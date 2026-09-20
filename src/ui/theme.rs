@@ -6,6 +6,7 @@
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::Span;
 
 /// Breathing room inside a pane. One column read as cramped against the
 /// borders; two is what makes a column of text look placed rather than
@@ -62,6 +63,34 @@ pub fn label() -> Style {
 
 /// Selection is a bar and brighter text, never a filled background: a panel
 /// colour that suits one terminal theme is wrong in the next.
+/// One line with something pushed to each edge.
+///
+/// The design puts every count and every state against the right-hand edge
+/// so the eye can run down a column of them. Done by measuring rather than
+/// by a second right-aligned widget, which would blank the left half.
+pub fn spread<'a>(
+    left: Vec<Span<'a>>,
+    right: Vec<Span<'a>>,
+    width: u16,
+) -> ratatui::text::Line<'a> {
+    let used: usize = left.iter().chain(right.iter()).map(|s| s.width()).sum();
+    let gap = (width as usize).saturating_sub(used);
+    let mut spans = left;
+    spans.push(Span::raw(" ".repeat(gap)));
+    spans.extend(right);
+    ratatui::text::Line::from(spans)
+}
+
+/// A horizontal rule across an area one row high.
+pub fn rule(frame: &mut ratatui::Frame, area: Rect) {
+    frame.render_widget(
+        ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::TOP)
+            .border_style(Style::default().fg(BORDER)),
+        area,
+    );
+}
+
 pub fn selected() -> Style {
     Style::default().fg(TEXT).add_modifier(Modifier::BOLD)
 }

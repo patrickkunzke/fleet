@@ -230,10 +230,15 @@ impl Pane {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let [head, body] =
-            Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(inner);
+        let [head, head_rule, body] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .areas(inner);
 
         self.render_head(frame, head, row, focused);
+        theme::rule(frame, head_rule);
 
         if let Some(m) = self.mirror.as_mut() {
             // No gutter here. Every other pane is text we lay out; this one

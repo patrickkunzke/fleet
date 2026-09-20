@@ -576,7 +576,7 @@ impl App {
             vertical: theme::MARGIN_Y,
         });
 
-        let [top, _, body, _, keys] = Layout::vertical([
+        let [top, top_rule, body, key_rule, keys] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(0),
@@ -586,6 +586,8 @@ impl App {
         .areas(area);
 
         self.draw_top(frame, top);
+        theme::rule(frame, top_rule);
+        theme::rule(frame, key_rule);
 
         // Folded away, the terminal is the window. That is the point of the
         // key: a REPL rendered into a third of the screen is a preview of a
@@ -638,10 +640,13 @@ impl App {
     }
 
     fn draw_top(&self, frame: &mut Frame, area: Rect) {
-        let working = self
-            .rows
+        let count = |p: fleet::Presence| self.rows.iter().filter(|r| r.presence == p).count();
+        let working = count(fleet::Presence::Working);
+        let waiting = count(fleet::Presence::Waiting);
+        let blocked = self
+            .tasks
             .iter()
-            .filter(|r| r.presence == fleet::Presence::Working)
+            .filter(|t| t.state == db::State::Blocked)
             .count();
         let root = self
             .root
@@ -650,34 +655,38 @@ impl App {
             .and_then(|s| s.to_str())
             .unwrap_or("all repos");
 
-        let mut spans = vec![
-            Span::styled(" fleet", theme::accent().add_modifier(Modifier::BOLD)),
+        let left = vec![
+            Span::styled("fleet", theme::accent().add_modifier(Modifier::BOLD)),
             Span::raw("  "),
-            Span::styled(root, theme::faint()),
+            Span::styled(root.to_string(), theme::faint()),
         ];
+
+        // Counts against the right edge, in the order the design has them.
+        let mut right: Vec<Span> = Vec::new();
+        let push = |right: &mut Vec<Span>, text: String, style: Style| {
+            if !right.is_empty() {
+                right.push(Span::styled("  ·  ", theme::faint()));
+            }
+            right.push(Span::styled(text, style));
+        };
         if working > 0 {
-            spans.push(Span::raw("  "));
-            spans.push(Span::styled(
-                format!("{working} working"),
-                Style::default().fg(theme::BUSY),
-            ));
+            push(&mut right, format!("{working} working"), Style::default().fg(theme::BUSY));
         }
-        let blocked = self
-            .tasks
-            .iter()
-            .filter(|t| t.state == db::State::Blocked)
-            .count();
+        if waiting > 0 {
+            push(&mut right, format!("{waiting} waiting on you"), Style::default().fg(theme::OK));
+        }
         if blocked > 0 {
-            spans.push(Span::styled("  ·  ", theme::faint()));
-            spans.push(Span::styled(format!("{blocked} blocked"), theme::accent()));
+            push(&mut right, format!("{blocked} blocked"), theme::accent());
         }
         let n = self.rows.len();
-        spans.push(Span::styled(
-            format!("  ·  {n} agent{}", if n == 1 { "" } else { "s" }),
+        push(
+            &mut right,
+            format!("{n} agent{}", if n == 1 { "" } else { "s" }),
             theme::dim(),
-        ));
+        );
 
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        let inner = theme::pad(area);
+        frame.render_widget(Paragraph::new(theme::spread(left, right, inner.width)), inner);
     }
 
     fn draw_side(&self, frame: &mut Frame, area: Rect) {
@@ -978,7 +987,8 @@ mod tests {
     fn the_frame_has_all_three_columns_and_a_key_bar() {
         let out = drawn(&mut app(), 110, 24);
         assert!(out.contains("fleet"), "{out}");
-        assert!(out.contains("FLEET"), "the rail: {out}");
+        assert!(out.contains("AGENTS"), "the rail: {out}");
+        assert!(out.contains("new agent"), "the rail's footer: {out}");
         assert!(out.contains("no session linked"), "the centre: {out}");
         assert!(out.contains("TASKS"), "the right rail: {out}");
         assert!(out.contains("BACKGROUND"), "and its lower half: {out}");
@@ -1149,7 +1159,8 @@ mod tests {
         app.on_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: rail.x + 2,
-            row: rail.y + 3,
+            // Agents take three rows each now: name, detail, and the gap.
+            row: rail.y + 4,
             modifiers: KeyModifiers::NONE,
         });
         assert_eq!(app.selected().unwrap().name, "billing-svc");

@@ -37,8 +37,14 @@ pub fn render(
     let wanted = 1 /* divider */ + 1 /* header */ + content;
     let bg_height = wanted.min(area.height / 2).max(3);
 
-    let [top, bottom] =
-        Layout::vertical([Constraint::Min(0), Constraint::Length(bg_height)]).areas(area);
+    // A strip at the foot, ruled off, the way the left rail has one.
+    let [top, bottom, foot_rule, foot] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(bg_height),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(area);
 
     render_tasks(frame, top, tasks, selected_agent);
 
@@ -48,15 +54,25 @@ pub fn render(
     let inner = divider.inner(bottom);
     frame.render_widget(divider, bottom);
     render_background(frame, inner, background);
+
+    theme::rule(frame, foot_rule);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("^a l", theme::dim()),
+            Span::styled(" the flow log", theme::faint()),
+        ])),
+        theme::pad(foot),
+    );
 }
 
 fn render_tasks(frame: &mut Frame, area: Rect, tasks: &[Task], selected_agent: Option<&str>) {
     let open = tasks.iter().filter(|t| t.state != State::Done).count();
-    let mut lines = vec![Line::from(vec![
-        Span::styled("TASKS", theme::label()),
-        Span::raw("  "),
-        Span::styled(format!("{open} open"), theme::faint()),
-    ])];
+    let width = area.width.saturating_sub(theme::GUTTER * 2);
+    let mut lines = vec![theme::spread(
+        vec![Span::styled("TASKS", theme::label())],
+        vec![Span::styled(format!("{open} open"), theme::faint())],
+        width,
+    )];
 
     if tasks.is_empty() {
         lines.push(Line::raw(""));
@@ -72,7 +88,6 @@ fn render_tasks(frame: &mut Frame, area: Rect, tasks: &[Task], selected_agent: O
         return;
     }
 
-    let width = area.width.saturating_sub(theme::GUTTER * 2);
     let room = area.height as usize;
     let mut epic: Option<&str> = None;
     // Counted rather than derived from the line count, which also holds the
@@ -98,14 +113,14 @@ fn render_tasks(frame: &mut Frame, area: Rect, tasks: &[Task], selected_agent: O
                 .filter(|t| t.epic_key.as_deref() == key && t.state == State::Done)
                 .count();
             let total = tasks.iter().filter(|t| t.epic_key.as_deref() == key).count();
-            lines.push(Line::from(vec![
-                Span::styled(
+            lines.push(theme::spread(
+                vec![Span::styled(
                     key.unwrap_or("loose").to_string(),
                     theme::accent().add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::styled(format!("{done}/{total}"), theme::faint()),
-            ]));
+                )],
+                vec![Span::styled(format!("{done}/{total}"), theme::faint())],
+                width,
+            ));
         }
 
         let mine = selected_agent.is_some() && task.agent.as_deref() == selected_agent;
@@ -162,11 +177,12 @@ fn render_tasks(frame: &mut Frame, area: Rect, tasks: &[Task], selected_agent: O
 
 fn render_background(frame: &mut Frame, area: Rect, background: &[BgTask]) {
     let running = background.iter().filter(|b| b.state == "running").count();
-    let mut lines = vec![Line::from(vec![
-        Span::styled("BACKGROUND", theme::label()),
-        Span::raw("  "),
-        Span::styled(format!("{running} running"), theme::faint()),
-    ])];
+    let width = area.width.saturating_sub(theme::GUTTER * 2);
+    let mut lines = vec![theme::spread(
+        vec![Span::styled("BACKGROUND", theme::label())],
+        vec![Span::styled(format!("{running} running"), theme::faint())],
+        width,
+    )];
 
     if background.is_empty() {
         lines.push(Line::from(Span::styled("nothing running", theme::faint())));
@@ -174,7 +190,6 @@ fn render_background(frame: &mut Frame, area: Rect, background: &[BgTask]) {
         return;
     }
 
-    let width = area.width.saturating_sub(theme::GUTTER * 2);
     let room = area.height as usize;
 
     for bg in background {

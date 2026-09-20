@@ -158,9 +158,13 @@ fn short_repo(path: &str) -> &str {
         .unwrap_or(path)
 }
 
-/// How many rows fit, given two lines each plus the header.
+/// Lines one agent occupies: its name, its detail, and the gap after it.
+/// The gap is what stops four agents reading as one block of text.
+const ROW: u16 = 3;
+
+/// How many agents fit, after the header and the footer strip.
 pub fn capacity(height: u16) -> usize {
-    (height.saturating_sub(2) / 2) as usize
+    (height.saturating_sub(4) / ROW) as usize
 }
 
 /// Which agent a click at screen row `y` landed on, if any.
@@ -173,22 +177,35 @@ pub fn row_at(area: Rect, y: u16) -> Option<usize> {
     if y <= area.y || y >= area.y + area.height {
         return None;
     }
-    Some(((y - area.y - 1) / 2) as usize)
+    Some(((y - area.y - 1) / ROW as u16) as usize)
 }
 
 pub fn render(frame: &mut Frame, area: Rect, rows: &[Row], selected: usize) {
     let block = Block::default()
         .borders(Borders::RIGHT)
         .border_style(Style::default().fg(theme::BORDER));
-    let inner = theme::pad(block.inner(area));
+    let whole = block.inner(area);
     frame.render_widget(block, area);
 
-    let working = rows.iter().filter(|r| r.presence == Presence::Working).count();
-    let mut lines = vec![Line::from(vec![
-        Span::styled("FLEET", theme::label()),
-        Span::raw("  "),
-        Span::styled(format!("{working} working"), theme::faint()),
-    ])];
+    // The rail ends in its own strip, ruled off, saying how to add to it.
+    let [list, foot_rule, foot] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(whole);
+    theme::rule(frame, foot_rule);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("+", theme::accent()),
+            Span::styled(" new agent  ", theme::faint()),
+            Span::styled("n", theme::dim()),
+        ])),
+        theme::pad(foot),
+    );
+
+    let inner = theme::pad(list);
+    let mut lines = vec![Line::from(Span::styled("AGENTS", theme::label()))];
 
     if rows.is_empty() {
         lines.push(Line::raw(""));
@@ -201,7 +218,7 @@ pub fn render(frame: &mut Frame, area: Rect, rows: &[Row], selected: usize) {
 
     // Keep the selected row on screen by scrolling whole rows, never halves:
     // a two-line row split across the top edge reads as a different agent.
-    let fits = capacity(inner.height).max(1);
+    let fits = capacity(area.height).max(1);
     let first = selected.saturating_sub(fits.saturating_sub(1));
 
     for (i, row) in rows.iter().enumerate().skip(first).take(fits) {
@@ -241,7 +258,7 @@ pub fn render(frame: &mut Frame, area: Rect, rows: &[Row], selected: usize) {
         let detail = Line::from(vec![
             Span::styled(bar, theme::accent()),
             Span::raw("  "),
-            Span::styled(truncate(&row.detail, inner.width.saturating_sub(3)), theme::faint()),
+            Span::styled(truncate(&row.detail, inner.width.saturating_sub(4)), theme::faint()),
         ]);
 
         let style = if is_selected {
@@ -251,6 +268,7 @@ pub fn render(frame: &mut Frame, area: Rect, rows: &[Row], selected: usize) {
         };
         lines.push(Line::from(head).style(style));
         lines.push(detail.style(style));
+        lines.push(Line::raw(""));
     }
 
     frame.render_widget(Paragraph::new(lines), inner);
@@ -379,20 +397,20 @@ mod tests {
 
     #[test]
     fn a_click_lands_on_the_agent_it_looks_like() {
-        let area = Rect::new(0, 0, 26, 12);
+        let area = Rect::new(0, 0, 26, 16);
         assert_eq!(row_at(area, 0), None, "the header is not an agent");
         assert_eq!(row_at(area, 1), Some(0));
-        assert_eq!(row_at(area, 2), Some(0), "both of an agent's two lines");
-        assert_eq!(row_at(area, 3), Some(1));
+        assert_eq!(row_at(area, 2), Some(0), "its detail line is still it");
+        assert_eq!(row_at(area, 3), Some(0), "and so is the gap under it");
         assert_eq!(row_at(area, 4), Some(1));
-        assert_eq!(row_at(area, 12), None, "past the bottom edge");
+        assert_eq!(row_at(area, 16), None, "past the bottom edge");
     }
 
     #[test]
-    fn rows_are_two_lines_so_capacity_is_half_the_space() {
-        assert_eq!(capacity(2), 0);
-        assert_eq!(capacity(4), 1);
-        assert_eq!(capacity(20), 9);
+    fn capacity_leaves_room_for_the_header_and_the_footer() {
+        assert_eq!(capacity(4), 0);
+        assert_eq!(capacity(7), 1);
+        assert_eq!(capacity(22), 6);
     }
 
     #[test]
@@ -404,6 +422,7 @@ mod tests {
         term.draw(|f| render(f, f.area(), &[], 0)).unwrap();
         let empty = format!("{}", term.backend());
         assert!(empty.contains("no agents yet"), "{empty}");
+        assert!(empty.contains("new agent"), "the way to add one is always there: {empty}");
         assert!(empty.contains("spawn one"), "{empty}");
 
         let agents = [agent("billing-svc", "worker", Some("sess-1"), Some("ENG-2553-2"))];
@@ -414,8 +433,7 @@ mod tests {
         term.draw(|f| render(f, f.area(), &rows, 0)).unwrap();
         let drawn = format!("{}", term.backend());
 
-        assert!(drawn.contains("FLEET"), "{drawn}");
-        assert!(drawn.contains("1 working"), "{drawn}");
+        assert!(drawn.contains("AGENTS"), "{drawn}");
         assert!(drawn.contains("billing-svc"), "{drawn}");
         assert!(drawn.contains("ENG-2553-2"), "{drawn}");
         assert!(drawn.contains('▌'), "the selected row is marked: {drawn}");
