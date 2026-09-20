@@ -98,10 +98,7 @@ fn render_tasks(frame: &mut Frame, area: Rect, tasks: &[Task], selected_agent: O
 
     for task in tasks {
         if lines.len() + 1 >= room {
-            lines.push(Line::from(vec![
-                Span::raw("   "),
-                Span::styled(format!("+{} more", tasks.len() - shown), theme::faint()),
-            ]));
+            lines.push(theme::more("↓", tasks.len() - shown));
             break;
         }
 

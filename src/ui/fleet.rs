@@ -162,22 +162,79 @@ fn short_repo(path: &str) -> &str {
 /// The gap is what stops four agents reading as one block of text.
 const ROW: u16 = 3;
 
+/// Lines the rail spends on something other than agents: the heading and
+/// its blank line at the top, the rule and the `+ new agent` strip at the
+/// foot.
+const CHROME: u16 = 4;
+
 /// How many agents fit, after the header and the footer strip.
 pub fn capacity(height: u16) -> usize {
-    (height.saturating_sub(4) / ROW) as usize
+    (height.saturating_sub(CHROME) / ROW) as usize
+}
+
+/// Which agents the rail shows, and how many are off each end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Window {
+    pub first: usize,
+    pub len: usize,
+    pub above: usize,
+    pub below: usize,
+    /// Whether a line is set aside at each end for the markers.
+    pub scrolls: bool,
+}
+
+/// Which slice of the rail is on screen.
+///
+/// The selected agent is always in it, and whole rows only: a two-line row
+/// split across the top edge reads as a different agent. When it does not
+/// all fit, a line goes to a marker at each end — reserved even when that
+/// end is flush, so that rows keep their place as the selection moves. A
+/// row that slides under the cursor between the look and the click is worse
+/// than a row lost.
+pub fn window(height: u16, count: usize, selected: usize) -> Window {
+    let lines = height.saturating_sub(CHROME) as usize;
+    if count <= capacity(height) {
+        return Window {
+            first: 0,
+            len: count,
+            above: 0,
+            below: 0,
+            scrolls: false,
+        };
+    }
+
+    // Two lines for the markers, and the gap under the last row is not
+    // spent: it separates rows from each other, and below the last one
+    // there is nothing to separate it from.
+    let len = ((lines.saturating_sub(1)) / ROW as usize).max(1).min(count);
+    let first = selected
+        .saturating_sub(len.saturating_sub(1))
+        .min(count - len);
+    Window {
+        first,
+        len,
+        above: first,
+        below: count - first - len,
+        scrolls: true,
+    }
 }
 
 /// Which agent a click at screen row `y` landed on, if any.
 ///
-/// Mirrors the layout in [`render`]: one header line, then two lines per
-/// agent. Kept beside it so the two cannot drift, because a rail that
+/// Mirrors the layout in [`render`], scroll included — it takes the same
+/// count and selection so that both reach the same [`window`]. A rail that
 /// selects the wrong agent when clicked is worse than one that ignores the
-/// mouse.
-pub fn row_at(area: Rect, y: u16) -> Option<usize> {
+/// mouse, and it did exactly that on any rail long enough to scroll.
+pub fn row_at(area: Rect, y: u16, count: usize, selected: usize) -> Option<usize> {
     if y <= area.y || y >= area.y + area.height {
         return None;
     }
-    Some(((y - area.y - 1) / ROW as u16) as usize)
+    let w = window(area.height, count, selected);
+    // The heading, its blank line, and the marker line when there is one.
+    let head = 2 + u16::from(w.scrolls);
+    let offset = (y - area.y).checked_sub(head)?;
+    let n = (offset / ROW) as usize;
+    (n < w.len).then_some(w.first + n)
 }
 
 pub fn render(frame: &mut Frame, area: Rect, rows: &[Row], selected: usize) {
@@ -218,12 +275,23 @@ pub fn render(frame: &mut Frame, area: Rect, rows: &[Row], selected: usize) {
         lines.push(Line::from(Span::styled("n  spawn one", theme::faint())));
     }
 
-    // Keep the selected row on screen by scrolling whole rows, never halves:
-    // a two-line row split across the top edge reads as a different agent.
-    let fits = capacity(area.height).max(1);
-    let first = selected.saturating_sub(fits.saturating_sub(1));
+    let w = window(area.height, rows.len(), selected);
+    if w.scrolls {
+        // Blank when this end is flush: the line stays reserved so the rows
+        // below it do not move as the selection travels.
+        lines.push(match w.above {
+            0 => Line::raw(""),
+            n => theme::more("↑", n),
+        });
+    }
 
-    for (i, row) in rows.iter().enumerate().skip(first).take(fits) {
+    for (i, row) in rows.iter().enumerate().skip(w.first).take(w.len) {
+        // The gap goes between rows rather than after each one. Below the
+        // last row it separates nothing, and it is the line the ↓ marker
+        // needs on a short rail.
+        if i > w.first {
+            lines.push(Line::raw(""));
+        }
         let is_selected = i == selected;
         let (glyph, colour) = row.glyph();
         let bar = if is_selected { "▌" } else { " " };
@@ -270,7 +338,11 @@ pub fn render(frame: &mut Frame, area: Rect, rows: &[Row], selected: usize) {
         };
         lines.push(Line::from(head).style(style));
         lines.push(detail.style(style));
+    }
+
+    if w.scrolls && w.below > 0 {
         lines.push(Line::raw(""));
+        lines.push(theme::more("↓", w.below));
     }
 
     frame.render_widget(Paragraph::new(lines), inner);
@@ -399,13 +471,108 @@ mod tests {
 
     #[test]
     fn a_click_lands_on_the_agent_it_looks_like() {
+        // Four agents in a rail that holds four: nothing scrolls.
         let area = Rect::new(0, 0, 26, 16);
-        assert_eq!(row_at(area, 0), None, "the header is not an agent");
-        assert_eq!(row_at(area, 1), Some(0));
-        assert_eq!(row_at(area, 2), Some(0), "its detail line is still it");
-        assert_eq!(row_at(area, 3), Some(0), "and so is the gap under it");
-        assert_eq!(row_at(area, 4), Some(1));
-        assert_eq!(row_at(area, 16), None, "past the bottom edge");
+        let at = |y| row_at(area, y, 4, 0);
+        assert_eq!(at(0), None, "the heading is not an agent");
+        assert_eq!(at(1), None, "nor is the blank line under it");
+        assert_eq!(at(2), Some(0));
+        assert_eq!(at(3), Some(0), "its detail line is still it");
+        assert_eq!(at(4), Some(0), "and so is the gap under it");
+        assert_eq!(at(5), Some(1));
+        assert_eq!(at(16), None, "past the bottom edge");
+    }
+
+    #[test]
+    fn a_click_on_a_scrolled_rail_lands_on_what_is_drawn_there() {
+        // The rail holds three of eight. It selected whatever was at that
+        // position in the full list instead, so every click on a rail long
+        // enough to scroll went to the wrong agent.
+        let area = Rect::new(0, 0, 26, 15);
+        let w = window(area.height, 8, 7);
+        assert!(w.scrolls && w.first > 0, "this rail has to scroll: {w:?}");
+
+        // One line lower than before, because the ↑ marker holds a line.
+        assert_eq!(row_at(area, 2, 8, 7), None, "the marker is not an agent");
+        assert_eq!(row_at(area, 3, 8, 7), Some(w.first));
+        assert_eq!(row_at(area, 6, 8, 7), Some(w.first + 1));
+        assert_eq!(
+            row_at(area, 3 + 3 * w.len as u16, 8, 7),
+            None,
+            "the ↓ marker is not an agent either"
+        );
+    }
+
+    #[test]
+    fn the_window_always_holds_the_selection() {
+        for selected in 0..8 {
+            let w = window(15, 8, selected);
+            assert!(
+                (w.first..w.first + w.len).contains(&selected),
+                "{selected} is off the rail: {w:?}"
+            );
+            assert_eq!(w.above + w.len + w.below, 8, "every agent is accounted for");
+        }
+    }
+
+    #[test]
+    fn rows_keep_their_place_as_the_selection_travels_inside_the_window() {
+        // The markers hold their lines even when an end is flush. Otherwise
+        // the rows shift by one the moment the top marker appears, which is
+        // between looking at a row and clicking it.
+        let flush = window(15, 8, 0);
+        let scrolled = window(15, 8, 7);
+        assert_eq!(flush.above, 0, "nothing above when the selection is first");
+        assert!(flush.scrolls, "but the rail still scrolls, so the line stays");
+        assert_eq!(flush.len, scrolled.len, "and the same number of rows fit");
+    }
+
+    #[test]
+    fn the_marker_fits_on_a_rail_barely_tall_enough_to_scroll() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // The gap under the last row is the line the ↓ marker needs. Spent
+        // on a separator below the last thing there is to separate, the
+        // marker was pushed off the bottom and the rail went back to hiding
+        // rows without saying so.
+        let agents: Vec<_> = ["a", "b", "c"]
+            .iter()
+            .map(|n| agent(n, "worker", Some(n), None))
+            .collect();
+        let rows = merge(&agents, &[]);
+
+        let mut term = Terminal::new(TestBackend::new(26, 9)).unwrap();
+        term.draw(|f| render(f, f.area(), &rows, 0)).unwrap();
+        let out = format!("{}", term.backend());
+        assert!(out.contains("↓ 2 more"), "{out}");
+    }
+
+    #[test]
+    fn a_rail_that_fits_says_nothing_about_scrolling() {
+        let w = window(22, 4, 0);
+        assert!(!w.scrolls);
+        assert_eq!((w.first, w.len, w.above, w.below), (0, 4, 0, 0));
+    }
+
+    #[test]
+    fn a_rail_with_more_agents_than_it_can_show_says_so_at_both_ends() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let agents: Vec<_> = ["a", "b", "c", "d", "e", "f", "g", "h"]
+            .iter()
+            .map(|n| agent(n, "worker", Some(n), None))
+            .collect();
+        let rows = merge(&agents, &[]);
+
+        let mut term = Terminal::new(TestBackend::new(26, 15)).unwrap();
+        term.draw(|f| render(f, f.area(), &rows, 4)).unwrap();
+        let out = format!("{}", term.backend());
+
+        assert!(out.contains("↑"), "nothing says rows are above: {out}");
+        assert!(out.contains("more"), "{out}");
+        assert!(out.contains("↓"), "nothing says rows are below: {out}");
     }
 
     #[test]

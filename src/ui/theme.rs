@@ -121,6 +121,21 @@ fn truncate<'a>(spans: Vec<Span<'a>>, budget: usize) -> (Vec<Span<'a>>, usize) {
     (kept, used)
 }
 
+/// Where a list had to stop, and which way the rest of it is.
+///
+/// Both rails run out of room and both say so the same way. The arrow is the
+/// half that matters: the agent rail hides rows at either end, and a bare
+/// count leaves you to guess which. `+` is not used for this — it means "add
+/// one" three lines below, on the same rail.
+pub fn more(arrow: &str, n: usize) -> ratatui::text::Line<'static> {
+    ratatui::text::Line::from(vec![
+        // To the text column, not the glyph column: this is a note about the
+        // list, not an entry in it.
+        Span::raw("   "),
+        Span::styled(format!("{arrow} {n} more"), faint()),
+    ])
+}
+
 /// Join the rules to the dividers they cross.
 ///
 /// Drawn separately, a rule and a divider land next to each other as `─│─`:

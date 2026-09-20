@@ -18,7 +18,7 @@ already runs on the machine.
 | `src/db.rs` — fleet.db reads and writes | done, 11 tests |
 | `fleet board` — the whole board, in the binary | done, 13 tests |
 | `src/tmux.rs` — spawning and pane control | done, 8 tests |
-| `src/ui/` — frame, fleet rail, session pane, board rail | done, 43 tests |
+| `src/ui/` — frame, fleet rail, session pane, board rail | done, 52 tests |
 | `src/agent.rs` — starting an agent, repo discovery | done, 4 tests |
 | `n` to spawn from the rail | done |
 | `src/ui/flow.rs` — graph and log views | done, 18 tests |

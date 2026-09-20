@@ -334,7 +334,8 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) => {
                 if inside(self.rail_at, at) {
                     self.focus = Focus::Rail;
-                    if let Some(i) = fleet::row_at(self.rail_at, ev.row)
+                    if let Some(i) =
+                        fleet::row_at(self.rail_at, ev.row, self.rows.len(), self.selected)
                         && i < self.rows.len()
                     {
                         self.selected = i;
@@ -1177,15 +1178,25 @@ mod tests {
         assert_eq!(app.selected().unwrap().name, "chief");
 
         let rail = app.rail_at;
-        app.on_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: rail.x + 2,
-            // Agents take three rows each now: name, detail, and the gap.
-            row: rail.y + 4,
-            modifiers: KeyModifiers::NONE,
-        });
+        let click = |app: &mut App, row: u16| {
+            app.on_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: rail.x + 2,
+                row,
+                modifiers: KeyModifiers::NONE,
+            });
+        };
+
+        // The heading and its blank line, then three rows an agent: its
+        // name, its detail, and the gap that separates it from the next.
+        click(&mut app, rail.y + 5);
         assert_eq!(app.selected().unwrap().name, "billing-svc");
         assert_eq!(app.focus, Focus::Rail, "clicking the rail points the keys at it");
+
+        // The gap belongs to the agent above it, which is the one whose
+        // name you were aiming at. It used to select the one below.
+        click(&mut app, rail.y + 4);
+        assert_eq!(app.selected().unwrap().name, "chief");
     }
 
     #[test]
