@@ -8,16 +8,18 @@
 
 mod db;
 mod registry;
+mod tmux;
 mod transcript;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use crate::db::Db;
-use crate::registry::{Change, Registry, Watcher};
+use crate::registry::{Change, Registry, Session, Watcher};
+use crate::tmux::Tmux;
 use crate::transcript::{BACKFILL_BYTES, Entry, Outcome, Transcript};
 
 #[derive(Parser)]
@@ -44,6 +46,26 @@ enum Command {
         /// How many entries to show.
         #[arg(short, long, default_value_t = 40)]
         lines: usize,
+    },
+    /// Start an agent in a tmux pane and register it on the board.
+    Spawn {
+        /// What to call it. Also the tmux window name.
+        name: String,
+        /// The repository the agent works in.
+        #[arg(long)]
+        repo: PathBuf,
+        /// What to run. Overridable so the plumbing can be exercised without
+        /// starting a real agent.
+        #[arg(long, default_value = "claude")]
+        command: String,
+        /// tmux session to spawn into. Defaults to the current one, else "fleet".
+        #[arg(long)]
+        session: Option<String>,
+        /// Seconds to wait for the agent to register itself.
+        #[arg(long, default_value_t = 20)]
+        timeout: u64,
+        #[arg(long, env = "FLEET_DB")]
+        db: Option<PathBuf>,
     },
     /// Read the coordination database.
     Board {
@@ -78,7 +100,84 @@ fn main() -> Result<()> {
         Command::Sessions { watch } => sessions(watch),
         Command::Session { name, watch, lines } => session(&name, watch, lines),
         Command::Board { view, db } => board(view, db),
+        Command::Spawn {
+            name,
+            repo,
+            command,
+            session,
+            timeout,
+            db,
+        } => spawn(&name, &repo, &command, session.as_deref(), timeout, db),
     }
+}
+
+/// Start an agent and join the three sources back together: a tmux pane, the
+/// Claude Code session that appears inside it, and the row on the board.
+fn spawn(
+    name: &str,
+    repo: &Path,
+    command: &str,
+    session: Option<&str>,
+    timeout: u64,
+    db_path: Option<PathBuf>,
+) -> Result<()> {
+    let repo = repo
+        .canonicalize()
+        .with_context(|| format!("no such repository: {}", repo.display()))?;
+    let tmux = Tmux::detect(session)?;
+    let pane = tmux.spawn(name, &repo, command)?;
+    println!("{name}  pane {} in session {}", pane.id, pane.session);
+
+    let db = Db::open(db_path.unwrap_or_else(db::default_path))?;
+    let target = format!("{}:{}", pane.session, pane.window_name);
+
+    // The agent registers itself a moment after the process starts, so the row
+    // goes in without a session id first. An agent that never reports is still
+    // an agent someone has to deal with, and a board that omits it is worse
+    // than one that shows it unlinked.
+    db.upsert_agent(name, None, Some(&repo.to_string_lossy()), None, Some(&target), None)?;
+
+    match adopt(&pane.pid, timeout) {
+        Some(found) => {
+            db.upsert_agent(name, None, None, Some(&found.session_id), None, None)?;
+            db.log_event(
+                "note",
+                Some(name),
+                None,
+                None,
+                &format!("spawned in {target}"),
+                None,
+                None,
+            )?;
+            println!("      adopted session {} (pid {})", found.session_id, found.pid);
+        }
+        None => println!(
+            "      no session registered within {timeout}s — the pane is up, \
+             the board row is unlinked"
+        ),
+    }
+    Ok(())
+}
+
+/// Wait for a Claude Code session to appear inside a pane we just created.
+///
+/// Matched by process tree rather than by working directory: two agents in
+/// the same repo are ordinary here, and a cwd match would adopt the wrong one.
+fn adopt(pane_pid: &i32, timeout_secs: u64) -> Option<Session> {
+    let mut reg = Registry::new(registry::default_dir());
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+    while std::time::Instant::now() < deadline {
+        reg.refresh();
+        if let Some(s) = reg
+            .interactive()
+            .find(|s| tmux::owns(*pane_pid, s.pid))
+            .cloned()
+        {
+            return Some(s);
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    None
 }
 
 fn sessions(watch: bool) -> Result<()> {

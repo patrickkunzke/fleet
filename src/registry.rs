@@ -290,6 +290,7 @@ impl Registry {
         self.sessions.values()
     }
 
+    #[allow(dead_code)]
     pub fn interactive(&self) -> impl Iterator<Item = &Session> {
         self.sessions.values().filter(|s| s.is_interactive())
     }

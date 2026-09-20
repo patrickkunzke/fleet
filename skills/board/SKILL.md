@@ -39,8 +39,10 @@ which is what you want when you are going to parse it.
 - **Task keys are Jira keys with an index**: `ENG-2553-2`. One task = one repo
   = one MR. If a change spans three repos it is three tasks, not one.
 - **Agent names are short and repo-shaped**: `billing-svc`, `storefront`,
-  `chief`. They must match the session name in `~/.claude/sessions/*.json`
-  so the TUI can join them to a live process.
+  `chief`. They are the fleet's own names and need not match the session name
+  Claude Code derives — spawning in `billing-service` produces a session
+  called `billing-service-50`, not `billing-svc`. The link is the session id,
+  recorded with `--session`, so pass it whenever you know it.
 - **Every state change goes through the CLI**, never a bare `UPDATE`. The CLI
   writes the matching flow event; hand-written SQL silently breaks the history.
 - **`--body` is the brief.** Put in it what a fresh agent in that repo needs to
