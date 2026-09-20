@@ -79,28 +79,46 @@ pub fn spread<'a>(
         return ratatui::text::Line::from(right);
     }
 
-    let budget = width - right_width - 1;
-    let mut spans = Vec::new();
-    let mut used = 0usize;
-    for span in left {
-        let w = span.width();
-        if used + w <= budget {
-            used += w;
-            spans.push(span);
-            continue;
-        }
-        let room = budget.saturating_sub(used);
-        if room > 1 {
-            let cut: String = span.content.chars().take(room - 1).collect();
-            used += room;
-            spans.push(Span::styled(format!("{cut}…"), span.style));
-        }
-        break;
-    }
-
+    let (mut spans, used) = truncate(left, width - right_width - 1);
     spans.push(Span::raw(" ".repeat(width - used - right_width)));
     spans.extend(right);
     ratatui::text::Line::from(spans)
+}
+
+/// One line, cut to a width, saying where it was cut.
+///
+/// A pane edge that slices a name in half reads as a rendering fault; the
+/// same name ending in `…` reads as a name that did not fit. Nothing that
+/// lays out its own columns should reach the edge at all, so this is the
+/// floor under those, not a substitute for them.
+pub fn fit<'a>(spans: Vec<Span<'a>>, width: u16) -> ratatui::text::Line<'a> {
+    ratatui::text::Line::from(truncate(spans, width as usize).0)
+}
+
+/// Keep whole spans while they fit, then an ellipsis where the next one was
+/// cut. Returns the columns actually used, which is never more than `budget`.
+fn truncate<'a>(spans: Vec<Span<'a>>, budget: usize) -> (Vec<Span<'a>>, usize) {
+    let mut kept = Vec::new();
+    let mut used = 0usize;
+    for span in spans {
+        let w = span.width();
+        if used + w <= budget {
+            used += w;
+            kept.push(span);
+            continue;
+        }
+        let room = budget.saturating_sub(used);
+        // One column left holds an ellipsis and nothing else, which says
+        // less than the character it replaced. Two is the smallest cut
+        // worth making.
+        if room > 1 {
+            let cut: String = span.content.chars().take(room - 1).collect();
+            used += room;
+            kept.push(Span::styled(format!("{cut}…"), span.style));
+        }
+        break;
+    }
+    (kept, used)
 }
 
 /// Join the rules to the dividers they cross.
@@ -225,6 +243,28 @@ mod tests {
             "  │───",
             "the divider stays a divider"
         );
+    }
+
+    #[test]
+    fn fit_says_where_it_cut_rather_than_stopping_at_the_wall() {
+        let line = |w| {
+            fit(
+                vec![
+                    Span::raw("└──▶ "),
+                    Span::raw("billing-service"),
+                    Span::raw("  ●"),
+                ],
+                w,
+            )
+            .to_string()
+        };
+        assert_eq!(line(30), "└──▶ billing-service  ●");
+        let cut = line(14);
+        assert_eq!(cut.chars().count(), 14, "{cut}");
+        assert!(cut.ends_with('…'), "{cut}");
+        // One column left holds an ellipsis and nothing else, which says
+        // less than the character it replaced.
+        assert_eq!(line(6), "└──▶ ");
     }
 
     #[test]

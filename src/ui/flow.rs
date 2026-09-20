@@ -86,19 +86,25 @@ pub fn render(
         View::Graph => "topology",
         View::Log => "chronological",
     };
+    let head_inner = theme::pad(head);
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("◈ ", theme::accent()),
-            Span::styled(
-                "flow",
-                Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled(what, theme::faint()),
-            Span::raw("  "),
-            Span::styled(format!("{} events", events.len()), theme::faint()),
-        ])),
-        theme::pad(head),
+        Paragraph::new(theme::spread(
+            vec![
+                Span::styled("◈ ", theme::accent()),
+                Span::styled(
+                    "flow",
+                    Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(what, theme::faint()),
+            ],
+            vec![Span::styled(
+                format!("{} events", events.len()),
+                theme::faint(),
+            )],
+            head_inner.width,
+        )),
+        head_inner,
     );
     theme::rule(frame, head_rule);
 
@@ -112,14 +118,19 @@ fn graph(frame: &mut Frame, area: Rect, events: &[Event], rows: &[Row]) {
     let edges = edges(events);
     if edges.is_empty() {
         frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(Span::styled("no messages logged yet", theme::faint())),
-                Line::raw(""),
-                Line::from(Span::styled(
+            Paragraph::new(
+                [
+                    "no messages logged yet".to_string(),
+                    String::new(),
+                ]
+                .into_iter()
+                .chain(wrap(
                     "agents record them with: fleet msg <from> <to> …",
-                    theme::faint(),
-                )),
-            ]),
+                    area.width,
+                ))
+                .map(|l| Line::from(Span::styled(l, theme::faint())))
+                .collect::<Vec<_>>(),
+            ),
             area,
         );
         return;
@@ -145,8 +156,10 @@ fn graph(frame: &mut Frame, area: Rect, events: &[Event], rows: &[Row]) {
         }
     }
 
+    let fit = |spans: Vec<Span<'static>>| theme::fit(spans, area.width);
+
     let mut lines = vec![
-        Line::from(vec![
+        fit(vec![
             Span::styled(" ◆ ", theme::accent()),
             Span::styled(
                 chief.clone(),
@@ -159,6 +172,37 @@ fn graph(frame: &mut Frame, area: Rect, events: &[Event], rows: &[Row]) {
 
     let busiest = spokes.values().map(|(a, b)| a + b).max().unwrap_or(1).max(1);
     let last = spokes.len().saturating_sub(1);
+
+    // Everything but the name is fixed furniture: the elbow, the bar, the
+    // traffic counts and the presence glyph. Measured across every row so
+    // the columns line up, then dropped in order of what a narrow pane can
+    // do without — the bar first, since it is the counts drawn again.
+    let counts = |sent: &usize, received: &usize| format!("{sent}▸ {received}◂");
+    let counts_width = spokes
+        .values()
+        .map(|(s, r)| counts(s, r).chars().count())
+        .max()
+        .unwrap_or(5);
+    const ELBOW: usize = 6;
+    const GLYPH: usize = 3;
+    const BAR: usize = 5;
+    // A space the name column cannot spend, so that a name ending in an
+    // ellipsis does not run into whatever comes after it.
+    const GAP: usize = 1;
+    const NAME_MIN: usize = 6;
+    const NAME_MAX: usize = 16;
+
+    let avail = area.width as usize;
+    let floor = ELBOW + NAME_MIN + GAP + GLYPH;
+    let show_counts = avail >= floor + counts_width;
+    let show_bar = show_counts && avail >= floor + BAR + counts_width;
+    let fixed = ELBOW
+        + GAP
+        + GLYPH
+        + if show_bar { BAR } else { 0 }
+        + if show_counts { counts_width } else { 0 };
+    let name_width = avail.saturating_sub(fixed).clamp(3, NAME_MAX);
+
     for (i, (name, (sent, received))) in spokes.iter().enumerate() {
         let elbow = if i == last { " └──▶ " } else { " ├──▶ " };
         let state = rows.iter().find(|r| &r.name == name);
@@ -168,39 +212,65 @@ fn graph(frame: &mut Frame, area: Rect, events: &[Event], rows: &[Row]) {
             Some(Presence::Gone) => ("×", theme::FAINT),
             _ => ("·", theme::FAINT),
         };
-        lines.push(Line::from(vec![
+        let mut spans = vec![
             Span::styled(elbow, Style::default().fg(theme::BORDER)),
-            Span::styled(format!("{name:<16}"), Style::default().fg(theme::TEXT)),
-            Span::styled(bar(sent + received, busiest), theme::accent()),
-            Span::raw(" "),
-            Span::styled(format!("{sent}▸ {received}◂"), theme::dim()),
-            Span::raw("  "),
-            Span::styled(glyph, Style::default().fg(colour)),
-        ]));
+            Span::styled(
+                format!("{:<name_width$} ", clip(name, name_width as u16)),
+                Style::default().fg(theme::TEXT),
+            ),
+        ];
+        if show_bar {
+            spans.push(Span::styled(bar(sent + received, busiest), theme::accent()));
+            spans.push(Span::raw(" "));
+        }
+        if show_counts {
+            spans.push(Span::styled(
+                format!("{:<counts_width$}", counts(sent, received)),
+                theme::dim(),
+            ));
+        }
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(glyph, Style::default().fg(colour)));
+        lines.push(fit(spans));
     }
 
-    if !peers.is_empty() {
+    // Two names on one line, so they halve what is left between them rather
+    // than the second one running off the edge. Below about sixteen columns
+    // there is no pair of names worth printing, so the section goes instead
+    // of being printed as two ellipses.
+    let widest = peers
+        .iter()
+        .map(|e| e.count.to_string().chars().count())
+        .max()
+        .unwrap_or(1);
+    let each = (avail.saturating_sub(1 + 5 + 2 + widest)) / 2;
+    if !peers.is_empty() && each >= 4 {
+        let each = each.min(NAME_MAX);
         lines.push(Line::raw(""));
-        lines.push(Line::from(Span::styled(
-            "bypassing the chief",
-            theme::label(),
-        )));
+        lines.push(fit(vec![Span::styled("bypassing the chief", theme::label())]));
         for edge in peers {
-            lines.push(Line::from(vec![
+            lines.push(fit(vec![
                 Span::raw(" "),
-                Span::styled(edge.from.clone(), theme::dim()),
+                Span::styled(
+                    format!("{:>each$}", clip(&edge.from, each as u16)),
+                    theme::dim(),
+                ),
                 Span::styled(" ──▶ ", Style::default().fg(theme::BORDER)),
-                Span::styled(format!("{:<16}", edge.to), theme::dim()),
+                Span::styled(
+                    format!("{:<each$}", clip(&edge.to, each as u16)),
+                    theme::dim(),
+                ),
+                Span::raw("  "),
                 Span::styled(edge.count.to_string(), theme::faint()),
             ]));
         }
     }
 
     lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled(
+    lines.push(fit(vec![Span::styled(
         " ▸ sent   ◂ received",
         theme::faint(),
-    )));
+    )]));
 
     frame.render_widget(Paragraph::new(lines), area);
 }
@@ -429,6 +499,57 @@ mod tests {
         term.draw(|f| render(f, f.area(), view, events, &rows, selected, true))
             .unwrap();
         format!("{}", term.backend())
+    }
+
+    /// Every line the graph draws, with the trailing blanks removed.
+    fn graph_lines(events: &[Event], w: u16) -> Vec<String> {
+        drawn(View::Graph, events, 0, w, 16)
+            .lines()
+            .map(|l| l.trim_end_matches(['"', ' ']).trim_start_matches('"').to_string())
+            .collect()
+    }
+
+    #[test]
+    fn the_graph_ends_its_lines_with_an_ellipsis_rather_than_at_the_wall() {
+        let events = [event("message", "chief", "accounts-service", "go")];
+        for w in [20, 25, 30, 36, 44, 60] {
+            for line in graph_lines(&events, w) {
+                assert!(
+                    line.chars().count() <= w as usize,
+                    "at {w} columns this overflows: {line:?}"
+                );
+            }
+        }
+        // The name is what gives way, and it says that it did.
+        let narrow = graph_lines(&events, 30).join("\n");
+        assert!(narrow.contains('…'), "nothing was marked as cut: {narrow}");
+    }
+
+    #[test]
+    fn the_graph_drops_the_bar_before_the_counts_and_the_counts_before_the_name() {
+        let events = [event("message", "chief", "accounts-service", "go")];
+        let at = |w| graph_lines(&events, w).join("\n");
+
+        let wide = at(60);
+        assert!(wide.contains('▇'), "the bar fits: {wide}");
+        assert!(wide.contains("1▸ 0◂"), "so do the counts: {wide}");
+
+        let middle = at(30);
+        assert!(!middle.contains('▇'), "the bar is the first to go: {middle}");
+        assert!(middle.contains("1▸ 0◂"), "the counts are not: {middle}");
+
+        let narrow = at(25);
+        assert!(!narrow.contains("1▸ 0◂"), "the counts go next: {narrow}");
+        assert!(narrow.contains("setting"), "the name is what is left: {narrow}");
+    }
+
+    #[test]
+    fn a_pane_too_narrow_for_two_names_drops_the_section_rather_than_print_two_ellipses() {
+        // Both halves of "a ──▶ b" cut to nothing says less than the heading
+        // it sits under.
+        let events = [event("message", "accounts-service", "billing-service", "yours")];
+        let narrow = graph_lines(&events, 20).join("\n");
+        assert!(!narrow.contains("bypassing"), "{narrow}");
     }
 
     #[test]

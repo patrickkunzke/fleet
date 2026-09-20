@@ -588,6 +588,19 @@ impl Db {
     /// Returns the command that finished, which is what a caller reports —
     /// "passed 7" tells nobody anything.
     pub fn bg_end(&self, id: i64, state: &str, detail: Option<&str>) -> Result<String> {
+        // Read before the update, because the event has to name the agent
+        // whose process this was. Without it the flow log shows "started:
+        // gradlew test" against accounts-svc and "passed: gradlew test"
+        // against nobody, which reads as two unrelated things.
+        let owner: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT a.name FROM bg_tasks b JOIN agents a ON a.id = b.agent_id
+                 WHERE b.id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
         let command: Option<String> = self
             .conn
             .query_row(
@@ -603,7 +616,7 @@ impl Db {
         };
         self.log_event(
             "bg",
-            None,
+            owner.as_deref(),
             None,
             None,
             &format!("{state}: {command}"),
@@ -833,6 +846,21 @@ mod tests {
                 .bg_running,
             0
         );
+
+        // Both ends of the process name the agent it belonged to. Without it
+        // the flow log shows the start against accounts-svc and the finish
+        // against nobody, reading as two unrelated things.
+        let events = db.events(10).unwrap();
+        let ended = events
+            .iter()
+            .find(|e| e.summary.starts_with("passed:"))
+            .expect("finishing writes an event");
+        assert_eq!(ended.from_agent.as_deref(), Some("accounts-svc"));
+        let started = events
+            .iter()
+            .find(|e| e.summary.starts_with("started:"))
+            .unwrap();
+        assert_eq!(started.from_agent, ended.from_agent);
     }
 
     #[test]

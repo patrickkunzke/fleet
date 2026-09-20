@@ -21,7 +21,7 @@ already runs on the machine.
 | `src/ui/` — frame, fleet rail, session pane, board rail | done, 43 tests |
 | `src/agent.rs` — starting an agent, repo discovery | done, 4 tests |
 | `n` to spawn from the rail | done |
-| `src/ui/flow.rs` — graph and log views | done, 14 tests |
+| `src/ui/flow.rs` — graph and log views | done, 18 tests |
 | `src/ui/mirror.rs` — the live tmux pane | done, 5 tests |
 | `src/ui/preview.rs` — the fixture fleet, for layout work | done, 4 tests |
 
