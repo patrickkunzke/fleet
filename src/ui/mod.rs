@@ -51,6 +51,17 @@ enum Focus {
     Session,
 }
 
+/// In Insert every key belongs to the agent, including the ones that would
+/// otherwise quit. Leaving is Ctrl-], the old telnet escape, chosen because
+/// Claude Code wants Escape for interrupting a turn and Ctrl-C for its own
+/// purposes — binding either of those to "leave" would make the two most
+/// important keys in a runaway turn do the wrong thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Normal,
+    Insert,
+}
+
 pub struct App {
     registry: Registry,
     db: Db,
@@ -64,6 +75,8 @@ pub struct App {
     selected: usize,
     centre: session::Pane,
     focus: Focus,
+    mode: Mode,
+    input: session::Input,
     /// Counts for the right rail until it has panes of its own.
     tasks: usize,
     blocked: usize,
@@ -87,6 +100,8 @@ impl App {
             selected: 0,
             centre: session::Pane::default(),
             focus: Focus::Rail,
+            mode: Mode::Normal,
+            input: session::Input::default(),
             tasks: 0,
             blocked: 0,
             background: 0,
@@ -137,6 +152,12 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return;
         }
+        // Insert mode comes first, before the keys that would quit: while
+        // typing, q is a letter and Ctrl-C is an interrupt for the agent.
+        if self.mode == Mode::Insert {
+            self.insert_key(key);
+            return;
+        }
         match (key.code, key.modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Char('q'), _) => {
                 self.quit = true;
@@ -179,6 +200,11 @@ impl App {
     }
 
     fn session_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Char('i') && self.centre.is_live() {
+            self.mode = Mode::Insert;
+            self.status = None;
+            return;
+        }
         if key.code == KeyCode::Enter {
             // Hand over the real terminal. Inside tmux this moves you there;
             // outside it, the pane is selected and we say how to attach.
@@ -201,6 +227,77 @@ impl App {
             KeyCode::PageDown => self.centre.scroll_by(-1, 10),
             KeyCode::Char('G') | KeyCode::End => self.centre.to_tail(),
             _ => {}
+        }
+    }
+
+    /// Everything typed while the agent has the keyboard.
+    fn insert_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            // Ctrl-] hands the keyboard back.
+            KeyCode::Char(']') if ctrl => {
+                self.mode = Mode::Normal;
+                return;
+            }
+            KeyCode::Char('c') if ctrl => {
+                self.forward("C-c");
+                return;
+            }
+            _ => {}
+        }
+
+        match key.code {
+            KeyCode::Char(c) => self.input.insert(c),
+            KeyCode::Backspace => self.input.backspace(),
+            KeyCode::Left => self.input.left(),
+            KeyCode::Right => self.input.right(),
+            KeyCode::Home => self.input.home(),
+            KeyCode::End => self.input.end(),
+            KeyCode::Enter => {
+                let line = self.input.take();
+                self.send(&line);
+            }
+            // With something typed, Escape is "forget it"; with an empty line
+            // it is the agent's interrupt, which is the only way to stop a
+            // turn that has gone wrong.
+            KeyCode::Esc if !self.input.is_empty() => self.input.clear(),
+            KeyCode::Esc => self.forward("Escape"),
+            // A permission prompt is answered by moving and pressing Enter,
+            // and no line of text can do that.
+            KeyCode::Up if self.input.is_empty() => self.forward("Up"),
+            KeyCode::Down if self.input.is_empty() => self.forward("Down"),
+            KeyCode::Tab if self.input.is_empty() => self.forward("Tab"),
+            _ => {}
+        }
+    }
+
+    fn send(&mut self, line: &str) {
+        let Some(tmux) = self.tmux.clone() else { return };
+        match self.centre.send(&tmux, line) {
+            Ok(()) => self.echo(),
+            Err(e) => self.status = Some(e.to_string()),
+        }
+    }
+
+    fn forward(&mut self, key: &str) {
+        let Some(tmux) = self.tmux.clone() else { return };
+        match self.centre.send_key(&tmux, key) {
+            Ok(()) => self.echo(),
+            Err(e) => self.status = Some(e.to_string()),
+        }
+    }
+
+    /// Wait briefly for the pane to echo what was just sent.
+    ///
+    /// Without this a keystroke is invisible until the next poll, up to
+    /// 400ms later, which reads as a dropped key. Bounded tightly: an agent
+    /// that is busy will not echo at all, and the loop must not stall for it.
+    fn echo(&mut self) {
+        for _ in 0..4 {
+            std::thread::sleep(Duration::from_millis(15));
+            if self.centre.poll() {
+                return;
+            }
         }
     }
 
@@ -240,7 +337,8 @@ impl App {
         self.centre_size = (centre.width.saturating_sub(3), centre.height.saturating_sub(2));
         fleet::render(frame, rail, &self.rows, self.selected);
         let row = self.rows.get(self.selected).cloned();
-        self.centre.render(frame, centre, row.as_ref());
+        let input = (self.mode == Mode::Insert).then_some(&self.input);
+        self.centre.render(frame, centre, row.as_ref(), input);
         self.draw_side(frame, side);
         self.draw_keys(frame, keys);
     }
@@ -332,6 +430,11 @@ impl App {
             return;
         }
         let keys: &[(&str, &str)] = match self.focus {
+            _ if self.mode == Mode::Insert => &[
+                ("typing", "→ pane"),
+                ("esc", "interrupt"),
+                ("^]", "stop typing"),
+            ],
             Focus::Rail => &[
                 ("↑↓", "agent"),
                 ("tab", "session"),
@@ -339,6 +442,7 @@ impl App {
                 ("q", "quit"),
             ],
             Focus::Session if self.centre.is_live() => &[
+                ("i", "type"),
                 ("↵", "zoom to pane"),
                 ("tab", "agents"),
                 ("q", "quit"),
@@ -547,6 +651,50 @@ mod tests {
             out.contains("no session linked"),
             "an agent with no live session says so: {out}"
         );
+    }
+
+    #[test]
+    fn typing_is_not_offered_where_there_is_no_pane_to_type_into() {
+        let mut app = app();
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        app.on_key(KeyEvent::from(KeyCode::Char('i')));
+        assert_eq!(
+            app.mode,
+            Mode::Normal,
+            "a transcript-only agent cannot be typed at"
+        );
+    }
+
+    #[test]
+    fn insert_mode_keeps_the_keys_that_would_otherwise_quit() {
+        let mut app = app();
+        app.mode = Mode::Insert;
+
+        app.on_key(KeyEvent::from(KeyCode::Char('q')));
+        assert!(!app.quit, "q is a letter while typing");
+
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(!app.quit, "and Ctrl-C interrupts the agent, not the program");
+
+        app.on_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL));
+        assert_eq!(app.mode, Mode::Normal, "Ctrl-] hands the keyboard back");
+
+        app.on_key(KeyEvent::from(KeyCode::Char('q')));
+        assert!(app.quit, "and then q quits again");
+    }
+
+    #[test]
+    fn escape_clears_a_typed_line_but_interrupts_an_empty_one() {
+        let mut app = app();
+        app.mode = Mode::Insert;
+        for c in "half a thought".chars() {
+            app.on_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        assert!(!app.input.is_empty());
+
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.input.is_empty(), "the first Escape discards the line");
+        assert_eq!(app.mode, Mode::Insert, "and stays in insert mode");
     }
 
     #[test]

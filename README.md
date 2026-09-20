@@ -144,7 +144,8 @@ The centre pane shows two different things, and prefers the first:
 1. **The agent's actual terminal**, mirrored out of tmux with `pipe-pane` and
    replayed through a vt100 parser. The real REPL — spinners, permission
    prompts, its own colours. tmux still owns the process, so an agent outlives
-   this program and `↵` hands over the unmodified terminal.
+   this program and `↵` hands over the unmodified terminal. `i` types into it;
+   `Ctrl-]` stops.
 2. **The transcript**, re-rendered from the jsonl. The only thing that can show
    a session which is not in our tmux, or one that has ended, and the
    structured source the flow pane is built on. A reading of the session
