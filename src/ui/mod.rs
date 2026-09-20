@@ -19,6 +19,8 @@ pub mod session;
 pub mod theme;
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
@@ -91,6 +93,9 @@ pub struct App {
     db_path: PathBuf,
     tx: Sender<Msg>,
     rx: Option<Receiver<Msg>>,
+    /// Set when the user asked for the real terminal. Acted on by the run
+    /// loop, which owns the screen — the key handler does not.
+    wants_attach: bool,
     tasks: Vec<db::Task>,
     background: Vec<db::BgTask>,
     events: Vec<db::Event>,
@@ -109,6 +114,7 @@ impl App {
             db_path,
             tx,
             rx: Some(rx),
+            wants_attach: false,
             registry: Registry::new(registry::default_dir()),
             db,
             root,
@@ -361,10 +367,16 @@ impl App {
             return;
         }
         if key.code == KeyCode::Enter {
-            // Hand over the real terminal. Inside tmux this moves you there;
-            // outside it, the pane is selected and we say how to attach.
-            if let Some(tmux) = self.tmux.as_ref() {
-                self.status = self.centre.zoom(tmux);
+            // Hand over the real terminal. Inside tmux, selecting the window
+            // is enough. Outside it — which is the normal case, since fleet
+            // is meant to start anywhere — the run loop gives up the screen
+            // and attaches until the user detaches again.
+            if Tmux::inside() {
+                if let Some(tmux) = self.tmux.as_ref() {
+                    self.status = self.centre.zoom(tmux);
+                }
+            } else if self.centre.is_live() {
+                self.wants_attach = true;
             }
             return;
         }
@@ -606,7 +618,7 @@ impl App {
             ],
             Focus::Session if self.centre.is_live() => &[
                 ("i", "type"),
-                ("↵", "zoom to pane"),
+                ("↵", if Tmux::inside() { "zoom to pane" } else { "attach" }),
                 ("tab", "agents"),
                 ("q", "quit"),
             ],
@@ -659,7 +671,8 @@ pub fn run(db: Db, db_path: PathBuf, root: Option<PathBuf>) -> Result<()> {
 
     let rx = app.rx.take().expect("the app owns its channel until run takes it");
     let tx = app.tx.clone();
-    spawn_input(tx.clone());
+    let paused = Arc::new(AtomicBool::new(false));
+    spawn_input(tx.clone(), paused.clone());
     spawn_registry(tx.clone());
     spawn_transcript_poll(tx.clone());
     spawn_ticker(tx);
@@ -682,6 +695,10 @@ pub fn run(db: Db, db_path: PathBuf, root: Option<PathBuf>) -> Result<()> {
             if app.quit {
                 break;
             }
+            if app.wants_attach {
+                app.wants_attach = false;
+                attach(&mut term, &mut app, &paused)?;
+            }
             term.draw(|f| app.draw(f))?;
         }
         Ok(())
@@ -690,9 +707,53 @@ pub fn run(db: Db, db_path: PathBuf, root: Option<PathBuf>) -> Result<()> {
     result
 }
 
-fn spawn_input(tx: Sender<Msg>) {
+/// Give the terminal to tmux, and take it back when the user detaches.
+fn attach(
+    term: &mut ratatui::DefaultTerminal,
+    app: &mut App,
+    paused: &Arc<AtomicBool>,
+) -> Result<()> {
+    let Some(tmux) = app.tmux.clone() else {
+        return Ok(());
+    };
+
+    // Stop reading stdin before tmux starts: two readers on one terminal
+    // means keystrokes land wherever they happen to be collected. The pause
+    // outlasts the reader's poll window so nothing is in flight.
+    paused.store(true, Ordering::SeqCst);
+    std::thread::sleep(POLL * 2);
+
+    ratatui::restore();
+    let failed = app.centre.attach(&tmux);
+    *term = ratatui::init();
+
+    paused.store(false, Ordering::SeqCst);
+    term.clear()?;
+    app.status = failed;
+    // The pane kept running while we were away, and its size may have
+    // changed under tmux's attached client.
+    app.refresh();
+    Ok(())
+}
+
+/// How long the reader waits for a key before looking at the pause flag.
+/// Short enough that handing the terminal over feels immediate.
+const POLL: Duration = Duration::from_millis(60);
+
+fn spawn_input(tx: Sender<Msg>, paused: Arc<AtomicBool>) {
     std::thread::spawn(move || {
         loop {
+            // Polled rather than blocking on read, so that stdin can be
+            // given up while tmux has the terminal.
+            if paused.load(Ordering::SeqCst) {
+                std::thread::sleep(POLL);
+                continue;
+            }
+            match event::poll(POLL) {
+                Ok(false) => continue,
+                Err(_) => return,
+                Ok(true) => {}
+            }
             match event::read() {
                 Ok(Event::Key(key)) => {
                     if tx.send(Msg::Key(key)).is_err() {
@@ -928,8 +989,12 @@ mod tests {
         let mut app = app();
         app.on_key(KeyEvent::from(KeyCode::Tab));
         app.on_key(KeyEvent::from(KeyCode::Enter));
-        // Nothing to zoom to, so nothing is claimed.
+        // Nothing to hand over, so nothing is claimed and nothing is queued.
         assert!(app.status.is_none());
+        assert!(
+            !app.wants_attach,
+            "giving up the screen for an agent with no pane would strand the user"
+        );
     }
 
     #[test]

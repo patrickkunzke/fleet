@@ -212,6 +212,29 @@ impl Tmux {
         Ok(())
     }
 
+    /// Hand the terminal to tmux until the user detaches.
+    ///
+    /// Inherits stdio on purpose: this *is* the real terminal for as long as
+    /// it runs. The caller must have given up the alternate screen first, and
+    /// gets it back when tmux exits.
+    pub fn attach(&self, pane: &Pane) -> Result<()> {
+        self.run(&["select-window", "-t", &pane.window])?;
+        self.run(&["select-pane", "-t", &pane.id])?;
+
+        let mut command = Command::new(&self.bin);
+        if let Some(socket) = &self.socket {
+            command.args(["-L", socket]);
+        }
+        let status = command
+            .args(["attach-session", "-t", &format!("={}", pane.session)])
+            .status()
+            .context("attaching to tmux")?;
+        if !status.success() {
+            bail!("tmux attach exited with {status}");
+        }
+        Ok(())
+    }
+
     /// Send one key by its tmux name: `Enter`, `Escape`, `C-c`, `Up`.
     ///
     /// Separate from send_line because these are the things a line of text

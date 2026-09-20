@@ -53,8 +53,11 @@ Builds the binary, links it to `~/.local/bin/fleet`, links `skills/board` into
 
 ## Use
 
+Start it in any terminal. tmux holds the agents; you never have to be inside
+it. `↵` gives you the real pane and hands the screen back when you detach.
+
 ```bash
-fleet                                       # the fleet view
+fleet                                       # the fleet view, scoped to $PWD
 fleet spawn billing-svc --repo ~/Code/acme/service/billing-service
 fleet sessions --watch
 fleet repos --root ~/Code/acme           # what `n` offers

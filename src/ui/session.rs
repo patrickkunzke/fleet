@@ -236,18 +236,24 @@ impl Pane {
         tmux.send_key(pane, key)
     }
 
-    /// Hand the user the actual pane, if there is one.
+    /// Hand the user the actual pane, from inside tmux, where selecting it is
+    /// enough to move them.
     pub fn zoom(&self, tmux: &Tmux) -> Option<String> {
         let m = self.mirror.as_ref()?;
         match tmux.zoom(m.pane()) {
-            Ok(()) if Tmux::inside() => None,
-            Ok(()) => Some(format!(
-                "selected {} — attach with: tmux attach -t {}",
-                m.pane().window_name,
-                m.pane().session
-            )),
+            Ok(()) => None,
             Err(e) => Some(format!("cannot zoom: {e}")),
         }
+    }
+
+    /// Give the whole terminal over to the pane until the user detaches.
+    ///
+    /// What `↵` does when fleet is not itself running inside tmux, which is
+    /// most of the time — the point of tmux here is to hold the agents, not
+    /// to be somewhere you have to sit.
+    pub fn attach(&self, tmux: &Tmux) -> Option<String> {
+        let m = self.mirror.as_ref()?;
+        tmux.attach(m.pane()).err().map(|e| format!("cannot attach: {e}"))
     }
 
     pub fn scroll_by(&mut self, delta: isize, page: usize) {

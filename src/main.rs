@@ -35,7 +35,8 @@ struct Cli {
 enum Command {
     /// The fleet view. This is what running `fleet` with no arguments does.
     Tui {
-        /// Only show sessions working under this directory.
+        /// The workspace: which sessions to show, and where `n` looks for
+        /// repositories. Defaults to the directory you are standing in.
         #[arg(long)]
         root: Option<PathBuf>,
         #[arg(long, env = "FLEET_DB")]
@@ -260,6 +261,9 @@ fn main() -> Result<()> {
         } => {
             let path = db.unwrap_or_else(db::default_path);
             let db = Db::open(&path)?;
+            // Standing somewhere is the usual way of saying which workspace
+            // you mean, so it does not need a flag.
+            let root = root.or_else(|| std::env::current_dir().ok());
             match snapshot {
                 Some(size) => {
                     let (w, h) = size
