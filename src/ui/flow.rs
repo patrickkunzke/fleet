@@ -72,7 +72,15 @@ pub fn render(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let [head, body] = Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(inner);
+    // Header, then the rule that closes it — the same two rows the session
+    // pane uses, so switching views does not move the content or drop a
+    // divider the eye was following across the frame.
+    let [head, head_rule, body] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(inner);
 
     let what = match view {
         View::Graph => "topology",
@@ -92,6 +100,7 @@ pub fn render(
         ])),
         theme::pad(head),
     );
+    theme::rule(frame, head_rule);
 
     match view {
         View::Graph => graph(frame, theme::pad(body), events, rows),
@@ -239,10 +248,12 @@ fn log(frame: &mut Frame, area: Rect, events: &[Event], selected: usize) {
             "note" => ("·", theme::FAINT),
             _ => ("•", theme::DIM),
         };
-        let route = match (&e.from_agent, &e.to_agent) {
-            (Some(f), Some(t)) if !t.is_empty() => format!("{f} ▸ {t}"),
-            (Some(f), _) if !f.is_empty() => f.clone(),
-            _ => String::new(),
+        let (from, to) = principals(e);
+        let route = match (from, to) {
+            (Some(f), Some(t)) => format!("{f} ▸ {t}"),
+            (Some(f), None) => f.to_string(),
+            (None, Some(t)) => format!("▸ {t}"),
+            (None, None) => String::new(),
         };
         let route = clip(&route, route_width as u16);
         lines.push(
@@ -279,20 +290,37 @@ fn log(frame: &mut Frame, area: Rect, events: &[Event], selected: usize) {
 
     let Some(e) = events.get(selected) else { return };
     let width = inner.width.saturating_sub(theme::GUTTER * 2);
+
+    // Most events are not one agent addressing another — every state change
+    // and every background process has a sender and nobody at the other end.
+    // Drawing the arrow anyway pointed each of them at an em dash, which
+    // reads as a recipient whose name went missing.
+    let arrow = Style::default().fg(theme::BORDER);
+    let mut route = Vec::new();
+    match principals(e) {
+        (Some(f), Some(t)) => {
+            route.push(Span::styled(f.to_string(), Style::default().fg(theme::OK)));
+            route.push(Span::styled(" ──▶ ", arrow));
+            route.push(Span::styled(t.to_string(), theme::accent()));
+        }
+        (Some(f), None) => route.push(Span::styled(f.to_string(), Style::default().fg(theme::OK))),
+        // Addressed by the board rather than by an agent: the CLI queuing a
+        // task, or a process whose owner has since been retired.
+        (None, Some(t)) => {
+            route.push(Span::styled("──▶ ", arrow));
+            route.push(Span::styled(t.to_string(), theme::accent()));
+        }
+        (None, None) => {}
+    }
+    if let Some(task) = e.task_key.as_deref().filter(|s| !s.is_empty()) {
+        if !route.is_empty() {
+            route.push(Span::raw("  "));
+        }
+        route.push(Span::styled(task.to_string(), theme::faint()));
+    }
+
     let mut body = vec![theme::spread(
-        vec![
-            Span::styled(
-                e.from_agent.clone().unwrap_or_default(),
-                Style::default().fg(theme::OK),
-            ),
-            Span::styled(" ──▶ ", Style::default().fg(theme::BORDER)),
-            Span::styled(
-                e.to_agent.clone().unwrap_or_else(|| "—".into()),
-                theme::accent(),
-            ),
-            Span::raw("  "),
-            Span::styled(e.task_key.clone().unwrap_or_default(), theme::faint()),
-        ],
+        route,
         // Time only: the date is the same one, and a truncated timestamp
         // reads as a broken value rather than an abbreviated one.
         vec![Span::styled(
@@ -310,6 +338,17 @@ fn log(frame: &mut Frame, area: Rect, events: &[Event], selected: usize) {
         )));
     }
     frame.render_widget(Paragraph::new(body), theme::pad(inner));
+}
+
+/// Who an event is from and who it is to, with a blank name counted as no
+/// name. The two spellings reach the table from different writers — the shell
+/// board wrote empty strings where the binary writes NULL — and a route drawn
+/// from one of them would start with a space.
+fn principals(e: &Event) -> (Option<&str>, Option<&str>) {
+    fn some(s: &Option<String>) -> Option<&str> {
+        s.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    }
+    (some(&e.from_agent), some(&e.to_agent))
 }
 
 fn hhmm(ts: &str) -> String {
@@ -390,6 +429,57 @@ mod tests {
         term.draw(|f| render(f, f.area(), view, events, &rows, selected, true))
             .unwrap();
         format!("{}", term.backend())
+    }
+
+    #[test]
+    fn the_header_is_closed_by_a_rule_in_both_views() {
+        // The session pane closes its header the same way. Switching views
+        // must not drop a divider the eye was following across the frame.
+        for view in [View::Graph, View::Log] {
+            let out = drawn(view, &[event("message", "chief", "billing-svc", "go")], 0, 60, 14);
+            let second = out.lines().nth(1).unwrap_or_default();
+            assert!(
+                second.contains("───"),
+                "no rule under the {view:?} header: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_event_with_nobody_at_the_far_end_draws_no_arrow() {
+        // Every state change and every background process has a sender and
+        // no recipient, which is most of the table. An arrow there pointed
+        // at an em dash, reading as a name that had gone missing.
+        let out = drawn(View::Log, &[event("bg", "accounts-svc", "", "started: gradlew")], 0, 60, 14);
+        assert!(out.contains("accounts-svc"), "{out}");
+        assert!(!out.contains("──▶"), "an arrow to nobody: {out}");
+        assert!(!out.contains('—'), "an em dash standing in for a name: {out}");
+    }
+
+    #[test]
+    fn an_event_from_nobody_says_so_by_leaving_the_column_empty() {
+        // The board writes these itself: a task queued from the CLI.
+        let out = drawn(View::Log, &[event("task", "", "", "queued: consume param")], 0, 60, 14);
+        assert!(out.contains("queued: consume param"), "{out}");
+        assert!(!out.contains("──▶"), "{out}");
+        assert!(!out.contains('—'), "{out}");
+    }
+
+    #[test]
+    fn a_message_still_shows_both_ends_and_the_arrow_between_them() {
+        let out = drawn(View::Log, &[event("message", "chief", "accounts-svc", "take it")], 0, 70, 14);
+        assert!(out.contains("chief"), "{out}");
+        assert!(out.contains("──▶"), "a message is the case the arrow is for: {out}");
+    }
+
+    #[test]
+    fn a_blank_name_counts_as_no_name() {
+        // The shell board wrote empty strings where the binary writes NULL,
+        // and one flow log reads both.
+        let mut e = event("task", "", "", "done");
+        e.from_agent = Some("  ".into());
+        e.to_agent = Some(String::new());
+        assert_eq!(principals(&e), (None, None));
     }
 
     #[test]
