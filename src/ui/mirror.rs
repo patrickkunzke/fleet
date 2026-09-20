@@ -183,6 +183,11 @@ impl Mirror {
         let _ = self.start_pipe();
     }
 
+    /// The mirrored screen, for reading a selection out of it.
+    pub fn screen(&self) -> &vt100::Screen {
+        self.parser.screen()
+    }
+
     pub fn render(&self, frame: &mut Frame, area: Rect) {
         frame.render_widget(PseudoTerminal::new(self.parser.screen()), area);
     }
@@ -244,6 +249,38 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
         }
         mirror.contents()
+    }
+
+    #[test]
+    fn a_drag_over_the_pane_reads_back_what_the_agent_printed() {
+        use crate::ui::selection::Selection;
+
+        let Some(s) = Scratch::new("select") else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let pane = s
+            .tmux
+            .spawn(
+                "selectable",
+                dir.path(),
+                "sh -c 'printf \"MR !412 is green\\nsecond line\\n\"; sleep 20'",
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        let mut mirror = Mirror::attach(&s.tmux, pane, 40, 10).unwrap();
+        settle(&mut mirror, "MR !412");
+
+        // The whole of the first line: the end column is the cell under the
+        // pointer, which is selected like everywhere else.
+        let mut sel = Selection::start((0, 0));
+        sel.drag_to((0, 15));
+        assert_eq!(sel.text(mirror.screen()).trim_end(), "MR !412 is green");
+
+        // And across the break into the next.
+        sel.drag_to((1, 5));
+        let both = sel.text(mirror.screen());
+        assert!(both.starts_with("MR !412 is green"), "{both:?}");
+        assert!(both.contains('\n'), "the line break comes with it: {both:?}");
+        assert!(both.trim_end().ends_with("second"), "{both:?}");
     }
 
     #[test]

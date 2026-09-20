@@ -24,6 +24,7 @@ use crate::ui::keys::Key;
 use crate::transcript::{BACKFILL_BYTES, Entry, Outcome, Transcript};
 use crate::ui::fleet::{Presence, Row};
 use crate::ui::mirror::Mirror;
+use crate::ui::selection::{self, Selection};
 use crate::ui::theme;
 
 #[derive(Default)]
@@ -48,6 +49,9 @@ pub struct Pane {
     /// ours may reason about it.
     content_at: std::cell::Cell<Rect>,
     note: Option<String>,
+    /// A drag over the agent's output. Ours to track, because capturing the
+    /// mouse is what stopped the terminal doing it.
+    selection: Option<Selection>,
 }
 
 impl Pane {
@@ -112,6 +116,52 @@ impl Pane {
         }
     }
 
+    /// Begin a selection, if the press landed on an agent's own output.
+    ///
+    /// Only the live pane: the transcript and the flow views are our text,
+    /// laid out by us, and a selection over them would be a selection of the
+    /// rendering rather than of anything an agent said.
+    pub fn press(&mut self, column: u16, row: u16) {
+        self.selection = self
+            .mirror
+            .as_ref()
+            .and(selection::cell_at(self.content_at.get(), column, row))
+            .map(Selection::start);
+    }
+
+    pub fn drag(&mut self, column: u16, row: u16) {
+        if let (Some(sel), Some(at)) = (
+            self.selection.as_mut(),
+            selection::cell_at(self.content_at.get(), column, row),
+        ) {
+            sel.drag_to(at);
+        }
+    }
+
+    /// Finish a drag, and hand back what was under it.
+    ///
+    /// A click is a drag of nothing and yields nothing: otherwise every
+    /// click on the pane would put one character on the clipboard, over
+    /// whatever was there.
+    pub fn release(&mut self) -> Option<String> {
+        let sel = self.selection.take()?;
+        if sel.is_empty() {
+            return None;
+        }
+        let text = sel.text(self.mirror.as_ref()?.screen());
+        // Trailing blanks are the rest of the terminal's rows, not something
+        // anybody meant to copy.
+        let text = text.trim_end().to_string();
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// Drop the selection. Anything that moves the text under it — a
+    /// keystroke reaching the agent, a scroll — invalidates it, and a
+    /// highlight left over a line it no longer covers is a lie.
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
     /// Read whatever the agent has written since last time. Returns true when
     /// there is something new, so the caller can skip a redraw when there is
     /// not.
@@ -166,7 +216,14 @@ impl Pane {
     }
 
     /// Scroll the mirrored screen. Ignored on a transcript, which has its own.
+    /// Scroll the mirrored pane. The selection goes: it is anchored to cells
+    /// on the screen, and everything under it has just moved.
     pub fn scroll_mirror(&mut self, delta: isize) -> bool {
+        self.selection = None;
+        self.scroll_mirror_inner(delta)
+    }
+
+    fn scroll_mirror_inner(&mut self, delta: isize) -> bool {
         match self.mirror.as_mut() {
             Some(m) => {
                 m.scroll_by(delta);
@@ -256,6 +313,10 @@ impl Pane {
             // picture of one.
             m.resize(body.width, body.height);
             m.render(frame, body);
+            // Over the top of the agent's own output, once it is drawn.
+            if let Some(sel) = &self.selection {
+                sel.highlight(frame.buffer_mut(), body);
+            }
             return;
         }
 

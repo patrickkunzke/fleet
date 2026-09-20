@@ -22,7 +22,9 @@ already runs on the machine.
 | `src/agent.rs` — starting an agent, repo discovery | done, 4 tests |
 | `n` to spawn from the rail | done |
 | `src/ui/flow.rs` — graph and log views | done, 18 tests |
-| `src/ui/mirror.rs` — the live tmux pane | done, 5 tests |
+| `src/ui/mirror.rs` — the live tmux pane | done, 6 tests |
+| `src/ui/selection.rs` — drag to copy from a pane | done, 6 tests |
+| `src/ui/clipboard.rs` — pbcopy and OSC 52 | done, 3 tests |
 | `src/ui/preview.rs` — the fixture fleet, for layout work | done, 4 tests |
 
 ## What it is built on
@@ -82,9 +84,23 @@ that.
 everything you type reaches that session — arrows, Escape, Ctrl-C, its own
 line editor. The wheel scrolls it. There is no mode to enter first.
 
+**Drag over an agent's output to copy it.** Capturing the mouse is what lets
+a pane be clicked and scrolled, and it takes the terminal's own selection
+away — there is no way to have both. So fleet does the selecting: drag, and
+what was under it goes to the clipboard on release, by `pbcopy` and by OSC 52
+so it also works over SSH. Anything that moves the text — a keystroke, a
+scroll — drops the selection rather than leaving a highlight over a line that
+has gone.
+
+That covers the centre pane, which is an agent's own output. To select
+anywhere else — the rails, the flow log — **`^a m`** hands the mouse back to
+the terminal entirely; clicking and scrolling stop until you press it again,
+and the key bar says so while it is off.
+
 Fleet's own keys live behind **`Ctrl-A`**, the way a multiplexer's do: `^a n`
-new agent, `^a x` take one off the rail, `^a z` fold the rails away, `^a g`
-graph, `^a l` log, `^a tab` move the keyboard, `^a q` quit. `↵` hands you the real terminal until you
+new agent, `^a x` take one off the rail, `^a m` give the mouse back, `^a z`
+fold the rails away, `^a g` graph, `^a l` log, `^a tab` move the keyboard,
+`^a q` quit. `↵` hands you the real terminal until you
 detach. `^a ^a` sends a literal Ctrl-A through. Where nothing is live to type
 into — a transcript, the flow views — the keys act directly without it.
 

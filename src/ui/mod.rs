@@ -11,12 +11,14 @@
 //! to keep showing elapsed time.
 
 pub mod board;
+pub mod clipboard;
 pub mod fleet;
 pub mod flow;
 pub mod keys;
 pub mod picker;
 pub mod mirror;
 pub mod preview;
+pub mod selection;
 pub mod session;
 pub mod theme;
 
@@ -88,6 +90,9 @@ pub struct App {
     /// Where each pane was last drawn, so a click can be routed to it.
     rail_at: Rect,
     centre_at: Rect,
+    /// Whether fleet is taking the mouse. While it does, the terminal
+    /// cannot select text, so this is something you can give back.
+    mouse: bool,
     /// True between the prefix and the key it modifies.
     armed: bool,
     /// The repository picker, while it is open. An overlay rather than a
@@ -142,6 +147,7 @@ impl App {
             focus: Focus::Session,
             rail_at: Rect::ZERO,
             centre_at: Rect::ZERO,
+            mouse: true,
             armed: false,
             picker: None,
             tasks: Vec::new(),
@@ -263,6 +269,7 @@ impl App {
             (KeyCode::Char('l'), _) => {
                 self.centre_view = (self.centre_view != Some(View::Log)).then_some(View::Log)
             }
+            (KeyCode::Char('m'), _) => self.take_mouse(!self.mouse),
             (KeyCode::Char('n'), _) => self.open_picker(),
             (KeyCode::Char('x'), _) => self.retire_selected(),
             (KeyCode::Enter, _) if self.centre_view.is_none() => self.hand_over(),
@@ -284,8 +291,10 @@ impl App {
         };
         let Some(tmux) = self.tmux.clone() else { return };
         // Typing returns you to the live edge: writing into a screen you are
-        // scrolled away from shows nothing happening.
+        // scrolled away from shows nothing happening. It also moves the text
+        // a selection was drawn over, so the selection goes with it.
         self.centre.mirror_to_live();
+        self.centre.clear_selection();
         match self.centre.send(&tmux, &translated) {
             Ok(()) => self.echo(),
             Err(e) => self.status = Some(e.to_string()),
@@ -344,6 +353,20 @@ impl App {
                 } else if inside(self.centre_at, at) {
                     // Clicking a terminal is how you say "talk to this one".
                     self.focus = Focus::Session;
+                    // And it is where a drag over its output begins.
+                    self.centre.press(ev.column, ev.row);
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => self.centre.drag(ev.column, ev.row),
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(text) = self.centre.release() {
+                    let lines = text.lines().count();
+                    let s = if lines == 1 { "" } else { "s" };
+                    self.status = Some(if clipboard::copy(&text) {
+                        format!("copied {lines} line{s}")
+                    } else {
+                        "nothing here can reach the clipboard".into()
+                    });
                 }
             }
             // The live pane and the transcript each keep their own history,
@@ -474,6 +497,29 @@ impl App {
             let _ = self.db.retire_agent(&name);
         }
         self.refresh();
+    }
+
+    /// Take the mouse, or hand it back to the terminal.
+    ///
+    /// A terminal selects text with the mouse, and an application that
+    /// reports mouse events takes that away: there is no way to have both,
+    /// and no way for us to put a selection on the clipboard on the
+    /// terminal's behalf. So it is a switch. Clicking a pane and scrolling
+    /// one stop working while it is off, which is a fair trade for being
+    /// able to copy what an agent just said.
+    fn take_mouse(&mut self, take: bool) {
+        use std::io::stdout;
+        let done = if take {
+            crossterm::execute!(stdout(), EnableMouseCapture)
+        } else {
+            crossterm::execute!(stdout(), DisableMouseCapture)
+        };
+        if done.is_err() {
+            self.status = Some("the terminal would not change mouse reporting".into());
+            return;
+        }
+        self.mouse = take;
+        self.status = take.then(|| "mouse back to fleet — click a pane, scroll it".into());
     }
 
     /// Make sure there is someone to brief.
@@ -726,6 +772,20 @@ impl App {
     }
 
     fn draw_keys(&self, frame: &mut Frame, area: Rect) {
+        // Before the status, and instead of the keys: with the mouse gone,
+        // half of what the bar advertises does nothing, and a click that
+        // quietly fails is worse than one the bar warned you about.
+        if !self.mouse {
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("the terminal has the mouse", theme::accent()),
+                    Span::styled("   ^a m", theme::dim()),
+                    Span::styled(" mouse back to fleet", theme::faint()),
+                ])),
+                theme::pad(area),
+            );
+            return;
+        }
         if let Some(status) = &self.status {
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(status.clone(), theme::accent()))),
@@ -740,7 +800,7 @@ impl App {
                 Paragraph::new(Line::from(vec![
                     Span::styled(" ^a ", theme::accent().add_modifier(Modifier::REVERSED)),
                     Span::styled(
-                        "  n new  x retire  z wide  g graph  l log  tab focus  q quit",
+                        "  n new  x retire  m mouse  z wide  g graph  l log  tab focus  q quit",
                         theme::dim(),
                     ),
                 ])),
@@ -757,7 +817,7 @@ impl App {
                 ("keys", "→ agent"),
                 ("^a", "fleet"),
                 ("↵", "attach"),
-                ("click", "a pane"),
+                ("drag", "to copy"),
             ],
             Some(View::Log) => &[
                 ("↑↓", "event"),
@@ -925,7 +985,12 @@ fn attach(
     ratatui::restore();
     let failed = app.centre.attach(&tmux);
     *term = ratatui::init();
-    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+    // Whatever the user left it as. Handing the mouse back and then taking
+    // it again behind their back is the sort of thing that makes a program
+    // feel haunted.
+    if app.mouse {
+        let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+    }
 
     paused.store(false, Ordering::SeqCst);
     term.clear()?;
@@ -1235,6 +1300,31 @@ mod tests {
         let Some(home) = home else { return };
         assert_eq!(shorten(&home.join("Code/fleet"), 40), "~/Code/fleet");
         assert_eq!(shorten(&home, 40), "~");
+    }
+
+    #[test]
+    fn the_mouse_can_be_handed_back_to_the_terminal() {
+        // An application that reports mouse events stops the terminal
+        // selecting text, and there is no way to have both.
+        let mut app = app();
+        assert!(app.mouse, "fleet takes it to begin with");
+
+        app.on_key(KeyEvent::new(KeyCode::Char(PREFIX), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::from(KeyCode::Char('m')));
+        assert!(!app.mouse);
+
+        // The bar has to say so: with the mouse gone, half of what it
+        // advertises does nothing, and a click that quietly fails is worse
+        // than one it warned you about.
+        let out = drawn(&mut app, 110, 24);
+        assert!(out.contains("the terminal has the mouse"), "{out}");
+        assert!(out.contains("^a m"), "and how to get it back: {out}");
+
+        app.on_key(KeyEvent::new(KeyCode::Char(PREFIX), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::from(KeyCode::Char('m')));
+        assert!(app.mouse);
+        let out = drawn(&mut app, 110, 24);
+        assert!(!out.contains("the terminal has the mouse"), "{out}");
     }
 
     #[test]
