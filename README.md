@@ -19,7 +19,7 @@ already runs on the machine.
 | `src/db.rs` — fleet.db reads and writes | done, 11 tests |
 | `fleet board` reads in the binary | done; writes still cli/board.sh |
 | `src/tmux.rs` — spawning and pane control | done, 8 tests |
-| `src/ui/` — frame and fleet rail | done, 16 tests; centre and right rails are stubs |
+| `src/ui/` — frame, fleet rail, session pane | done, 26 tests; the right rail is still a stub |
 | TUI panes | not started |
 | `board` subcommand in the binary | not started |
 
@@ -109,7 +109,7 @@ src/db.rs            fleet.db  [done]
 src/registry.rs      ~/.claude/sessions watcher (notify / FSEvents)  [done]
 src/transcript.rs    jsonl tail  [done]
 src/tmux.rs          spawn a session into a pane, zoom to it  [done]
-src/ui/…             fleet rail [done], session pane, flow, board rail
+src/ui/…             fleet rail [done], session pane [done], flow, board rail
 schema.sql           embedded with include_str!
 skills/board/        installed by `fleet install-skill`
 ```

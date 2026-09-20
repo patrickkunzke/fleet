@@ -11,6 +11,7 @@
 //! to keep showing elapsed time.
 
 pub mod fleet;
+pub mod session;
 pub mod theme;
 
 use std::path::PathBuf;
@@ -35,14 +36,28 @@ enum Msg {
     Key(KeyEvent),
     Registry,
     Tick,
+    /// The selected session may have written something. Far more frequent
+    /// than the others and usually finds nothing, so it redraws only when
+    /// the transcript actually grew.
+    Transcript,
+}
+
+/// Which half of the frame the arrow keys belong to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    Rail,
+    Session,
 }
 
 pub struct App {
     registry: Registry,
     db: Db,
     root: Option<PathBuf>,
+    projects: PathBuf,
     rows: Vec<Row>,
     selected: usize,
+    centre: session::Pane,
+    focus: Focus,
     /// Counts for the right rail until it has panes of its own.
     tasks: usize,
     blocked: usize,
@@ -57,8 +72,11 @@ impl App {
             registry: Registry::new(registry::default_dir()),
             db,
             root,
+            projects: registry::default_projects_dir(),
             rows: Vec::new(),
             selected: 0,
+            centre: session::Pane::default(),
+            focus: Focus::Rail,
             tasks: 0,
             blocked: 0,
             background: 0,
@@ -95,6 +113,13 @@ impl App {
         }
 
         self.selected = self.selected.min(self.rows.len().saturating_sub(1));
+        self.retarget();
+    }
+
+    /// Point the centre pane at the selection. Cheap when it has not changed.
+    fn retarget(&mut self) {
+        let row = self.selected().cloned();
+        self.centre.follow(row.as_ref(), &self.projects);
     }
 
     fn on_key(&mut self, key: KeyEvent) {
@@ -103,13 +128,54 @@ impl App {
         }
         match (key.code, key.modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Char('q'), _) => {
-                self.quit = true
+                self.quit = true;
+                return;
             }
-            (KeyCode::Down, _) | (KeyCode::Char('j'), _) => self.move_by(1),
-            (KeyCode::Up, _) | (KeyCode::Char('k'), _) => self.move_by(-1),
-            (KeyCode::Char('g'), _) => self.selected = 0,
-            (KeyCode::Char('G'), _) => self.selected = self.rows.len().saturating_sub(1),
-            (KeyCode::Char('r'), _) => self.refresh(),
+            (KeyCode::Tab, _) => {
+                self.focus = match self.focus {
+                    Focus::Rail => Focus::Session,
+                    Focus::Session => Focus::Rail,
+                };
+                return;
+            }
+            (KeyCode::Char('r'), _) => {
+                self.refresh();
+                return;
+            }
+            _ => {}
+        }
+
+        match self.focus {
+            Focus::Rail => self.rail_key(key),
+            Focus::Session => self.session_key(key),
+        }
+    }
+
+    fn rail_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => self.move_by(1),
+            KeyCode::Up | KeyCode::Char('k') => self.move_by(-1),
+            KeyCode::Char('g') => {
+                self.selected = 0;
+                self.retarget();
+            }
+            KeyCode::Char('G') => {
+                self.selected = self.rows.len().saturating_sub(1);
+                self.retarget();
+            }
+            _ => {}
+        }
+    }
+
+    fn session_key(&mut self, key: KeyEvent) {
+        // Up scrolls back through history, which means increasing the offset
+        // from the bottom.
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => self.centre.scroll_by(1, 1),
+            KeyCode::Down | KeyCode::Char('j') => self.centre.scroll_by(-1, 1),
+            KeyCode::PageUp => self.centre.scroll_by(1, 10),
+            KeyCode::PageDown => self.centre.scroll_by(-1, 10),
+            KeyCode::Char('G') | KeyCode::End => self.centre.to_tail(),
             _ => {}
         }
     }
@@ -120,6 +186,7 @@ impl App {
         }
         let last = self.rows.len() as isize - 1;
         self.selected = (self.selected as isize + delta).clamp(0, last) as usize;
+        self.retarget();
     }
 
     pub fn selected(&self) -> Option<&Row> {
@@ -147,7 +214,7 @@ impl App {
         .areas(body);
 
         fleet::render(frame, rail, &self.rows, self.selected);
-        self.draw_centre(frame, centre);
+        self.centre.render(frame, centre, self.selected());
         self.draw_side(frame, side);
         self.draw_keys(frame, keys);
     }
@@ -190,48 +257,6 @@ impl App {
         ));
 
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
-    }
-
-    fn draw_centre(&self, frame: &mut Frame, area: Rect) {
-        let block = Block::default()
-            .borders(Borders::RIGHT)
-            .border_style(Style::default().fg(theme::BORDER));
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-
-        let mut lines = Vec::new();
-        match self.selected() {
-            Some(row) => {
-                lines.push(Line::from(vec![
-                    Span::styled(row.name.clone(), Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)),
-                    Span::raw("  "),
-                    Span::styled(row.repo.clone(), theme::faint()),
-                ]));
-                lines.push(Line::from(Span::styled(row.detail.clone(), theme::dim())));
-                lines.push(Line::raw(""));
-                match &row.session_id {
-                    Some(id) => lines.push(Line::from(Span::styled(
-                        format!("session {id}"),
-                        theme::faint(),
-                    ))),
-                    None => lines.push(Line::from(Span::styled(
-                        "no session linked — spawn or adopt one",
-                        theme::faint(),
-                    ))),
-                }
-            }
-            None => lines.push(Line::from(Span::styled(
-                "nothing selected",
-                theme::faint(),
-            ))),
-        }
-        lines.push(Line::raw(""));
-        lines.push(Line::from(Span::styled(
-            "the session pane goes here",
-            theme::faint(),
-        )));
-
-        frame.render_widget(Paragraph::new(lines), pad(inner));
     }
 
     fn draw_side(&self, frame: &mut Frame, area: Rect) {
@@ -280,13 +305,22 @@ impl App {
             );
             return;
         }
-        let keys = [
-            ("↑↓", "agent"),
-            ("r", "refresh"),
-            ("q", "quit"),
-        ];
+        let keys: &[(&str, &str)] = match self.focus {
+            Focus::Rail => &[
+                ("↑↓", "agent"),
+                ("tab", "session"),
+                ("r", "refresh"),
+                ("q", "quit"),
+            ],
+            Focus::Session => &[
+                ("↑↓", "scroll"),
+                ("G", "live"),
+                ("tab", "agents"),
+                ("q", "quit"),
+            ],
+        };
         let mut spans = vec![Span::raw(" ")];
-        for (key, what) in keys {
+        for (key, what) in keys.iter().copied() {
             spans.push(Span::styled(key, theme::dim()));
             spans.push(Span::raw(" "));
             spans.push(Span::styled(what, theme::faint()));
@@ -330,6 +364,7 @@ pub fn run(db: Db, root: Option<PathBuf>) -> Result<()> {
     let (tx, rx) = channel();
     spawn_input(tx.clone());
     spawn_registry(tx.clone());
+    spawn_transcript_poll(tx.clone());
     spawn_ticker(tx);
 
     let mut term = ratatui::init();
@@ -339,6 +374,13 @@ pub fn run(db: Db, root: Option<PathBuf>) -> Result<()> {
             match msg {
                 Msg::Key(key) => app.on_key(key),
                 Msg::Registry | Msg::Tick => app.refresh(),
+                Msg::Transcript => {
+                    // Nothing new is the common case; redrawing anyway would
+                    // burn a frame twice a second for no visible change.
+                    if !app.centre.poll() {
+                        continue;
+                    }
+                }
             }
             if app.quit {
                 break;
@@ -386,6 +428,19 @@ fn spawn_registry(tx: Sender<Msg>) {
     });
 }
 
+/// A live agent writes to its transcript continuously, and those writes
+/// produce no event this loop would otherwise see.
+fn spawn_transcript_poll(tx: Sender<Msg>) {
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_millis(400));
+            if tx.send(Msg::Transcript).is_err() {
+                return;
+            }
+        }
+    });
+}
+
 fn spawn_ticker(tx: Sender<Msg>) {
     std::thread::spawn(move || {
         loop {
@@ -425,7 +480,7 @@ mod tests {
         let out = drawn(&app(), 110, 24);
         assert!(out.contains("fleet"), "{out}");
         assert!(out.contains("FLEET"), "the rail: {out}");
-        assert!(out.contains("session pane"), "the centre: {out}");
+        assert!(out.contains("no session linked"), "the centre: {out}");
         assert!(out.contains("TASKS"), "the right rail: {out}");
         assert!(out.contains("BACKGROUND"), "and its lower half: {out}");
         assert!(out.contains("quit"), "the key bar: {out}");
@@ -460,6 +515,26 @@ mod tests {
             out.contains("no session linked"),
             "an agent with no live session says so: {out}"
         );
+    }
+
+    #[test]
+    fn tab_moves_the_arrow_keys_between_the_rail_and_the_session() {
+        let mut app = app();
+        assert_eq!(app.focus, Focus::Rail);
+        assert!(drawn(&app, 110, 24).contains("agent"));
+
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Session);
+
+        // Down no longer changes which agent is selected.
+        let before = app.selected().unwrap().name.clone();
+        app.on_key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(app.selected().unwrap().name, before);
+        assert!(drawn(&app, 110, 24).contains("scroll"), "the key bar follows focus");
+
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        app.on_key(KeyEvent::from(KeyCode::Down));
+        assert_ne!(app.selected().unwrap().name, before);
     }
 
     #[test]
