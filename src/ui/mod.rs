@@ -571,7 +571,10 @@ impl App {
         let area = frame.area();
         frame.render_widget(Block::default().style(theme::base()), area);
 
-        let [top, top_rule, body, key_rule, keys] = Layout::vertical([
+        // A row above the title, so it is not jammed against the terminal's
+        // first line.
+        let [_, top, top_rule, body, key_rule, keys] = Layout::vertical([
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(0),
@@ -628,6 +631,24 @@ impl App {
             self.draw_side(frame, side);
         }
         self.draw_keys(frame, keys);
+
+        // After everything, so that every rule and divider is on the buffer
+        // to be joined up.
+        if !self.wide {
+            let columns = [rail.x + rail.width - 1, centre.x + centre.width - 1];
+            // The flow views are ours to draw; a session's output is not.
+            let theirs = match self.centre_view {
+                Some(_) => Rect::ZERO,
+                None => self.centre.content_at(),
+            };
+            theme::join(
+                frame.buffer_mut(),
+                &columns,
+                top_rule.y,
+                key_rule.y + 1,
+                theirs,
+            );
+        }
 
         if let Some(picker) = &self.picker {
             picker.render(frame, area);

@@ -43,6 +43,10 @@ pub struct Pane {
     /// this — an entry is one line or twenty depending on the pane's width —
     /// so it is recorded there and used to clamp the next keystroke.
     max_scroll: std::cell::Cell<usize>,
+    /// Where the agent's own output was last drawn. Whatever is in there was
+    /// written by the agent, box-drawing characters included, and nothing of
+    /// ours may reason about it.
+    content_at: std::cell::Cell<Rect>,
     note: Option<String>,
 }
 
@@ -133,6 +137,11 @@ impl Pane {
                 true
             }
         }
+    }
+
+    /// The area holding the agent's output, as last drawn.
+    pub fn content_at(&self) -> Rect {
+        self.content_at.get()
     }
 
     /// Is the centre showing the real terminal rather than our reading of it?
@@ -239,6 +248,7 @@ impl Pane {
 
         self.render_head(frame, head, row, focused);
         theme::rule(frame, head_rule);
+        self.content_at.set(body);
 
         if let Some(m) = self.mirror.as_mut() {
             // No gutter here. Every other pane is text we lay out; this one
