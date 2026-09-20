@@ -49,6 +49,8 @@ pub struct Row {
     pub detail: String,
     pub bg_running: i64,
     pub session_id: Option<String>,
+    pub branch: Option<String>,
+    pub tmux_target: Option<String>,
     pub pid: Option<i32>,
 }
 
@@ -124,6 +126,8 @@ pub fn merge(
             detail,
             bg_running: a.bg_running,
             session_id: a.session_id.clone(),
+            branch: a.branch.clone(),
+            tmux_target: a.tmux_target.clone(),
             pid: live.map(|s| s.pid),
         });
     }
@@ -156,6 +160,8 @@ pub fn merge(
             detail: "not on the board".to_string(),
             bg_running: 0,
             session_id: Some(s.session_id.clone()),
+            branch: None,
+            tmux_target: None,
             pid: Some(s.pid),
         })
         .collect();

@@ -1,0 +1,523 @@
+//! The centre pane: the selected agent's live session.
+//!
+//! Not a summary of the session — the session itself, in the order it
+//! happened, as the transcript records it. The pane follows the tail the way
+//! a terminal does: new output pushes the view along until you scroll back,
+//! and then it holds still until you return to the bottom. Scrolling away and
+//! silently being yanked back by an agent's next tool call is the single most
+//! annoying thing a live log can do.
+
+use ratatui::prelude::*;
+use ratatui::widgets::{Block, Borders, Paragraph};
+
+use crate::transcript::{BACKFILL_BYTES, Entry, Outcome, Transcript};
+use crate::ui::fleet::{Presence, Row};
+use crate::ui::theme;
+
+#[derive(Default)]
+pub struct Pane {
+    /// Which session this pane is showing, so a changed selection reopens.
+    session_id: Option<String>,
+    /// Whether `follow` has ever run. Without it the first call on an agent
+    /// with no session looks identical to "nothing changed", and the pane
+    /// stays blank instead of saying why.
+    targeted: bool,
+    transcript: Option<Transcript>,
+    /// Lines held back from the bottom. Zero means following the tail.
+    scroll: usize,
+    /// How far back the last draw could have scrolled. Only rendering knows
+    /// this — an entry is one line or twenty depending on the pane's width —
+    /// so it is recorded there and used to clamp the next keystroke.
+    max_scroll: std::cell::Cell<usize>,
+    note: Option<String>,
+}
+
+impl Pane {
+    /// Point the pane at whatever is selected, reopening only on a change.
+    pub fn follow(&mut self, row: Option<&Row>, projects_dir: &std::path::Path) {
+        let wanted = row.and_then(|r| r.session_id.clone());
+        if self.targeted && wanted == self.session_id {
+            return;
+        }
+        self.targeted = true;
+        self.session_id = wanted.clone();
+        self.transcript = None;
+        self.scroll = 0;
+        self.note = None;
+
+        let Some(id) = wanted else {
+            self.note = Some("no session linked".into());
+            return;
+        };
+        // The transcript is found by session id rather than by the agent's
+        // repo: an agent that moved, or one adopted from elsewhere, still has
+        // exactly one file.
+        let path = std::fs::read_dir(projects_dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path().join(format!("{id}.jsonl")))
+            .find(|p| p.is_file());
+
+        match path {
+            Some(p) => match Transcript::open(&p, BACKFILL_BYTES) {
+                Ok(t) => self.transcript = Some(t),
+                Err(e) => self.note = Some(format!("cannot read the transcript: {e}")),
+            },
+            None => self.note = Some("no transcript yet".into()),
+        }
+    }
+
+    /// Read whatever the agent has written since last time. Returns true when
+    /// there is something new, so the caller can skip a redraw when there is
+    /// not.
+    pub fn poll(&mut self) -> bool {
+        let Some(t) = self.transcript.as_mut() else {
+            return false;
+        };
+        match t.poll() {
+            Ok(added) => {
+                // Scrolled back: hold the view where it is by pushing the
+                // offset along with the new lines.
+                if self.scroll > 0 {
+                    self.scroll += added;
+                }
+                added > 0
+            }
+            Err(e) => {
+                self.note = Some(format!("transcript stopped: {e}"));
+                self.transcript = None;
+                true
+            }
+        }
+    }
+
+    pub fn scroll_by(&mut self, delta: isize, page: usize) {
+        let max = self.max_scroll.get() as isize;
+        let next = self.scroll as isize + delta * page as isize;
+        self.scroll = next.clamp(0, max.max(0)) as usize;
+    }
+
+    pub fn to_tail(&mut self) {
+        self.scroll = 0;
+    }
+
+    pub fn following(&self) -> bool {
+        self.scroll == 0
+    }
+
+    pub fn render(&self, frame: &mut Frame, area: Rect, row: Option<&Row>) {
+        let block = Block::default()
+            .borders(Borders::RIGHT)
+            .border_style(Style::default().fg(theme::BORDER));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let [head, body] =
+            Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(inner);
+
+        self.render_head(frame, head, row);
+
+        let width = body.width.saturating_sub(2);
+        let mut lines: Vec<Line> = Vec::new();
+        match (&self.transcript, &self.note) {
+            (Some(t), _) => {
+                for entry in t.entries() {
+                    render_entry(entry, width, &mut lines);
+                }
+            }
+            (None, Some(note)) => lines.push(Line::from(Span::styled(note.clone(), theme::faint()))),
+            (None, None) => {}
+        }
+
+        // Anchor at the bottom: a session pane that starts at the top of a
+        // thousand-line history shows you the least useful part of it.
+        let height = body.height as usize;
+        let total = lines.len();
+        self.max_scroll.set(total.saturating_sub(height));
+        let end = total.saturating_sub(self.scroll.min(self.max_scroll.get()));
+        let start = end.saturating_sub(height);
+        let visible: Vec<Line> = lines[start..end].to_vec();
+
+        frame.render_widget(Paragraph::new(visible), pad(body));
+    }
+
+    fn render_head(&self, frame: &mut Frame, area: Rect, row: Option<&Row>) {
+        let Some(row) = row else { return };
+        let (glyph, colour) = match row.presence {
+            Presence::Working => ("●", theme::BUSY),
+            Presence::Waiting => ("○", theme::OK),
+            _ => ("×", theme::FAINT),
+        };
+
+        let mut spans = vec![
+            Span::styled(glyph, Style::default().fg(colour)),
+            Span::raw(" "),
+            Span::styled(
+                row.name.clone(),
+                Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(row.repo.clone(), theme::faint()),
+        ];
+        if let Some(branch) = &row.branch {
+            spans.push(Span::styled(format!("  {branch}"), theme::faint()));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), pad(area));
+
+        // Right-aligned, and drawn over the left half rather than appended to
+        // it: a long branch name would otherwise push this off the edge, and
+        // "you are not looking at the live edge" is the one thing in the
+        // header that must never be the part that gets clipped.
+        if !self.following() {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled("scrolled back ", theme::accent())))
+                    .alignment(Alignment::Right),
+                pad(area),
+            );
+        }
+    }
+}
+
+fn pad(area: Rect) -> Rect {
+    Rect {
+        x: area.x + 1,
+        y: area.y,
+        width: area.width.saturating_sub(2),
+        height: area.height,
+    }
+}
+
+fn render_entry(entry: &Entry, width: u16, out: &mut Vec<Line<'static>>) {
+    match entry {
+        Entry::Prompt { text, .. } => {
+            for (i, line) in wrap(text, width.saturating_sub(2)).into_iter().enumerate() {
+                out.push(Line::from(vec![
+                    Span::styled(if i == 0 { "› " } else { "  " }, theme::accent()),
+                    Span::styled(line, Style::default().fg(theme::TEXT)),
+                ]));
+            }
+            out.push(Line::raw(""));
+        }
+        Entry::CrossSessionMessage { from, text, .. } => {
+            out.push(Line::from(vec![
+                Span::styled("← ", theme::accent()),
+                Span::styled(from.clone(), Style::default().fg(theme::OK)),
+            ]));
+            for line in wrap(text, width.saturating_sub(2)) {
+                out.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(line, Style::default().fg(theme::TEXT)),
+                ]));
+            }
+            out.push(Line::raw(""));
+        }
+        Entry::Say { text, .. } => {
+            for line in wrap(text, width) {
+                out.push(Line::from(Span::styled(
+                    line,
+                    Style::default().fg(theme::TEXT),
+                )));
+            }
+            out.push(Line::raw(""));
+        }
+        Entry::Thought { chars, .. } => {
+            out.push(Line::from(Span::styled(
+                format!("  thought for {}", thousands(*chars)),
+                theme::faint(),
+            )));
+        }
+        Entry::Tool {
+            name,
+            target,
+            outcome,
+            sidechain,
+            ..
+        } => {
+            let (glyph, colour) = match outcome {
+                Outcome::Pending => ("◐", theme::BUSY),
+                Outcome::Ok(_) => ("⏺", theme::OK),
+                Outcome::Failed(_) => ("⏺", theme::ACCENT),
+                Outcome::Background(_) => ("⏵", theme::BUSY),
+            };
+            let result = match outcome {
+                Outcome::Pending => "running".to_string(),
+                Outcome::Ok(s) => s.clone(),
+                Outcome::Failed(s) => s.clone(),
+                Outcome::Background(id) => format!("bg {id}"),
+            };
+            let result_style = match outcome {
+                Outcome::Failed(_) => theme::accent(),
+                Outcome::Pending | Outcome::Background(_) => Style::default().fg(theme::BUSY),
+                Outcome::Ok(_) => theme::faint(),
+            };
+
+            // Name and outcome are fixed; the target absorbs what is left, so
+            // the right-hand column stays a column.
+            let used = 2 + 7 + 1 + result.chars().count() + 2;
+            let room = (width as usize).saturating_sub(used).max(8);
+            let target = elide(target, room);
+            let gap = (width as usize)
+                .saturating_sub(2 + 7 + 1 + target.chars().count() + result.chars().count());
+
+            out.push(Line::from(vec![
+                Span::styled(if *sidechain { "  ⌞" } else { " " }, theme::faint()),
+                Span::styled(glyph, Style::default().fg(colour)),
+                Span::raw(" "),
+                Span::styled(format!("{name:<7}"), theme::dim()),
+                Span::styled(target, Style::default().fg(theme::TEXT)),
+                Span::raw(" ".repeat(gap)),
+                Span::styled(result, result_style),
+            ]));
+        }
+        Entry::Turn { secs, .. } => {
+            out.push(Line::from(Span::styled(
+                format!("  ── {secs:.1}s"),
+                theme::faint(),
+            )));
+            out.push(Line::raw(""));
+        }
+    }
+}
+
+fn thousands(n: usize) -> String {
+    if n >= 1000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+fn elide(s: &str, width: usize) -> String {
+    if s.chars().count() <= width {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(width.saturating_sub(1)).collect();
+    format!("{cut}…")
+}
+
+/// Wrap on word boundaries, breaking a word only when it cannot fit alone.
+///
+/// Written here rather than pulled in: the pane needs the line count it is
+/// about to draw so it can anchor at the bottom, and a widget that wraps
+/// internally will not tell you that.
+fn wrap(text: &str, width: u16) -> Vec<String> {
+    let width = (width as usize).max(8);
+    let mut out = Vec::new();
+
+    for paragraph in text.lines() {
+        if paragraph.trim().is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut line = String::new();
+        for word in paragraph.split_whitespace() {
+            let len = line.chars().count();
+            let word_len = word.chars().count();
+            if line.is_empty() {
+                line.push_str(word);
+            } else if len + 1 + word_len <= width {
+                line.push(' ');
+                line.push_str(word);
+            } else {
+                out.push(std::mem::take(&mut line));
+                line.push_str(word);
+            }
+            // A single word longer than the pane: cut it rather than let the
+            // widget clip it silently.
+            while line.chars().count() > width {
+                let head: String = line.chars().take(width).collect();
+                let tail: String = line.chars().skip(width).collect();
+                out.push(head);
+                line = tail;
+            }
+        }
+        if !line.is_empty() {
+            out.push(line);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::fleet::Role;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use std::io::Write;
+
+    fn row(session: Option<&str>) -> Row {
+        Row {
+            name: "billing-svc".into(),
+            role: Role::Worker,
+            repo: "billing-service".into(),
+            presence: Presence::Working,
+            detail: "ENG-2553-2".into(),
+            bg_running: 0,
+            session_id: session.map(str::to_string),
+            branch: Some("feature/ENG-2553-2".into()),
+            tmux_target: None,
+            pid: Some(1),
+        }
+    }
+
+    /// A projects directory holding one transcript, as Claude Code lays it out.
+    fn projects(id: &str, lines: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("-repo-content");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut f = std::fs::File::create(project.join(format!("{id}.jsonl"))).unwrap();
+        for l in lines {
+            writeln!(f, "{l}").unwrap();
+        }
+        dir
+    }
+
+    const PROMPT: &str = r#"{"type":"user","timestamp":"2026-09-20T14:01:00.000Z","message":{"content":"thread the service param through"}}"#;
+    const SAY: &str = r#"{"type":"assistant","timestamp":"2026-09-20T14:01:05.000Z","message":{"content":[{"type":"text","text":"I'll add the parameter."}]}}"#;
+    const TOOL: &str = r#"{"type":"assistant","timestamp":"2026-09-20T14:01:07.000Z","message":{"content":[{"type":"tool_use","id":"tu_1","name":"Edit","input":{"file_path":"/repo/src/AccountClient.kt"}}]}}"#;
+    const RESULT: &str = r#"{"type":"user","timestamp":"2026-09-20T14:01:09.000Z","toolUseResult":{"filePath":"/repo/src/AccountClient.kt","structuredPatch":[{"lines":[" a","+b","-c"]}]},"message":{"content":[{"type":"tool_result","tool_use_id":"tu_1","content":"ok"}]}}"#;
+
+    fn drawn(pane: &Pane, row: Option<&Row>, w: u16, h: u16) -> String {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| pane.render(f, f.area(), row)).unwrap();
+        format!("{}", term.backend())
+    }
+
+    #[test]
+    fn it_shows_the_selected_agents_transcript() {
+        let dir = projects("sess-1", &[PROMPT, SAY, TOOL, RESULT]);
+        let mut pane = Pane::default();
+        let row = row(Some("sess-1"));
+        pane.follow(Some(&row), dir.path());
+
+        let out = drawn(&pane, Some(&row), 64, 16);
+        assert!(out.contains("billing-svc"), "the header: {out}");
+        assert!(out.contains("feature/ENG-2553-2"), "the branch: {out}");
+        assert!(out.contains("thread the service param"), "the prompt: {out}");
+        assert!(out.contains("I'll add the parameter"), "the prose: {out}");
+        assert!(out.contains("Edit"), "the tool: {out}");
+        assert!(out.contains("AccountClient.kt"), "its target: {out}");
+        assert!(out.contains("+1 -1"), "and its outcome: {out}");
+    }
+
+    #[test]
+    fn an_unfinished_call_reads_as_running() {
+        let dir = projects("sess-1", &[TOOL]);
+        let mut pane = Pane::default();
+        let row = row(Some("sess-1"));
+        pane.follow(Some(&row), dir.path());
+
+        let out = drawn(&pane, Some(&row), 64, 10);
+        assert!(out.contains("running"), "{out}");
+    }
+
+    #[test]
+    fn an_agent_with_no_session_says_so_instead_of_showing_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pane = Pane::default();
+        let row = row(None);
+        pane.follow(Some(&row), dir.path());
+
+        let out = drawn(&pane, Some(&row), 64, 10);
+        assert!(out.contains("no session linked"), "{out}");
+    }
+
+    #[test]
+    fn a_session_whose_transcript_has_not_appeared_yet_says_that_instead() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pane = Pane::default();
+        let row = row(Some("sess-missing"));
+        pane.follow(Some(&row), dir.path());
+
+        let out = drawn(&pane, Some(&row), 64, 10);
+        assert!(out.contains("no transcript yet"), "{out}");
+    }
+
+    #[test]
+    fn changing_the_selection_reopens_but_reselecting_the_same_one_does_not() {
+        let dir = projects("sess-1", &[PROMPT, SAY, TOOL, RESULT]);
+        let mut pane = Pane::default();
+        let row = row(Some("sess-1"));
+
+        pane.follow(Some(&row), dir.path());
+        drawn(&pane, Some(&row), 64, 5); // scrolling is bounded by the last draw
+        pane.scroll_by(1, 3);
+        let scrolled = pane.scroll;
+        assert!(scrolled > 0);
+
+        // Same session: the scroll position is where the user put it.
+        pane.follow(Some(&row), dir.path());
+        assert_eq!(pane.scroll, scrolled);
+
+        // A different one starts at the tail.
+        let elsewhere = super::tests::row(Some("sess-2"));
+        pane.follow(Some(&elsewhere), dir.path());
+        assert_eq!(pane.scroll, 0);
+    }
+
+    #[test]
+    fn new_output_does_not_yank_a_scrolled_back_view_to_the_bottom() {
+        let dir = projects("sess-1", &[PROMPT, SAY]);
+        let path = dir.path().join("-repo-content").join("sess-1.jsonl");
+        let mut pane = Pane::default();
+        let row = row(Some("sess-1"));
+        pane.follow(Some(&row), dir.path());
+
+        drawn(&pane, Some(&row), 64, 4);
+        pane.scroll_by(1, 1);
+        let before = pane.scroll;
+        assert!(!pane.following());
+
+        let mut f = std::fs::File::options().append(true).open(&path).unwrap();
+        writeln!(f, "{TOOL}").unwrap();
+        assert!(pane.poll());
+
+        assert!(
+            pane.scroll > before,
+            "the offset moves with the new line so the view holds still"
+        );
+
+        pane.to_tail();
+        assert!(pane.following());
+    }
+
+    #[test]
+    fn the_header_says_when_you_are_not_looking_at_the_live_edge() {
+        let dir = projects("sess-1", &[PROMPT, SAY, TOOL, RESULT]);
+        let mut pane = Pane::default();
+        let row = row(Some("sess-1"));
+        pane.follow(Some(&row), dir.path());
+
+        assert!(!drawn(&pane, Some(&row), 64, 6).contains("scrolled back"));
+        pane.scroll_by(1, 2);
+        assert!(drawn(&pane, Some(&row), 64, 6).contains("scrolled back"));
+    }
+
+    #[test]
+    fn wrapping_breaks_on_words_and_only_splits_one_that_cannot_fit() {
+        assert_eq!(
+            wrap("the resolver prefers the explicit service argument", 20),
+            vec!["the resolver prefers", "the explicit service", "argument"]
+        );
+        // Long enough that no boundary helps.
+        let long = "a".repeat(25);
+        assert_eq!(wrap(&long, 10), vec!["aaaaaaaaaa", "aaaaaaaaaa", "aaaaa"]);
+        // Blank lines in the source survive as blank lines.
+        assert_eq!(wrap("one\n\ntwo", 20), vec!["one", "", "two"]);
+    }
+
+    #[test]
+    fn it_draws_in_a_narrow_pane_without_panicking() {
+        let dir = projects("sess-1", &[PROMPT, SAY, TOOL, RESULT]);
+        let mut pane = Pane::default();
+        let row = row(Some("sess-1"));
+        pane.follow(Some(&row), dir.path());
+
+        for (w, h) in [(20, 4), (30, 6), (200, 50)] {
+            let _ = drawn(&pane, Some(&row), w, h);
+        }
+    }
+}
