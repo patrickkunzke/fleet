@@ -33,9 +33,14 @@ pub struct Pane {
     pub cwd: PathBuf,
 }
 
+#[derive(Clone)]
 pub struct Tmux {
     bin: PathBuf,
     session: String,
+    /// A private tmux server, addressed with `-L`. Tests use one each: a
+    /// single server runs its commands off one queue, so a dozen tests
+    /// sharing it queue behind each other's `sleep`s and deadlock.
+    socket: Option<String>,
 }
 
 impl Tmux {
@@ -52,7 +57,15 @@ impl Tmux {
                 // starting a second session the user would have to attach to.
                 .or_else(current_session)
                 .unwrap_or_else(|| DEFAULT_SESSION.to_string()),
+            socket: None,
         })
+    }
+
+    /// Talk to a private tmux server rather than the user's own.
+    #[cfg(test)]
+    pub fn on_socket(mut self, socket: &str) -> Tmux {
+        self.socket = Some(socket.to_string());
+        self
     }
 
     #[allow(dead_code)]
@@ -67,7 +80,11 @@ impl Tmux {
     }
 
     fn run(&self, args: &[&str]) -> Result<String> {
-        let out = Command::new(&self.bin)
+        let mut command = Command::new(&self.bin);
+        if let Some(socket) = &self.socket {
+            command.args(["-L", socket]);
+        }
+        let out = command
             .args(args)
             .output()
             .with_context(|| format!("running tmux {}", args.join(" ")))?;
@@ -177,6 +194,100 @@ impl Tmux {
         self.run(&["kill-pane", "-t", &pane.id])?;
         Ok(())
     }
+
+    /// Resolve whatever the board recorded as a tmux target: a pane id, or
+    /// the `session:window` form written before pane ids were stored.
+    pub fn find(&self, target: &str) -> Result<Option<Pane>> {
+        let panes = self.panes()?;
+        if target.starts_with('%') {
+            return Ok(panes.into_iter().find(|p| p.id == target));
+        }
+        let (session, window) = match target.split_once(':') {
+            Some(pair) => pair,
+            None => (self.session.as_str(), target),
+        };
+        Ok(panes
+            .into_iter()
+            .find(|p| p.session == session && p.window_name == window))
+    }
+
+    /// Force a window to the size we are going to draw it at.
+    ///
+    /// A mirrored pane is only correct if tmux believes it is the size of the
+    /// column showing it, otherwise the agent wraps its output to a width
+    /// nobody is looking at. tmux only honours this once the session stops
+    /// sizing itself to its attached clients.
+    pub fn set_size(&self, pane: &Pane, cols: u16, rows: u16) -> Result<()> {
+        // window-size is a window option in tmux 3.x, and setting it is what
+        // stops the window resizing itself to whatever client is attached.
+        self.run(&["set-option", "-w", "-t", &pane.window, "window-size", "manual"])?;
+        self.run(&[
+            "resize-window",
+            "-t",
+            &pane.window,
+            "-x",
+            &cols.to_string(),
+            "-y",
+            &rows.to_string(),
+        ])?;
+        Ok(())
+    }
+
+    /// Tear the whole session down. Used by tests and when the fleet's own
+    /// session is being retired.
+    #[cfg(test)]
+    pub fn kill_session(&self) -> Result<()> {
+        self.run(&["kill-session", "-t", &format!("={}", self.session)])?;
+        Ok(())
+    }
+
+    /// Stop a private server entirely. Refuses on the user's own server,
+    /// where it would close every window they have open.
+    #[cfg(test)]
+    pub fn kill_server(&self) -> Result<()> {
+        if self.socket.is_none() {
+            bail!("refusing to kill the default tmux server");
+        }
+        self.run(&["kill-server"])?;
+        Ok(())
+    }
+
+    /// What tmux currently believes the window measures.
+    #[cfg(test)]
+    pub fn window_size(&self, pane: &Pane) -> Result<(u16, u16)> {
+        let out = self.run(&[
+            "display-message",
+            "-p",
+            "-t",
+            &pane.window,
+            "#{window_width}x#{window_height}",
+        ])?;
+        let (w, h) = out
+            .split_once('x')
+            .context("tmux did not report a window size")?;
+        Ok((w.trim().parse()?, h.trim().parse()?))
+    }
+
+    /// The pane's visible screen, escapes intact.
+    pub fn capture(&self, pane: &Pane) -> Result<String> {
+        self.run(&["capture-pane", "-p", "-e", "-t", &pane.id])
+    }
+
+    /// Stream everything the pane prints from now on into a file.
+    ///
+    /// `-O` is output only: we are watching, not injecting. Input still goes
+    /// through send-keys, which is what attaching would do anyway.
+    pub fn pipe_to(&self, pane: &Pane, path: &Path) -> Result<()> {
+        let command = format!("cat >> '{}'", path.display());
+        self.run(&["pipe-pane", "-O", "-t", &pane.id, &command])?;
+        Ok(())
+    }
+
+    /// Stop streaming. pipe-pane with no command is how tmux spells "off".
+    pub fn stop_pipe(&self, pane: &Pane) -> Result<()> {
+        self.run(&["pipe-pane", "-t", &pane.id])?;
+        Ok(())
+    }
 }
 
 fn parse_pane(line: &str) -> Option<Pane> {
@@ -266,7 +377,7 @@ mod tests {
     impl Scratch {
         fn new(tag: &str) -> Option<Scratch> {
             let name = format!("fleet-test-{tag}-{}", std::process::id());
-            let tmux = Tmux::detect(Some(&name)).ok()?;
+            let tmux = Tmux::detect(Some(&name)).ok()?.on_socket(&name);
             tmux.ensure_session().ok()?;
             Some(Scratch { tmux })
         }
@@ -274,9 +385,7 @@ mod tests {
 
     impl Drop for Scratch {
         fn drop(&mut self) {
-            let _ = self
-                .tmux
-                .run(&["kill-session", "-t", &format!("={}", self.tmux.session)]);
+            let _ = self.tmux.kill_server();
         }
     }
 
@@ -394,6 +503,65 @@ mod tests {
 
         s.tmux.select(&pane).unwrap();
         s.tmux.zoom(&pane).unwrap();
+    }
+
+    #[test]
+    fn a_target_resolves_by_pane_id_or_by_window_name() {
+        let Some(s) = Scratch::new("find") else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let pane = s.tmux.spawn("billing-svc", dir.path(), "sleep 30").unwrap();
+
+        assert_eq!(s.tmux.find(&pane.id).unwrap().as_ref(), Some(&pane));
+        let by_name = format!("{}:billing-svc", pane.session);
+        assert_eq!(s.tmux.find(&by_name).unwrap().as_ref(), Some(&pane));
+        assert!(s.tmux.find("%99999").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_pane_can_be_sized_and_captured() {
+        let Some(s) = Scratch::new("size") else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let pane = s
+            .tmux
+            .spawn("sized", dir.path(), "printf 'hello mirror\n'; sleep 20")
+            .unwrap();
+
+        s.tmux.set_size(&pane, 40, 10).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let size = s
+            .tmux
+            .run(&["display-message", "-p", "-t", &pane.window, "#{window_width}x#{window_height}"])
+            .unwrap();
+        assert_eq!(size, "40x10", "tmux must believe the pane is the size we draw");
+
+        let screen = s.tmux.capture(&pane).unwrap();
+        assert!(screen.contains("hello mirror"), "{screen}");
+    }
+
+    #[test]
+    fn piping_a_pane_streams_what_it_prints_and_stops_on_request() {
+        let Some(s) = Scratch::new("pipe") else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let stream = dir.path().join("pane.stream");
+        let pane = s.tmux.spawn("noisy", dir.path(), "sh -c 'sleep 1; echo piped; sleep 20'").unwrap();
+
+        s.tmux.pipe_to(&pane, &stream).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1800));
+        let streamed = std::fs::read_to_string(&stream).unwrap_or_default();
+        assert!(streamed.contains("piped"), "got {streamed:?}");
+
+        s.tmux.stop_pipe(&pane).unwrap();
+        let after_stop = std::fs::metadata(&stream).unwrap().len();
+        s.tmux
+            .run(&["send-keys", "-t", &pane.id, "-l", "--", "more"])
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert_eq!(
+            std::fs::metadata(&stream).unwrap().len(),
+            after_stop,
+            "nothing more is written once the pipe is off"
+        );
     }
 
     #[test]
