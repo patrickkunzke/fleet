@@ -12,12 +12,13 @@
 
 pub mod board;
 pub mod fleet;
+pub mod picker;
 pub mod mirror;
 pub mod session;
 pub mod theme;
 
 use std::path::PathBuf;
-use std::sync::mpsc::{Sender, channel};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -25,10 +26,12 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Paragraph};
 
+use crate::agent;
 use crate::db::{self, Db};
 use crate::registry::{self, Registry, Watcher};
 use crate::tmux::Tmux;
 use crate::ui::fleet::Row;
+use crate::ui::picker::Picker;
 
 /// How often to redraw when nothing has happened. Slow on purpose: the only
 /// things that change without an event are elapsed times and a process that
@@ -78,6 +81,14 @@ pub struct App {
     focus: Focus,
     mode: Mode,
     input: session::Input,
+    /// The repository picker, while it is open. An overlay rather than a
+    /// mode: everything underneath keeps updating behind it.
+    picker: Option<Picker>,
+    /// Where the database lives, so a worker thread can open its own
+    /// connection rather than borrow the one the UI is using.
+    db_path: PathBuf,
+    tx: Sender<Msg>,
+    rx: Option<Receiver<Msg>>,
     tasks: Vec<db::Task>,
     background: Vec<db::BgTask>,
     status: Option<String>,
@@ -85,8 +96,12 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(db: Db, root: Option<PathBuf>) -> App {
+    pub fn new(db: Db, db_path: PathBuf, root: Option<PathBuf>) -> App {
+        let (tx, rx) = channel();
         App {
+            db_path,
+            tx,
+            rx: Some(rx),
             registry: Registry::new(registry::default_dir()),
             db,
             root,
@@ -101,6 +116,7 @@ impl App {
             focus: Focus::Rail,
             mode: Mode::Normal,
             input: session::Input::default(),
+            picker: None,
             tasks: Vec::new(),
             background: Vec::new(),
             status: None,
@@ -146,8 +162,12 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return;
         }
-        // Insert mode comes first, before the keys that would quit: while
-        // typing, q is a letter and Ctrl-C is an interrupt for the agent.
+        // The overlay and insert mode both take every key, before the ones
+        // that would quit: while typing, q is a letter.
+        if self.picker.is_some() {
+            self.picker_key(key);
+            return;
+        }
         if self.mode == Mode::Insert {
             self.insert_key(key);
             return;
@@ -189,8 +209,88 @@ impl App {
                 self.selected = self.rows.len().saturating_sub(1);
                 self.retarget();
             }
+            KeyCode::Char('n') => self.open_picker(),
             _ => {}
         }
+    }
+
+    fn open_picker(&mut self) {
+        let Some(root) = self.root.clone() else {
+            self.status = Some("start fleet with --root to spawn from here".into());
+            return;
+        };
+        let taken: Vec<String> = self
+            .db
+            .agents()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|a| a.repo)
+            .collect();
+        self.picker = Some(Picker::new(agent::candidates(&root, &taken)));
+    }
+
+    fn picker_key(&mut self, key: KeyEvent) {
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.picker = None,
+            KeyCode::Up => picker.move_by(-1),
+            KeyCode::Down => picker.move_by(1),
+            KeyCode::Backspace => picker.backspace(),
+            KeyCode::Char(c) => picker.push(c),
+            KeyCode::Enter => {
+                // Nothing matched: Enter is not a command to start something
+                // arbitrary.
+                let Some(chosen) = picker.chosen().cloned() else {
+                    return;
+                };
+                self.picker = None;
+                self.start_agent(&chosen);
+            }
+            _ => {}
+        }
+    }
+
+    /// Open the pane now, and let the session catch up on its own.
+    ///
+    /// Waiting here for Claude Code to register itself would freeze the UI
+    /// for several seconds on every spawn, which is how a key stops being
+    /// worth pressing.
+    fn start_agent(&mut self, chosen: &agent::Candidate) {
+        let Some(tmux) = self.tmux.clone() else {
+            self.status = Some("no tmux — agents are started in tmux panes".into());
+            return;
+        };
+        let spawned = match agent::start(&tmux, &self.db, &chosen.name, &chosen.path, "claude") {
+            Ok(s) => s,
+            Err(e) => {
+                self.status = Some(format!("cannot start {}: {e}", chosen.name));
+                return;
+            }
+        };
+
+        self.status = Some(format!("started {} — waiting for its session", spawned.name));
+        self.refresh();
+        // Select what was just started: pressing the key was the intent.
+        if let Some(at) = self.rows.iter().position(|r| r.name == spawned.name) {
+            self.selected = at;
+            self.retarget();
+        }
+
+        let db_path = self.db_path.clone();
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let Some(found) = agent::adopt(spawned.pane.pid, Duration::from_secs(30)) else {
+                return;
+            };
+            // A separate connection: this thread cannot borrow the one the UI
+            // is using, and SQLite in WAL mode is happy with both.
+            if let Ok(db) = Db::open(&db_path) {
+                let _ = agent::link(&db, &spawned.name, &found.session_id);
+            }
+            let _ = tx.send(Msg::Registry);
+        });
     }
 
     fn session_key(&mut self, key: KeyEvent) {
@@ -335,6 +435,10 @@ impl App {
         self.centre.render(frame, centre, row.as_ref(), input);
         self.draw_side(frame, side);
         self.draw_keys(frame, keys);
+
+        if let Some(picker) = &self.picker {
+            picker.render(frame, area);
+        }
     }
 
     fn draw_top(&self, frame: &mut Frame, area: Rect) {
@@ -408,6 +512,7 @@ impl App {
             ],
             Focus::Rail => &[
                 ("↑↓", "agent"),
+                ("n", "new agent"),
                 ("tab", "session"),
                 ("r", "refresh"),
                 ("q", "quit"),
@@ -437,11 +542,17 @@ impl App {
     }
 }
 
-pub fn snapshot(db: Db, root: Option<PathBuf>, width: u16, height: u16) -> Result<()> {
+pub fn snapshot(
+    db: Db,
+    db_path: PathBuf,
+    root: Option<PathBuf>,
+    width: u16,
+    height: u16,
+) -> Result<()> {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    let mut app = App::new(db, root);
+    let mut app = App::new(db, db_path, root);
     app.refresh();
     let mut term = Terminal::new(TestBackend::new(width, height))?;
     term.draw(|f| app.draw(f))?;
@@ -449,11 +560,12 @@ pub fn snapshot(db: Db, root: Option<PathBuf>, width: u16, height: u16) -> Resul
     Ok(())
 }
 
-pub fn run(db: Db, root: Option<PathBuf>) -> Result<()> {
-    let mut app = App::new(db, root);
+pub fn run(db: Db, db_path: PathBuf, root: Option<PathBuf>) -> Result<()> {
+    let mut app = App::new(db, db_path, root);
     app.refresh();
 
-    let (tx, rx) = channel();
+    let rx = app.rx.take().expect("the app owns its channel until run takes it");
+    let tx = app.tx.clone();
     spawn_input(tx.clone());
     spawn_registry(tx.clone());
     spawn_transcript_poll(tx.clone());
@@ -556,7 +668,7 @@ mod tests {
             .unwrap();
         db.upsert_agent("billing-svc", None, Some("/repo/content"), None, None, None)
             .unwrap();
-        let mut app = App::new(db, Some(PathBuf::from("/nowhere")));
+        let mut app = App::new(db, PathBuf::from(":memory:"), Some(PathBuf::from("/nowhere")));
         app.refresh();
         app
     }
@@ -664,6 +776,64 @@ mod tests {
         app.on_key(KeyEvent::from(KeyCode::Enter));
         // Nothing to zoom to, so nothing is claimed.
         assert!(app.status.is_none());
+    }
+
+    #[test]
+    fn n_opens_the_picker_and_escape_closes_it_without_starting_anything() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("storefront/.git")).unwrap();
+        std::fs::create_dir_all(root.path().join("billing-service/.git")).unwrap();
+
+        let db = Db::open_in_memory().unwrap();
+        let mut app = App::new(
+            db,
+            PathBuf::from(":memory:"),
+            Some(root.path().to_path_buf()),
+        );
+        app.refresh();
+
+        app.on_key(KeyEvent::from(KeyCode::Char('n')));
+        assert!(app.picker.is_some());
+
+        let out = drawn(&mut app, 110, 24);
+        assert!(out.contains("start an agent in"), "{out}");
+        assert!(out.contains("storefront"), "{out}");
+
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.picker.is_none());
+        assert!(
+            app.rows.is_empty(),
+            "cancelling must not have started anything"
+        );
+    }
+
+    #[test]
+    fn the_picker_swallows_the_keys_that_would_otherwise_act() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("storefront/.git")).unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let mut app = App::new(
+            db,
+            PathBuf::from(":memory:"),
+            Some(root.path().to_path_buf()),
+        );
+        app.refresh();
+        app.on_key(KeyEvent::from(KeyCode::Char('n')));
+
+        app.on_key(KeyEvent::from(KeyCode::Char('q')));
+        assert!(!app.quit, "q types into the filter, it does not quit");
+        assert!(app.picker.is_some());
+    }
+
+    #[test]
+    fn spawning_without_a_root_says_why_rather_than_opening_an_empty_picker() {
+        let db = Db::open_in_memory().unwrap();
+        let mut app = App::new(db, PathBuf::from(":memory:"), None);
+        app.refresh();
+
+        app.on_key(KeyEvent::from(KeyCode::Char('n')));
+        assert!(app.picker.is_none());
+        assert!(app.status.unwrap().contains("--root"));
     }
 
     #[test]

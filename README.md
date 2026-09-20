@@ -20,6 +20,8 @@ already runs on the machine.
 | `fleet board` reads in the binary | done; writes still cli/board.sh |
 | `src/tmux.rs` — spawning and pane control | done, 8 tests |
 | `src/ui/` — frame, fleet rail, session pane, board rail | done, 43 tests |
+| `src/agent.rs` — starting an agent, repo discovery | done, 4 tests |
+| `n` to spawn from the rail | done |
 | `src/ui/mirror.rs` — the live tmux pane | done, 5 tests |
 | `board` subcommand writes in the binary | not started; reads are done |
 | flow pane | not started |
@@ -74,6 +76,7 @@ cargo run -- tui --root ~/Code/acme      # the fleet view
 cargo run -- spawn billing-svc --repo ~/Code/acme/service/billing-service
 cargo run -- sessions --watch
 cargo run -- tui --snapshot 104x20          # one frame to stdout
+cargo run -- repos --root ~/Code/acme    # what `n` offers
 ```
 
 ## Packaging plan
