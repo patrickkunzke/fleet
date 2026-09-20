@@ -30,7 +30,6 @@ use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use ratatui::layout::Margin;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Paragraph};
 
@@ -567,14 +566,10 @@ impl App {
     }
 
     pub fn draw(&mut self, frame: &mut Frame) {
-        let whole = frame.area();
-        frame.render_widget(Block::default().style(theme::base()), whole);
-        // Standing off the terminal's own edges is most of what makes this
-        // look placed rather than pasted in.
-        let area = whole.inner(Margin {
-            horizontal: theme::MARGIN_X,
-            vertical: theme::MARGIN_Y,
-        });
+        // No outer margin: the panes bring their own gutters, and the rules
+        // are meant to reach the edges of the terminal.
+        let area = frame.area();
+        frame.render_widget(Block::default().style(theme::base()), area);
 
         let [top, top_rule, body, key_rule, keys] = Layout::vertical([
             Constraint::Length(1),

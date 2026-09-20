@@ -281,44 +281,38 @@ impl Pane {
             _ => ("×", theme::FAINT),
         };
 
-        let mut spans = vec![
+        let mut left = vec![
             Span::styled(glyph, Style::default().fg(colour)),
             Span::raw(" "),
             Span::styled(
                 row.name.clone(),
                 Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD),
             ),
-            Span::raw("  "),
-            Span::styled(row.repo.clone(), theme::faint()),
         ];
         if let Some(branch) = &row.branch {
-            spans.push(Span::styled(format!("  {branch}"), theme::faint()));
+            left.push(Span::styled(format!("  {branch}"), theme::faint()));
+        } else {
+            left.push(Span::styled(format!("  {}", row.repo), theme::faint()));
         }
-        if !self.is_live() && row.session_id.is_some() {
-            // Say which of the two views this is, so nobody wonders why the
-            // spinner is missing.
-            spans.push(Span::styled("  transcript", theme::faint()));
-        }
-        frame.render_widget(Paragraph::new(Line::from(spans)), theme::pad(area));
 
-        // Right-aligned, and drawn over the left half rather than appended to
-        // it: a long branch name would otherwise push this off the edge, and
-        // "you are not looking at the live edge" is the one thing in the
-        // header that must never be the part that gets clipped.
-        if focused && self.is_live() {
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled("typing here ", theme::accent())))
-                    .alignment(Alignment::Right),
-                theme::pad(area),
-            );
-        }
-        if !self.following() {
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled("scrolled back ", theme::accent())))
-                    .alignment(Alignment::Right),
-                theme::pad(area),
-            );
-        }
+        // Measured into the same line rather than drawn over it: a
+        // right-aligned widget on top of this one ate the repo name at any
+        // width where the two met.
+        let right = if !self.following() {
+            vec![Span::styled("scrolled back", theme::accent())]
+        } else if !self.is_live() && row.session_id.is_some() {
+            vec![Span::styled("transcript", theme::faint())]
+        } else if focused && self.is_live() {
+            vec![Span::styled("typing here", theme::accent())]
+        } else {
+            Vec::new()
+        };
+
+        let inner = theme::pad(area);
+        frame.render_widget(
+            Paragraph::new(theme::spread(left, right, inner.width)),
+            inner,
+        );
     }
 }
 

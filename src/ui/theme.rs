@@ -8,15 +8,11 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 
-/// Breathing room inside a pane. One column read as cramped against the
-/// borders; two is what makes a column of text look placed rather than
-/// wedged.
+/// Breathing room inside a pane. Every pane carries its own, which is why
+/// the app itself needs no outer margin: the rules then run wall to wall,
+/// and a rule that stops short of the edge looks like a mistake.
 pub const GUTTER: u16 = 2;
 
-/// Space between the app and the edges of the terminal it is running in.
-/// Without it everything reads as pasted into the corner.
-pub const MARGIN_X: u16 = 2;
-pub const MARGIN_Y: u16 = 1;
 
 pub fn pad(area: Rect) -> Rect {
     Rect {
@@ -73,10 +69,36 @@ pub fn spread<'a>(
     right: Vec<Span<'a>>,
     width: u16,
 ) -> ratatui::text::Line<'a> {
-    let used: usize = left.iter().chain(right.iter()).map(|s| s.width()).sum();
-    let gap = (width as usize).saturating_sub(used);
-    let mut spans = left;
-    spans.push(Span::raw(" ".repeat(gap)));
+    let width = width as usize;
+    let right_width: usize = right.iter().map(|s| s.width()).sum();
+
+    // No room for both: the right-hand side is the state — scrolled back,
+    // typing here — and losing it silently is worse than losing the tail of
+    // a name, so the left gives way.
+    if right_width + 1 >= width {
+        return ratatui::text::Line::from(right);
+    }
+
+    let budget = width - right_width - 1;
+    let mut spans = Vec::new();
+    let mut used = 0usize;
+    for span in left {
+        let w = span.width();
+        if used + w <= budget {
+            used += w;
+            spans.push(span);
+            continue;
+        }
+        let room = budget.saturating_sub(used);
+        if room > 1 {
+            let cut: String = span.content.chars().take(room - 1).collect();
+            used += room;
+            spans.push(Span::styled(format!("{cut}…"), span.style));
+        }
+        break;
+    }
+
+    spans.push(Span::raw(" ".repeat(width - used - right_width)));
     spans.extend(right);
     ratatui::text::Line::from(spans)
 }
@@ -93,4 +115,41 @@ pub fn rule(frame: &mut ratatui::Frame, area: Rect) {
 
 pub fn selected() -> Style {
     Style::default().fg(TEXT).add_modifier(Modifier::BOLD)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line(left: &str, right: &str, width: u16) -> String {
+        spread(
+            vec![Span::raw(left.to_string())],
+            vec![Span::raw(right.to_string())],
+            width,
+        )
+        .to_string()
+    }
+
+    #[test]
+    fn it_pushes_the_two_sides_to_the_edges() {
+        assert_eq!(line("fleet", "4 agents", 20), "fleet       4 agents");
+        // Exactly full: a space is kept even at the cost of a character,
+        // because two values butted together read as one.
+        assert_eq!(line("fleet", "4 agents", 13), "fle… 4 agents");
+    }
+
+    #[test]
+    fn a_line_too_narrow_for_both_gives_up_the_left_not_the_right() {
+        // The right side carries the state; truncating the name is the
+        // cheaper loss, and it says that it was truncated.
+        let out = line("billing-service", "typing here", 20);
+        assert!(out.ends_with("typing here"), "{out}");
+        assert!(out.contains('…'), "{out}");
+        assert_eq!(out.chars().count(), 20, "{out}");
+    }
+
+    #[test]
+    fn a_line_with_no_room_at_all_keeps_the_state() {
+        assert_eq!(line("billing-service", "typing here", 8), "typing here");
+    }
 }
