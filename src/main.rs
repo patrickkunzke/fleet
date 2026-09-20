@@ -6,6 +6,7 @@
 //! CLI where some verbs write and others do not — worse than either end state.
 //! It migrates in one step when the TUI needs it.
 
+mod agent;
 mod db;
 mod registry;
 mod tmux;
@@ -19,7 +20,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use crate::db::Db;
-use crate::registry::{Change, Registry, Session, Watcher};
+use crate::registry::{Change, Registry, Watcher};
 use crate::tmux::Tmux;
 use crate::transcript::{BACKFILL_BYTES, Entry, Outcome, Transcript};
 
@@ -79,6 +80,13 @@ enum Command {
         #[arg(long, env = "FLEET_DB")]
         db: Option<PathBuf>,
     },
+    /// Repositories an agent could be started in — what `n` offers.
+    Repos {
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[arg(long, env = "FLEET_DB")]
+        db: Option<PathBuf>,
+    },
     /// Read the coordination database.
     Board {
         #[command(subcommand)]
@@ -107,6 +115,12 @@ enum BoardView {
 }
 
 fn main() -> Result<()> {
+    // Rust ignores SIGPIPE, so `fleet repos | head` panics on the write that
+    // follows head exiting. Every other unix tool dies quietly there.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Tui {
         root: None,
@@ -118,21 +132,33 @@ fn main() -> Result<()> {
             db,
             snapshot,
         } => {
-            let db = Db::open(db.unwrap_or_else(db::default_path))?;
+            let path = db.unwrap_or_else(db::default_path);
+            let db = Db::open(&path)?;
             match snapshot {
                 Some(size) => {
                     let (w, h) = size
                         .split_once('x')
                         .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
                         .context("--snapshot wants WIDTHxHEIGHT, such as 110x28")?;
-                    ui::snapshot(db, root, w, h)
+                    ui::snapshot(db, path, root, w, h)
                 }
-                None => ui::run(db, root),
+                None => ui::run(db, path, root),
             }
         }
         Command::Sessions { watch } => sessions(watch),
         Command::Session { name, watch, lines } => session(&name, watch, lines),
         Command::Board { view, db } => board(view, db),
+        Command::Repos { root, db } => {
+            let db = Db::open(db.unwrap_or_else(db::default_path))?;
+            let taken: Vec<String> = db.agents()?.into_iter().filter_map(|a| a.repo).collect();
+            let found = agent::candidates(&root, &taken);
+            println!("{} repositories under {}", found.len(), root.display());
+            for c in found {
+                let note = if c.taken { "has an agent" } else { "" };
+                println!("  {:<34} {:<14} {}", c.name, note, c.path.display());
+            }
+            Ok(())
+        }
         Command::Spawn {
             name,
             repo,
@@ -154,34 +180,17 @@ fn spawn(
     timeout: u64,
     db_path: Option<PathBuf>,
 ) -> Result<()> {
-    let repo = repo
-        .canonicalize()
-        .with_context(|| format!("no such repository: {}", repo.display()))?;
     let tmux = Tmux::detect(session)?;
-    let pane = tmux.spawn(name, &repo, command)?;
-    println!("{name}  pane {} in session {}", pane.id, pane.session);
-
     let db = Db::open(db_path.unwrap_or_else(db::default_path))?;
-    let target = format!("{}:{}", pane.session, pane.window_name);
+    let spawned = agent::start(&tmux, &db, name, repo, command)?;
+    println!(
+        "{}  pane {} in session {}",
+        spawned.name, spawned.pane.id, spawned.pane.session
+    );
 
-    // The agent registers itself a moment after the process starts, so the row
-    // goes in without a session id first. An agent that never reports is still
-    // an agent someone has to deal with, and a board that omits it is worse
-    // than one that shows it unlinked.
-    db.upsert_agent(name, None, Some(&repo.to_string_lossy()), None, Some(&target), None)?;
-
-    match adopt(&pane.pid, timeout) {
+    match agent::adopt(spawned.pane.pid, Duration::from_secs(timeout)) {
         Some(found) => {
-            db.upsert_agent(name, None, None, Some(&found.session_id), None, None)?;
-            db.log_event(
-                "note",
-                Some(name),
-                None,
-                None,
-                &format!("spawned in {target}"),
-                None,
-                None,
-            )?;
+            agent::link(&db, &spawned.name, &found.session_id)?;
             println!("      adopted session {} (pid {})", found.session_id, found.pid);
         }
         None => println!(
@@ -190,27 +199,6 @@ fn spawn(
         ),
     }
     Ok(())
-}
-
-/// Wait for a Claude Code session to appear inside a pane we just created.
-///
-/// Matched by process tree rather than by working directory: two agents in
-/// the same repo are ordinary here, and a cwd match would adopt the wrong one.
-fn adopt(pane_pid: &i32, timeout_secs: u64) -> Option<Session> {
-    let mut reg = Registry::new(registry::default_dir());
-    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
-    while std::time::Instant::now() < deadline {
-        reg.refresh();
-        if let Some(s) = reg
-            .interactive()
-            .find(|s| tmux::owns(*pane_pid, s.pid))
-            .cloned()
-        {
-            return Some(s);
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    None
 }
 
 fn sessions(watch: bool) -> Result<()> {
