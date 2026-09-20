@@ -23,16 +23,17 @@ needs in order to act.
 
 ## The CLI
 
-Every read and write goes through one command. Find it once per session:
+Every read and write goes through one command:
 
 ```bash
-FLEET="$(command -v fleet || echo "$HOME/Code/side-projects/fleet/cli/board.sh")"
-"$FLEET" help
+fleet board --help
 ```
 
-If neither exists, say so and stop — do not hand-write SQL against the
-database. `FLEET_JSON=1` in front of any read gives JSON instead of a table,
-which is what you want when you are going to parse it.
+If `fleet` is not on PATH, say so and stop — do not hand-write SQL against the
+database. `FLEET_JSON=1` in front of any read gives JSON instead of columns,
+which is what you want when you are going to parse it. `fleet board sql` takes
+a SELECT for anything the verbs do not cover; it refuses to write, because a
+bare UPDATE would skip the flow event that every state change records.
 
 ## Conventions
 
@@ -54,10 +55,10 @@ which is what you want when you are going to parse it.
 Planning an epic:
 
 ```bash
-"$FLEET" epic ENG-2553 "shared settings flag"
-"$FLEET" add ENG-2553-1 ~/Code/acme/service/accounts-service "shared column + migration" \
+fleet board epic ENG-2553 "shared settings flag"
+fleet board add ENG-2553-1 ~/Code/acme/service/accounts-service "shared column + migration" \
   --epic ENG-2553 --body "Add the shared column and an optional service param. the old header stays as fallback."
-"$FLEET" add ENG-2553-2 ~/Code/acme/service/billing-service "consume the service param" \
+fleet board add ENG-2553-2 ~/Code/acme/service/billing-service "consume the service param" \
   --epic ENG-2553 --dep ENG-2553-1
 ```
 
@@ -65,24 +66,27 @@ Dispatching — `ready` is the queue, and it only ever lists tasks whose
 dependencies are all done:
 
 ```bash
-"$FLEET" ready
-"$FLEET" claim ENG-2553-1 accounts-svc
+fleet board ready
+fleet board claim ENG-2553-1 accounts-svc
 ```
 
 Then message that agent with `SendMessage`, and log it so the flow pane sees it:
 
 ```bash
-"$FLEET" msg chief accounts-svc "start ENG-2553-1" --task ENG-2553-1
+fleet board msg chief accounts-svc "start ENG-2553-1" --task ENG-2553-1
 ```
 
-Register an agent when you spawn one, so the board can join it to its session:
+Starting an agent does the registering for you — it opens a tmux pane, writes
+the row, and links the session once Claude Code reports it:
 
 ```bash
-"$FLEET" agent accounts-svc --repo ~/Code/acme/service/accounts-service \
-  --tmux fleet:accounts-svc --session "$SESSION_ID" --branch feature/ENG-2553-1
+fleet spawn accounts-svc --repo ~/Code/acme/service/accounts-service
 ```
 
-Check in with `"$FLEET" ls` and `"$FLEET" log`. When a task finishes, `done`
+Use `fleet board agent …` only to correct or add to a row afterwards, such as
+recording the branch it ended up on.
+
+Check in with `fleet board ls` and `fleet board log`. When a task finishes, `done`
 prints what it freed — that output is your cue to dispatch again, not a
 formality:
 
@@ -96,10 +100,10 @@ unblocked: ENG-2553-2
 You were handed a task key. The protocol is four commands:
 
 ```bash
-"$FLEET" start ENG-2553-2                              # picking it up
-"$FLEET" block ENG-2553-2 "needs !412 merged"          # stopping, with a reason
-"$FLEET" unblock ENG-2553-2                            # carrying on
-"$FLEET" done ENG-2553-2 --mr https://git.../123       # finished
+fleet board start ENG-2553-2                              # picking it up
+fleet board block ENG-2553-2 "needs !412 merged"          # stopping, with a reason
+fleet board unblock ENG-2553-2                            # carrying on
+fleet board done ENG-2553-2 --mr https://git.../123       # finished
 ```
 
 Report a blocker on the board **and** message the chief — the board is the
@@ -114,8 +118,8 @@ Anything that outlives your turn goes on the board, so the fleet's right rail
 can show it and nobody starts a second copy of your dev server:
 
 ```bash
-ID=$("$FLEET" bg start storefront "pnpm dev" --kind server --port 3000 --log /tmp/ren-dev.log)
-"$FLEET" bg end "$ID" failed --detail "2 type errors"
+ID=$(fleet board bg start storefront "pnpm dev" --kind server --port 3000 --log /tmp/ren-dev.log)
+fleet board bg end "$ID" failed --detail "2 type errors"
 ```
 
 Kinds: `server`, `compose`, `test`, `build`, `watch`, `script`. Close out every

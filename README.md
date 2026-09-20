@@ -12,19 +12,17 @@ already runs on the machine.
 | Piece | State |
 |---|---|
 | `schema.sql` — the coordination database | done |
-| `cli/board.sh` — the `fleet board` contract | done, shell implementation |
 | `skills/board` — the `/board` skill | done |
 | `src/registry.rs` — session discovery and watching | done, 6 tests |
 | `src/transcript.rs` — transcript reading and tailing | done, 8 tests |
 | `src/db.rs` — fleet.db reads and writes | done, 11 tests |
-| `fleet board` reads in the binary | done; writes still cli/board.sh |
+| `fleet board` — the whole board, in the binary | done, 13 tests |
 | `src/tmux.rs` — spawning and pane control | done, 8 tests |
 | `src/ui/` — frame, fleet rail, session pane, board rail | done, 43 tests |
 | `src/agent.rs` — starting an agent, repo discovery | done, 4 tests |
 | `n` to spawn from the rail | done |
 | `src/ui/flow.rs` — graph and log views | done, 9 tests |
 | `src/ui/mirror.rs` — the live tmux pane | done, 5 tests |
-| `board` subcommand writes in the binary | not started; reads are done |
 
 ## What it is built on
 
@@ -50,35 +48,31 @@ fleet.db; anything worth remembering next month goes to claude-mem.
 ./install.sh
 ```
 
-Symlinks `cli/board.sh` to `~/.local/bin/fleet`, symlinks `skills/board` into
-`~/.claude/skills/`, and creates the database. Both symlinks point back here,
-so edits take effect immediately.
+Builds the binary, links it to `~/.local/bin/fleet`, links `skills/board` into
+`~/.claude/skills/`, and creates the database.
 
 ## Use
 
 ```bash
-fleet help
-fleet epic ENG-2553 "shared settings flag"
-fleet add ENG-2553-1 ~/Code/acme/service/accounts-service "shared column" --epic ENG-2553
-fleet add ENG-2553-2 ~/Code/acme/service/billing-service "consume param" --epic ENG-2553 --dep ENG-2553-1
-fleet ready          # only ENG-2553-1 — the other one is waiting
-fleet ls
-fleet log
+fleet                                       # the fleet view
+fleet spawn billing-svc --repo ~/Code/acme/service/billing-service
+fleet sessions --watch
+fleet repos --root ~/Code/acme           # what `n` offers
+fleet tui --snapshot 104x22 --view graph    # one frame to stdout
+
+fleet board epic ENG-2553 "shared settings flag"
+fleet board add ENG-2553-1 ~/Code/acme/service/accounts-service "shared column" --epic ENG-2553
+fleet board add ENG-2553-2 ~/Code/acme/service/billing-service "consume param" --epic ENG-2553 --dep ENG-2553-1
+fleet board ready     # only ENG-2553-1 — the other one is waiting
+fleet board ls
+fleet board log
 ```
 
 `FLEET_JSON=1` before any read gives JSON. `FLEET_DB` overrides the database
-path, which is how the tests run against a scratch copy.
-
-The Rust binary carries the same reads plus the view itself:
-
-```bash
-cargo run -- tui --root ~/Code/acme      # the fleet view
-cargo run -- spawn billing-svc --repo ~/Code/acme/service/billing-service
-cargo run -- sessions --watch
-cargo run -- tui --snapshot 104x20          # one frame to stdout
-cargo run -- repos --root ~/Code/acme    # what `n` offers
-cargo run -- tui --snapshot 104x22 --view graph
-```
+path, which is how the tests run against a scratch copy. `fleet board sql`
+takes a SELECT and refuses anything else: every write goes through a verb that
+records the matching flow event, and a bare UPDATE is the one way to break
+that.
 
 Keys: `↑↓` agent, `n` new agent, `tab` session, `i` type into it, `↵` zoom to
 the pane, `g` the flow graph, `l` the flow log, `q` quit.

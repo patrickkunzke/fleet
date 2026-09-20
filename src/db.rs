@@ -14,6 +14,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::Serialize;
 
 /// The schema travels in the binary, so `fleet board init` needs no checkout.
 const SCHEMA: &str = include_str!("../schema.sql");
@@ -25,7 +26,8 @@ pub fn default_path() -> std::path::PathBuf {
         .join("fleet.db")
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum State {
     Queued,
     Running,
@@ -60,7 +62,7 @@ impl State {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Task {
     pub key: String,
     pub title: String,
@@ -74,7 +76,7 @@ pub struct Task {
     pub waiting_on: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Agent {
     pub name: String,
     pub role: String,
@@ -87,7 +89,7 @@ pub struct Agent {
     pub bg_running: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BgTask {
     pub id: i64,
     pub agent: Option<String>,
@@ -104,7 +106,7 @@ pub struct BgTask {
     pub elapsed_secs: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Event {
     pub ts: String,
     pub kind: String,
@@ -282,6 +284,70 @@ impl Db {
         Ok(rows)
     }
 
+    /// One task with its brief and everything that has happened to it.
+    pub fn show(&self, key: &str) -> Result<(Task, Option<String>, Vec<Event>)> {
+        let task = self
+            .board()?
+            .into_iter()
+            .find(|t| t.key == key)
+            .with_context(|| format!("unknown task '{key}'"))?;
+        let body: Option<String> = self.conn.query_row(
+            "SELECT body FROM tasks WHERE key = ?1",
+            params![key],
+            |r| r.get(0),
+        )?;
+
+        let mut stmt = self.conn.prepare(
+            "SELECT ts, kind, from_agent, to_agent, task_key, summary, body
+             FROM events WHERE task_key = ?1 ORDER BY ts, id",
+        )?;
+        let history = stmt
+            .query_map(params![key], |r| {
+                Ok(Event {
+                    ts: r.get(0)?,
+                    kind: r.get(1)?,
+                    from_agent: r.get(2)?,
+                    to_agent: r.get(3)?,
+                    task_key: r.get(4)?,
+                    summary: r.get(5)?,
+                    body: r.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((task, body, history))
+    }
+
+    /// The escape hatch the shell CLI had. Read-only on purpose: every write
+    /// must go through a method that records the matching flow event, and a
+    /// bare UPDATE here would be the one way to break that.
+    pub fn query(&self, sql: &str) -> Result<(Vec<String>, Vec<Vec<String>>)> {
+        let lowered = sql.trim_start().to_lowercase();
+        if !(lowered.starts_with("select") || lowered.starts_with("with")) {
+            bail!("only SELECT is allowed here — writes must go through the board commands");
+        }
+        let mut stmt = self.conn.prepare(sql)?;
+        let columns: Vec<String> = stmt.column_names().into_iter().map(str::to_string).collect();
+        let width = columns.len();
+        let rows = stmt
+            .query_map([], |r| {
+                (0..width)
+                    .map(|i| {
+                        Ok(match r.get_ref(i)? {
+                            rusqlite::types::ValueRef::Null => String::new(),
+                            rusqlite::types::ValueRef::Integer(v) => v.to_string(),
+                            rusqlite::types::ValueRef::Real(v) => v.to_string(),
+                            rusqlite::types::ValueRef::Text(v) => {
+                                String::from_utf8_lossy(v).into_owned()
+                            }
+                            rusqlite::types::ValueRef::Blob(_) => "<blob>".into(),
+                        })
+                    })
+                    .collect::<rusqlite::Result<Vec<String>>>()
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((columns, rows))
+    }
+
     // ------------------------------------------------------------ writes ---
     // Tested, not yet reachable from the CLI — see the note on NewTask.
 
@@ -444,7 +510,8 @@ impl Db {
             (State::Blocked, Some(why)) => format!("blocked: {why}"),
             (State::Review, Some(mr)) => format!("ready for review - {mr}"),
             (State::Review, None) => "ready for review".to_string(),
-            (State::Done, _) => "done".to_string(),
+            (State::Done, Some(mr)) => format!("done — {mr}"),
+            (State::Done, None) => "done".to_string(),
             (State::Dropped, Some(why)) => format!("dropped: {why}"),
             (state, _) => state.as_str().to_string(),
         };
@@ -518,7 +585,9 @@ impl Db {
     }
 
     #[allow(dead_code)]
-    pub fn bg_end(&self, id: i64, state: &str, detail: Option<&str>) -> Result<()> {
+    /// Returns the command that finished, which is what a caller reports —
+    /// "passed 7" tells nobody anything.
+    pub fn bg_end(&self, id: i64, state: &str, detail: Option<&str>) -> Result<String> {
         let command: Option<String> = self
             .conn
             .query_row(
@@ -540,7 +609,8 @@ impl Db {
             &format!("{state}: {command}"),
             detail,
             Some(&id.to_string()),
-        )
+        )?;
+        Ok(command)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -691,6 +761,14 @@ mod tests {
     }
 
     #[test]
+    fn finishing_with_a_merge_request_records_it_in_the_log_too() {
+        let db = seeded();
+        db.transition("ENG-2553-1", State::Done, Some("https://git/x/412"))
+            .unwrap();
+        assert_eq!(db.events(1).unwrap()[0].summary, "done — https://git/x/412");
+    }
+
+    #[test]
     fn leaving_blocked_reads_as_unblocked_not_as_a_fresh_start() {
         let db = seeded();
         db.transition("ENG-2553-2", State::Blocked, Some("needs !412"))
@@ -735,7 +813,8 @@ mod tests {
             .unwrap();
         assert_eq!(agent.bg_running, 1);
 
-        db.bg_end(id, "passed", Some("51 of 51")).unwrap();
+        let finished = db.bg_end(id, "passed", Some("51 of 51")).unwrap();
+        assert_eq!(finished, "./gradlew test");
         let bg = db.background().unwrap();
         let row = bg.iter().find(|b| b.id == id).unwrap();
         assert_eq!(row.state, "passed");
@@ -781,6 +860,41 @@ mod tests {
         assert!(db.transition("ENG-9999-1", State::Done, None).is_err());
         assert!(db.bg_end(4242, "passed", None).is_err());
         assert!(db.retire_agent("nobody").is_err());
+    }
+
+    #[test]
+    fn show_gathers_a_task_its_brief_and_its_history() {
+        let db = seeded();
+        db.claim("ENG-2553-1", "accounts-svc").unwrap();
+        db.transition("ENG-2553-1", State::Running, None).unwrap();
+
+        let (task, _body, history) = db.show("ENG-2553-1").unwrap();
+        assert_eq!(task.agent.as_deref(), Some("accounts-svc"));
+        let summaries: Vec<_> = history.into_iter().map(|e| e.summary).collect();
+        assert_eq!(
+            summaries,
+            vec!["queued: shared column", "assigned to accounts-svc", "started"],
+            "oldest first, which is how a history reads"
+        );
+
+        assert!(db.show("ENG-9999-1").is_err());
+    }
+
+    #[test]
+    fn the_escape_hatch_reads_but_does_not_write() {
+        let db = seeded();
+        let (columns, rows) = db.query("SELECT key, state FROM tasks ORDER BY key").unwrap();
+        assert_eq!(columns, vec!["key", "state"]);
+        assert_eq!(rows[0], vec!["ENG-2553-1", "queued"]);
+
+        // A bare UPDATE would skip the flow event that every state change
+        // writes, which is the one thing holding the board and the log together.
+        assert!(db.query("UPDATE tasks SET state = 'done'").is_err());
+        assert!(db.query("DELETE FROM tasks").is_err());
+        assert_eq!(
+            db.board().unwrap().iter().filter(|t| t.state == State::Done).count(),
+            0
+        );
     }
 
     #[test]
