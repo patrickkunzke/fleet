@@ -15,6 +15,7 @@ already runs on the machine.
 | `cli/board.sh` — the `fleet board` contract | done, shell implementation |
 | `skills/board` — the `/board` skill | done |
 | `src/registry.rs` — session discovery and watching | done, 6 tests |
+| `src/transcript.rs` — transcript reading and tailing | done, 8 tests |
 | TUI panes | not started |
 | `board` subcommand in the binary | not started |
 
@@ -93,7 +94,7 @@ Cargo.toml
 src/main.rs          clap — default subcommand is the TUI, `board` is the CLI
 src/db.rs            fleet.db
 src/registry.rs      ~/.claude/sessions watcher (notify / FSEvents)  [done]
-src/transcript.rs    jsonl tail
+src/transcript.rs    jsonl tail  [done]
 src/tmux.rs          spawn a session into a pane, zoom to it
 src/ui/…             fleet rail, session pane, flow, board rail
 schema.sql           embedded with include_str!
