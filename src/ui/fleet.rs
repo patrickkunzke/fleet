@@ -205,10 +205,12 @@ pub fn render(frame: &mut Frame, area: Rect, rows: &[Row], selected: usize) {
     );
 
     let inner = theme::pad(list);
-    let mut lines = vec![Line::from(Span::styled("AGENTS", theme::label()))];
+    let mut lines = vec![
+        Line::from(Span::styled("AGENTS", theme::label())),
+        Line::raw(""),
+    ];
 
     if rows.is_empty() {
-        lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
             "no agents yet",
             theme::faint(),

@@ -34,8 +34,8 @@ pub fn render(
     } else {
         BG_LINES * background.len().min(6) as u16
     };
-    let wanted = 1 /* divider */ + 1 /* header */ + content;
-    let bg_height = wanted.min(area.height / 2).max(3);
+    let wanted = 1 /* divider */ + 1 /* header */ + 1 /* its blank line */ + content;
+    let bg_height = wanted.min(area.height / 2).max(4);
 
     // A strip at the foot, ruled off, the way the left rail has one.
     let [top, bottom, foot_rule, foot] = Layout::vertical([
@@ -73,9 +73,9 @@ fn render_tasks(frame: &mut Frame, area: Rect, tasks: &[Task], selected_agent: O
         vec![Span::styled(format!("{open} open"), theme::faint())],
         width,
     )];
+    lines.push(Line::raw(""));
 
     if tasks.is_empty() {
-        lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
             "nothing on the board",
             theme::faint(),
@@ -89,7 +89,8 @@ fn render_tasks(frame: &mut Frame, area: Rect, tasks: &[Task], selected_agent: O
     }
 
     let room = area.height as usize;
-    let mut epic: Option<&str> = None;
+    // The heading's own blank line already separates it from the first epic.
+    let mut epic: Option<&str> = Some("");
     // Counted rather than derived from the line count, which also holds the
     // epic headings and the blank lines between them — deriving it printed
     // "+0 more" on a list that fitted perfectly.
@@ -97,10 +98,10 @@ fn render_tasks(frame: &mut Frame, area: Rect, tasks: &[Task], selected_agent: O
 
     for task in tasks {
         if lines.len() + 1 >= room {
-            lines.push(Line::from(Span::styled(
-                format!("+{} more", tasks.len() - shown),
-                theme::faint(),
-            )));
+            lines.push(Line::from(vec![
+                Span::raw("   "),
+                Span::styled(format!("+{} more", tasks.len() - shown), theme::faint()),
+            ]));
             break;
         }
 
@@ -183,6 +184,7 @@ fn render_background(frame: &mut Frame, area: Rect, background: &[BgTask]) {
         vec![Span::styled(format!("{running} running"), theme::faint())],
         width,
     )];
+    lines.push(Line::raw(""));
 
     if background.is_empty() {
         lines.push(Line::from(Span::styled("nothing running", theme::faint())));
@@ -207,13 +209,14 @@ fn render_background(frame: &mut Frame, area: Rect, background: &[BgTask]) {
         let took = elapsed(bg.elapsed_secs);
         let command = clip(
             &bg.command,
-            width.saturating_sub(took.chars().count() as u16 + 3),
+            width.saturating_sub(took.chars().count() as u16 + 4),
         );
         // Right-align the time so it reads as a column rather than trailing
         // each command at a different place.
         let gap = (width as usize)
-            .saturating_sub(2 + command.chars().count() + took.chars().count());
+            .saturating_sub(3 + command.chars().count() + took.chars().count());
         lines.push(Line::from(vec![
+            Span::raw(" "),
             Span::styled(glyph, Style::default().fg(colour)),
             Span::raw(" "),
             Span::styled(command, Style::default().fg(theme::TEXT)),
@@ -236,8 +239,8 @@ fn render_background(frame: &mut Frame, area: Rect, background: &[BgTask]) {
             theme::faint()
         };
         lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(clip(&detail, width.saturating_sub(2)), detail_style),
+            Span::raw("   "),
+            Span::styled(clip(&detail, width.saturating_sub(3)), detail_style),
         ]));
     }
 

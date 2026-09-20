@@ -138,20 +138,20 @@ fn graph(frame: &mut Frame, area: Rect, events: &[Event], rows: &[Row]) {
 
     let mut lines = vec![
         Line::from(vec![
-            Span::styled("  ◆ ", theme::accent()),
+            Span::styled(" ◆ ", theme::accent()),
             Span::styled(
                 chief.clone(),
                 Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD),
             ),
             Span::styled("  the one you brief", theme::faint()),
         ]),
-        Line::from(Span::styled("  │", Style::default().fg(theme::BORDER))),
+        Line::from(Span::styled(" │", Style::default().fg(theme::BORDER))),
     ];
 
     let busiest = spokes.values().map(|(a, b)| a + b).max().unwrap_or(1).max(1);
     let last = spokes.len().saturating_sub(1);
     for (i, (name, (sent, received))) in spokes.iter().enumerate() {
-        let elbow = if i == last { "  └──▶ " } else { "  ├──▶ " };
+        let elbow = if i == last { " └──▶ " } else { " ├──▶ " };
         let state = rows.iter().find(|r| &r.name == name);
         let (glyph, colour) = match state.map(|r| r.presence) {
             Some(Presence::Working) => ("●", theme::BUSY),
@@ -173,12 +173,12 @@ fn graph(frame: &mut Frame, area: Rect, events: &[Event], rows: &[Row]) {
     if !peers.is_empty() {
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
-            "  bypassing the chief",
+            "bypassing the chief",
             theme::label(),
         )));
         for edge in peers {
             lines.push(Line::from(vec![
-                Span::raw("  "),
+                Span::raw(" "),
                 Span::styled(edge.from.clone(), theme::dim()),
                 Span::styled(" ──▶ ", Style::default().fg(theme::BORDER)),
                 Span::styled(format!("{:<16}", edge.to), theme::dim()),
@@ -189,7 +189,7 @@ fn graph(frame: &mut Frame, area: Rect, events: &[Event], rows: &[Row]) {
 
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
-        "  ▸ sent   ◂ received",
+        " ▸ sent   ◂ received",
         theme::faint(),
     )));
 
@@ -223,9 +223,13 @@ fn log(frame: &mut Frame, area: Rect, events: &[Event], selected: usize) {
     // Fixed columns, so the summaries line up. The route is clipped to its
     // width rather than merely padded to it: "accounts-svc ▸ billing-svc" is
     // longer than the column, and padding alone lets it run into the summary.
-    const ROUTE: usize = 24;
     let inner = list.width.saturating_sub(theme::GUTTER * 2) as usize;
-    let summary_width = inner.saturating_sub(1 + 5 + 1 + 1 + 1 + ROUTE) as u16;
+    // The route gives way in a narrow pane. At a fixed 24 it left nothing
+    // for the summary, which is the half you are actually reading.
+    let route_width = 24.min(inner / 3).max(8);
+    // The trailing 1 is a space that has to exist even when the route fills
+    // its column exactly, or a clipped route runs straight into the summary.
+    let summary_width = inner.saturating_sub(1 + 5 + 1 + 1 + 1 + route_width + 1) as u16;
     let mut lines = Vec::new();
     for (i, e) in events.iter().enumerate().skip(first).take(room) {
         let is_selected = i == selected;
@@ -240,7 +244,7 @@ fn log(frame: &mut Frame, area: Rect, events: &[Event], selected: usize) {
             (Some(f), _) if !f.is_empty() => f.clone(),
             _ => String::new(),
         };
-        let route = clip(&route, ROUTE as u16);
+        let route = clip(&route, route_width as u16);
         lines.push(
             Line::from(vec![
                 Span::styled(if is_selected { "▌" } else { " " }, theme::accent()),
@@ -248,7 +252,7 @@ fn log(frame: &mut Frame, area: Rect, events: &[Event], selected: usize) {
                 Span::raw(" "),
                 Span::styled(glyph, Style::default().fg(colour)),
                 Span::raw(" "),
-                Span::styled(format!("{route:<ROUTE$}"), theme::dim()),
+                Span::styled(format!("{route:<route_width$} "), theme::dim()),
                 Span::styled(
                     clip(&e.summary, summary_width),
                     if is_selected {
@@ -274,28 +278,30 @@ fn log(frame: &mut Frame, area: Rect, events: &[Event], selected: usize) {
     frame.render_widget(divider, detail);
 
     let Some(e) = events.get(selected) else { return };
-    let mut body = vec![Line::from(vec![
-        Span::styled(
-            e.from_agent.clone().unwrap_or_default(),
-            Style::default().fg(theme::OK),
-        ),
-        Span::styled(" ──▶ ", Style::default().fg(theme::BORDER)),
-        Span::styled(
-            e.to_agent.clone().unwrap_or_else(|| "—".into()),
-            theme::accent(),
-        ),
-        Span::raw("  "),
-        Span::styled(e.task_key.clone().unwrap_or_default(), theme::faint()),
-        Span::raw("  "),
+    let width = inner.width.saturating_sub(theme::GUTTER * 2);
+    let mut body = vec![theme::spread(
+        vec![
+            Span::styled(
+                e.from_agent.clone().unwrap_or_default(),
+                Style::default().fg(theme::OK),
+            ),
+            Span::styled(" ──▶ ", Style::default().fg(theme::BORDER)),
+            Span::styled(
+                e.to_agent.clone().unwrap_or_else(|| "—".into()),
+                theme::accent(),
+            ),
+            Span::raw("  "),
+            Span::styled(e.task_key.clone().unwrap_or_default(), theme::faint()),
+        ],
         // Time only: the date is the same one, and a truncated timestamp
         // reads as a broken value rather than an abbreviated one.
-        Span::styled(
+        vec![Span::styled(
             e.ts.get(11..19).unwrap_or_default().to_string(),
             theme::faint(),
-        ),
-    ])];
+        )],
+        width,
+    )];
     body.push(Line::raw(""));
-    let width = inner.width.saturating_sub(theme::GUTTER * 2);
     // The summary is the one line; the body is what it would not fit.
     for line in wrap(e.body.as_deref().unwrap_or(&e.summary), width) {
         body.push(Line::from(Span::styled(

@@ -718,11 +718,8 @@ impl App {
     fn draw_keys(&self, frame: &mut Frame, area: Rect) {
         if let Some(status) = &self.status {
             frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    format!(" {status}"),
-                    theme::accent(),
-                ))),
-                area,
+                Paragraph::new(Line::from(Span::styled(status.clone(), theme::accent()))),
+                theme::pad(area),
             );
             return;
         }
@@ -737,7 +734,7 @@ impl App {
                         theme::dim(),
                     ),
                 ])),
-                area,
+                theme::pad(area),
             );
             return;
         }
@@ -768,14 +765,14 @@ impl App {
             ],
         };
 
-        let mut spans = vec![Span::raw(" ")];
+        let mut spans: Vec<Span> = Vec::new();
         for (key, what) in keys.iter().copied() {
             spans.push(Span::styled(key, theme::dim()));
             spans.push(Span::raw(" "));
             spans.push(Span::styled(what, theme::faint()));
             spans.push(Span::raw("   "));
         }
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        frame.render_widget(Paragraph::new(Line::from(spans)), theme::pad(area));
     }
 }
 
