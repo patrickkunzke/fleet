@@ -22,9 +22,9 @@ already runs on the machine.
 | `src/ui/` — frame, fleet rail, session pane, board rail | done, 43 tests |
 | `src/agent.rs` — starting an agent, repo discovery | done, 4 tests |
 | `n` to spawn from the rail | done |
+| `src/ui/flow.rs` — graph and log views | done, 9 tests |
 | `src/ui/mirror.rs` — the live tmux pane | done, 5 tests |
 | `board` subcommand writes in the binary | not started; reads are done |
-| flow pane | not started |
 
 ## What it is built on
 
@@ -77,7 +77,17 @@ cargo run -- spawn billing-svc --repo ~/Code/acme/service/billing-service
 cargo run -- sessions --watch
 cargo run -- tui --snapshot 104x20          # one frame to stdout
 cargo run -- repos --root ~/Code/acme    # what `n` offers
+cargo run -- tui --snapshot 104x22 --view graph
 ```
+
+Keys: `↑↓` agent, `n` new agent, `tab` session, `i` type into it, `↵` zoom to
+the pane, `g` the flow graph, `l` the flow log, `q` quit.
+
+The flow views read the `events` table, which every state change and every
+`fleet msg` writes. **A message sent with `SendMessage` and never logged does
+not appear there** — the board is the record, so an agent that does not report
+is invisible to it by construction. That is why the `/board` skill asks for
+both: the board is the state, the message is the interrupt.
 
 ## Packaging plan
 
@@ -113,7 +123,7 @@ src/db.rs            fleet.db  [done]
 src/registry.rs      ~/.claude/sessions watcher (notify / FSEvents)  [done]
 src/transcript.rs    jsonl tail  [done]
 src/tmux.rs          spawn a session into a pane, zoom to it  [done]
-src/ui/…             fleet rail, session pane, board rail [done], flow
+src/ui/…             fleet rail, session pane, board rail, flow [done]
 schema.sql           embedded with include_str!
 skills/board/        installed by `fleet install-skill`
 ```

@@ -43,6 +43,9 @@ enum Command {
         /// Draw one frame to stdout instead of taking over the terminal.
         #[arg(long, value_name = "WIDTHxHEIGHT")]
         snapshot: Option<String>,
+        /// Which centre view to draw: session (default), graph, or log.
+        #[arg(long)]
+        view: Option<String>,
     },
     /// Live sessions and what they are doing.
     Sessions {
@@ -126,11 +129,13 @@ fn main() -> Result<()> {
         root: None,
         db: None,
         snapshot: None,
+        view: None,
     }) {
         Command::Tui {
             root,
             db,
             snapshot,
+            view,
         } => {
             let path = db.unwrap_or_else(db::default_path);
             let db = Db::open(&path)?;
@@ -140,7 +145,7 @@ fn main() -> Result<()> {
                         .split_once('x')
                         .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
                         .context("--snapshot wants WIDTHxHEIGHT, such as 110x28")?;
-                    ui::snapshot(db, path, root, w, h)
+                    ui::snapshot(db, path, root, w, h, view.as_deref())
                 }
                 None => ui::run(db, path, root),
             }

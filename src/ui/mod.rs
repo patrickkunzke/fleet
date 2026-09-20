@@ -12,6 +12,7 @@
 
 pub mod board;
 pub mod fleet;
+pub mod flow;
 pub mod picker;
 pub mod mirror;
 pub mod session;
@@ -31,6 +32,7 @@ use crate::db::{self, Db};
 use crate::registry::{self, Registry, Watcher};
 use crate::tmux::Tmux;
 use crate::ui::fleet::Row;
+use crate::ui::flow::View;
 use crate::ui::picker::Picker;
 
 /// How often to redraw when nothing has happened. Slow on purpose: the only
@@ -91,6 +93,11 @@ pub struct App {
     rx: Option<Receiver<Msg>>,
     tasks: Vec<db::Task>,
     background: Vec<db::BgTask>,
+    events: Vec<db::Event>,
+    /// What the middle column is showing. The rail selection still drives
+    /// the session view underneath, so switching away and back keeps it.
+    centre_view: Option<View>,
+    event_selected: usize,
     status: Option<String>,
     quit: bool,
 }
@@ -119,6 +126,9 @@ impl App {
             picker: None,
             tasks: Vec::new(),
             background: Vec::new(),
+            events: Vec::new(),
+            centre_view: None,
+            event_selected: 0,
             status: None,
             quit: false,
         }
@@ -146,6 +156,12 @@ impl App {
         if let Ok(bg) = self.db.background() {
             self.background = bg;
         }
+        if let Ok(events) = self.db.events(200) {
+            self.events = events;
+        }
+        self.event_selected = self
+            .event_selected
+            .min(self.events.len().saturating_sub(1));
 
         self.selected = self.selected.min(self.rows.len().saturating_sub(1));
         self.retarget();
@@ -188,6 +204,17 @@ impl App {
                 self.refresh();
                 return;
             }
+            // Pressing the same key again puts the session back, so neither
+            // view is a place you get stuck in.
+            (KeyCode::Char('g'), _) => {
+                self.centre_view = (self.centre_view != Some(View::Graph)).then_some(View::Graph);
+                return;
+            }
+            (KeyCode::Char('l'), _) => {
+                self.centre_view = (self.centre_view != Some(View::Log)).then_some(View::Log);
+                self.focus = Focus::Session;
+                return;
+            }
             _ => {}
         }
 
@@ -201,16 +228,34 @@ impl App {
         match key.code {
             KeyCode::Down | KeyCode::Char('j') => self.move_by(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_by(-1),
-            KeyCode::Char('g') => {
+            KeyCode::Home => {
                 self.selected = 0;
                 self.retarget();
             }
-            KeyCode::Char('G') => {
+            KeyCode::End | KeyCode::Char('G') => {
                 self.selected = self.rows.len().saturating_sub(1);
                 self.retarget();
             }
             KeyCode::Char('n') => self.open_picker(),
             _ => {}
+        }
+    }
+
+    /// Select the agent an event came from, and go back to watching it.
+    fn jump_to_event(&mut self) {
+        let Some(event) = self.events.get(self.event_selected) else {
+            return;
+        };
+        let Some(who) = event.from_agent.clone().filter(|w| !w.is_empty()) else {
+            return;
+        };
+        if let Some(at) = self.rows.iter().position(|r| r.name == who) {
+            self.selected = at;
+            self.centre_view = None;
+            self.focus = Focus::Rail;
+            self.retarget();
+        } else {
+            self.status = Some(format!("{who} is not on the rail any more"));
         }
     }
 
@@ -294,6 +339,22 @@ impl App {
     }
 
     fn session_key(&mut self, key: KeyEvent) {
+        // The log owns the arrows while it is up.
+        if self.centre_view == Some(View::Log) {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.event_selected = self.event_selected.saturating_sub(1)
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.event_selected =
+                        (self.event_selected + 1).min(self.events.len().saturating_sub(1))
+                }
+                // Jump to whoever the event is about, and show their session.
+                KeyCode::Enter => self.jump_to_event(),
+                _ => {}
+            }
+            return;
+        }
         if key.code == KeyCode::Char('i') && self.centre.is_live() {
             self.mode = Mode::Insert;
             self.status = None;
@@ -430,9 +491,21 @@ impl App {
 
         self.centre_size = (centre.width.saturating_sub(3), centre.height.saturating_sub(2));
         fleet::render(frame, rail, &self.rows, self.selected);
-        let row = self.rows.get(self.selected).cloned();
-        let input = (self.mode == Mode::Insert).then_some(&self.input);
-        self.centre.render(frame, centre, row.as_ref(), input);
+        match self.centre_view {
+            Some(view) => flow::render(
+                frame,
+                centre,
+                view,
+                &self.events,
+                &self.rows,
+                self.event_selected,
+            ),
+            None => {
+                let row = self.rows.get(self.selected).cloned();
+                let input = (self.mode == Mode::Insert).then_some(&self.input);
+                self.centre.render(frame, centre, row.as_ref(), input);
+            }
+        }
         self.draw_side(frame, side);
         self.draw_keys(frame, keys);
 
@@ -510,11 +583,25 @@ impl App {
                 ("esc", "interrupt"),
                 ("^]", "stop typing"),
             ],
+            _ if self.centre_view == Some(View::Log) => &[
+                ("↑↓", "event"),
+                ("↵", "jump to agent"),
+                ("l", "back"),
+                ("g", "graph"),
+                ("q", "quit"),
+            ],
+            _ if self.centre_view == Some(View::Graph) => &[
+                ("g", "back"),
+                ("l", "log"),
+                ("n", "new agent"),
+                ("q", "quit"),
+            ],
             Focus::Rail => &[
                 ("↑↓", "agent"),
                 ("n", "new agent"),
+                ("g", "graph"),
+                ("l", "log"),
                 ("tab", "session"),
-                ("r", "refresh"),
                 ("q", "quit"),
             ],
             Focus::Session if self.centre.is_live() => &[
@@ -548,12 +635,18 @@ pub fn snapshot(
     root: Option<PathBuf>,
     width: u16,
     height: u16,
+    view: Option<&str>,
 ) -> Result<()> {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
     let mut app = App::new(db, db_path, root);
     app.refresh();
+    app.centre_view = match view {
+        Some("graph") => Some(View::Graph),
+        Some("log") => Some(View::Log),
+        _ => None,
+    };
     let mut term = Terminal::new(TestBackend::new(width, height))?;
     term.draw(|f| app.draw(f))?;
     print!("{}", term.backend());
@@ -723,6 +816,67 @@ mod tests {
             out.contains("no session linked"),
             "an agent with no live session says so: {out}"
         );
+    }
+
+    #[test]
+    fn g_and_l_swap_the_centre_and_put_it_back() {
+        let mut app = app();
+        assert!(app.centre_view.is_none());
+
+        app.on_key(KeyEvent::from(KeyCode::Char('g')));
+        assert_eq!(app.centre_view, Some(View::Graph));
+        assert!(drawn(&mut app, 110, 24).contains("topology"));
+
+        app.on_key(KeyEvent::from(KeyCode::Char('l')));
+        assert_eq!(app.centre_view, Some(View::Log), "l switches straight across");
+        assert!(drawn(&mut app, 110, 24).contains("chronological"));
+
+        app.on_key(KeyEvent::from(KeyCode::Char('l')));
+        assert!(app.centre_view.is_none(), "the same key again goes back");
+    }
+
+    #[test]
+    fn the_log_takes_the_arrows_while_it_is_up() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_agent("chief", Some("chief"), None, None, None, None)
+            .unwrap();
+        for i in 0..3 {
+            db.log_event("message", Some("chief"), Some("worker"), None, &format!("m{i}"), None, None)
+                .unwrap();
+        }
+        let mut app = App::new(db, PathBuf::from(":memory:"), None);
+        app.refresh();
+
+        app.on_key(KeyEvent::from(KeyCode::Char('l')));
+        assert_eq!(app.event_selected, 0);
+
+        app.on_key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(app.event_selected, 1, "the arrows move the event, not the agent");
+
+        // And they stop at the end rather than wrapping.
+        for _ in 0..10 {
+            app.on_key(KeyEvent::from(KeyCode::Down));
+        }
+        assert_eq!(app.event_selected, app.events.len() - 1);
+    }
+
+    #[test]
+    fn enter_in_the_log_goes_to_the_agent_the_event_came_from() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_agent("chief", Some("chief"), None, None, None, None)
+            .unwrap();
+        db.upsert_agent("billing-svc", None, Some("/repo"), None, None, None)
+            .unwrap();
+        db.log_event("message", Some("billing-svc"), Some("chief"), None, "blocked", None, None)
+            .unwrap();
+
+        let mut app = App::new(db, PathBuf::from(":memory:"), None);
+        app.refresh();
+        app.on_key(KeyEvent::from(KeyCode::Char('l')));
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+
+        assert!(app.centre_view.is_none(), "it returns to watching that agent");
+        assert_eq!(app.selected().unwrap().name, "billing-svc");
     }
 
     #[test]
