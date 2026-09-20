@@ -98,6 +98,10 @@ pub struct BgTask {
     pub state: String,
     pub detail: Option<String>,
     pub started_at: String,
+    /// How long it has been running, or ran for. Computed by SQLite so that
+    /// reading a timestamp back does not need a date library for the sake of
+    /// one subtraction.
+    pub elapsed_secs: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,7 +229,10 @@ impl Db {
     /// hour — a build that just failed is still what you want to see.
     pub fn background(&self) -> Result<Vec<BgTask>> {
         let mut stmt = self.conn.prepare(
-            "SELECT b.id, a.name, b.repo, b.command, b.kind, b.port, b.state, b.detail, b.started_at
+            "SELECT b.id, a.name, b.repo, b.command, b.kind, b.port, b.state, b.detail,
+                    b.started_at,
+                    CAST(strftime('%s', COALESCE(b.ended_at, 'now')) -
+                         strftime('%s', b.started_at) AS INTEGER)
              FROM bg_tasks b LEFT JOIN agents a ON a.id = b.agent_id
              WHERE b.state = 'running' OR b.ended_at > datetime('now', '-1 hour')
              ORDER BY b.started_at DESC",
@@ -242,6 +249,7 @@ impl Db {
                     state: r.get(6)?,
                     detail: r.get(7)?,
                     started_at: r.get(8)?,
+                    elapsed_secs: r.get::<_, Option<i64>>(9)?.unwrap_or(0),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -732,6 +740,10 @@ mod tests {
         let row = bg.iter().find(|b| b.id == id).unwrap();
         assert_eq!(row.state, "passed");
         assert_eq!(row.detail.as_deref(), Some("51 of 51"));
+        assert!(
+            row.elapsed_secs >= 0,
+            "a finished task reports how long it took, not how long ago it started"
+        );
 
         assert_eq!(
             db.agents()

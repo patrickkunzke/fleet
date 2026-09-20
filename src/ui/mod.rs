@@ -10,6 +10,7 @@
 //! produces no event of its own — a process that died, and a clock that has
 //! to keep showing elapsed time.
 
+pub mod board;
 pub mod fleet;
 pub mod mirror;
 pub mod session;
@@ -22,7 +23,7 @@ use std::time::Duration;
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Paragraph};
 
 use crate::db::{self, Db};
 use crate::registry::{self, Registry, Watcher};
@@ -77,10 +78,8 @@ pub struct App {
     focus: Focus,
     mode: Mode,
     input: session::Input,
-    /// Counts for the right rail until it has panes of its own.
-    tasks: usize,
-    blocked: usize,
-    background: usize,
+    tasks: Vec<db::Task>,
+    background: Vec<db::BgTask>,
     status: Option<String>,
     quit: bool,
 }
@@ -102,9 +101,8 @@ impl App {
             focus: Focus::Rail,
             mode: Mode::Normal,
             input: session::Input::default(),
-            tasks: 0,
-            blocked: 0,
-            background: 0,
+            tasks: Vec::new(),
+            background: Vec::new(),
             status: None,
             quit: false,
         }
@@ -127,14 +125,10 @@ impl App {
             Err(e) => self.status = Some(format!("board unreadable: {e}")),
         }
         if let Ok(board) = self.db.board() {
-            self.tasks = board.iter().filter(|t| t.state != db::State::Done).count();
-            self.blocked = board
-                .iter()
-                .filter(|t| t.state == db::State::Blocked)
-                .count();
+            self.tasks = board;
         }
         if let Ok(bg) = self.db.background() {
-            self.background = bg.iter().filter(|b| b.state == "running").count();
+            self.background = bg;
         }
 
         self.selected = self.selected.min(self.rows.len().saturating_sub(1));
@@ -368,12 +362,14 @@ impl App {
                 Style::default().fg(theme::BUSY),
             ));
         }
-        if self.blocked > 0 {
+        let blocked = self
+            .tasks
+            .iter()
+            .filter(|t| t.state == db::State::Blocked)
+            .count();
+        if blocked > 0 {
             spans.push(Span::styled("  ·  ", theme::faint()));
-            spans.push(Span::styled(
-                format!("{} blocked", self.blocked),
-                theme::accent(),
-            ));
+            spans.push(Span::styled(format!("{blocked} blocked"), theme::accent()));
         }
         spans.push(Span::styled(
             format!("  ·  {} agents", self.rows.len()),
@@ -384,38 +380,13 @@ impl App {
     }
 
     fn draw_side(&self, frame: &mut Frame, area: Rect) {
-        let [tasks, bg] =
-            Layout::vertical([Constraint::Percentage(55), Constraint::Min(0)]).areas(area);
-
-        let mut top = vec![Line::from(vec![
-            Span::styled("TASKS", theme::label()),
-            Span::raw("  "),
-            Span::styled(format!("{} open", self.tasks), theme::faint()),
-        ])];
-        top.push(Line::raw(""));
-        top.push(Line::from(Span::styled(
-            "the board goes here",
-            theme::faint(),
-        )));
-        frame.render_widget(Paragraph::new(top), pad(tasks));
-
-        let divider = Block::default()
-            .borders(Borders::TOP)
-            .border_style(Style::default().fg(theme::BORDER));
-        let inner = divider.inner(bg);
-        frame.render_widget(divider, bg);
-
-        let mut lower = vec![Line::from(vec![
-            Span::styled("BACKGROUND", theme::label()),
-            Span::raw("  "),
-            Span::styled(format!("{} running", self.background), theme::faint()),
-        ])];
-        lower.push(Line::raw(""));
-        lower.push(Line::from(Span::styled(
-            "dev servers and runs go here",
-            theme::faint(),
-        )));
-        frame.render_widget(Paragraph::new(lower), pad(inner));
+        board::render(
+            frame,
+            area,
+            &self.tasks,
+            &self.background,
+            self.selected().map(|r| r.name.as_str()),
+        );
     }
 
     fn draw_keys(&self, frame: &mut Frame, area: Rect) {
@@ -466,21 +437,6 @@ impl App {
     }
 }
 
-/// One column of breathing room, without spending a border on it.
-fn pad(area: Rect) -> Rect {
-    Rect {
-        x: area.x + 1,
-        y: area.y,
-        width: area.width.saturating_sub(2),
-        height: area.height,
-    }
-}
-
-/// Render one frame to stdout and exit.
-///
-/// The TUI cannot be looked at over a pipe, in CI, or from an agent, and a
-/// layout bug that only appears at some width is exactly the kind that
-/// survives to someone else's terminal.
 pub fn snapshot(db: Db, root: Option<PathBuf>, width: u16, height: u16) -> Result<()> {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -619,6 +575,10 @@ mod tests {
         assert!(out.contains("no session linked"), "the centre: {out}");
         assert!(out.contains("TASKS"), "the right rail: {out}");
         assert!(out.contains("BACKGROUND"), "and its lower half: {out}");
+        assert!(
+            out.contains("nothing on the board"),
+            "an empty board says so rather than showing a heading and a void: {out}"
+        );
         assert!(out.contains("quit"), "the key bar: {out}");
     }
 
