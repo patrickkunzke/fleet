@@ -23,6 +23,7 @@ already runs on the machine.
 | `n` to spawn from the rail | done |
 | `src/ui/flow.rs` — graph and log views | done, 9 tests |
 | `src/ui/mirror.rs` — the live tmux pane | done, 5 tests |
+| `src/ui/preview.rs` — the fixture fleet, for layout work | done, 4 tests |
 
 ## What it is built on
 
@@ -98,6 +99,33 @@ not appear there** — the board is the record, so an agent that does not report
 is invisible to it by construction. That is why the `/board` skill asks for
 both: the board is the state, the message is the interrupt.
 
+## Working on the layout
+
+Restarting a real fleet to look at a margin is the wrong loop: the agents are
+the expensive part and the spacing has nothing to do with them. So there is a
+fixture fleet.
+
+```bash
+./dev.sh                 # rebuild and redraw on every save
+./dev.sh 140x40 graph    # a size and a view: session, graph, log
+fleet preview --plain    # the same frame as text, for a diff
+```
+
+`fleet preview` invents the whole thing — an in-memory board carrying every
+task state and every agent presence, and a canned Claude Code pane on a
+**private tmux server** (`-L fleet-preview`). It draws one frame where your
+prompt was, in colour, and gives the shell back. Nothing it does can reach
+`~/.claude-fleet/fleet.db`, your registry, or your tmux server, so it is safe
+to run beside a fleet that is up.
+
+`dev.sh` polls for changes rather than needing `cargo-watch` or `fswatch`
+installed, and builds debug — the release binary stays as it was, because
+`~/.local/bin/fleet` is a symlink to it and somebody may have it open.
+
+Worth knowing either way: **quitting fleet does not stop the agents.** tmux
+owns them and the board is a file, so starting it again reattaches to
+everything that is still running.
+
 ## Packaging plan
 
 **Rust + ratatui, shipped as a Homebrew tap.** The shell CLI is a placeholder
@@ -166,8 +194,8 @@ The centre pane shows two different things, and prefers the first:
 1. **The agent's actual terminal**, mirrored out of tmux with `pipe-pane` and
    replayed through a vt100 parser. The real REPL — spinners, permission
    prompts, its own colours. tmux still owns the process, so an agent outlives
-   this program and `↵` hands over the unmodified terminal. `i` types into it;
-   `Ctrl-]` stops.
+   this program and `↵` hands over the unmodified terminal. Typing goes
+   straight to it; `Ctrl-A` is how you address fleet instead.
 2. **The transcript**, re-rendered from the jsonl. The only thing that can show
    a session which is not in our tmux, or one that has ended, and the
    structured source the flow pane is built on. A reading of the session

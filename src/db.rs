@@ -148,8 +148,8 @@ impl Db {
         Db::prepare(conn)
     }
 
-    /// Tests only — the real database is a file several processes share.
-    #[cfg(test)]
+    /// A board that exists only for this process: tests, and the preview's
+    /// invented fleet. The real one is a file several processes share.
     pub fn open_in_memory() -> Result<Db> {
         Db::prepare(Connection::open_in_memory()?)
     }

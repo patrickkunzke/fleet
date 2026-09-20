@@ -62,7 +62,6 @@ impl Tmux {
     }
 
     /// Talk to a private tmux server rather than the user's own.
-    #[cfg(test)]
     pub fn on_socket(mut self, socket: &str) -> Tmux {
         self.socket = Some(socket.to_string());
         self
@@ -308,7 +307,6 @@ impl Tmux {
 
     /// Stop a private server entirely. Refuses on the user's own server,
     /// where it would close every window they have open.
-    #[cfg(test)]
     pub fn kill_server(&self) -> Result<()> {
         if self.socket.is_none() {
             bail!("refusing to kill the default tmux server");

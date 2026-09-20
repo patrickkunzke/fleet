@@ -48,6 +48,21 @@ enum Command {
         #[arg(long)]
         view: Option<String>,
     },
+    /// Draw one frame of an invented fleet and hand the shell back.
+    ///
+    /// For working on the layout: no real agents, no real board, and nothing
+    /// to restart. `dev.sh` runs it on every save.
+    Preview {
+        /// How big to draw it. Must fit the window.
+        #[arg(long, value_name = "WIDTHxHEIGHT", default_value = "110x32")]
+        size: String,
+        /// Which centre view: session (default), graph, or log.
+        #[arg(long)]
+        view: Option<String>,
+        /// Text instead of colour, for a diff or a pipe.
+        #[arg(long)]
+        plain: bool,
+    },
     /// Live sessions and what they are doing.
     Sessions {
         /// Follow the registry and report each change.
@@ -239,6 +254,13 @@ enum BgCmd {
     Ls,
 }
 
+/// `110x32`, as both `--snapshot` and `--preview` spell a size.
+fn parse_size(size: &str) -> Result<(u16, u16)> {
+    size.split_once('x')
+        .and_then(|(w, h)| Some((w.trim().parse().ok()?, h.trim().parse().ok()?)))
+        .with_context(|| format!("expected WIDTHxHEIGHT, such as 110x28, not '{size}'"))
+}
+
 fn main() -> Result<()> {
     // Rust ignores SIGPIPE, so `fleet repos | head` panics on the write that
     // follows head exiting. Every other unix tool dies quietly there.
@@ -266,14 +288,15 @@ fn main() -> Result<()> {
             let root = root.or_else(|| std::env::current_dir().ok());
             match snapshot {
                 Some(size) => {
-                    let (w, h) = size
-                        .split_once('x')
-                        .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
-                        .context("--snapshot wants WIDTHxHEIGHT, such as 110x28")?;
+                    let (w, h) = parse_size(&size)?;
                     ui::snapshot(db, path, root, w, h, view.as_deref())
                 }
                 None => ui::run(db, path, root),
             }
+        }
+        Command::Preview { size, view, plain } => {
+            let (w, h) = parse_size(&size)?;
+            ui::preview::run(w, h, view.as_deref(), plain)
         }
         Command::Sessions { watch } => sessions(watch),
         Command::Session { name, watch, lines } => session(&name, watch, lines),

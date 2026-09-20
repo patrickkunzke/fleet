@@ -16,6 +16,7 @@ pub mod flow;
 pub mod keys;
 pub mod picker;
 pub mod mirror;
+pub mod preview;
 pub mod session;
 pub mod theme;
 
@@ -569,6 +570,13 @@ impl App {
         // No outer margin: the panes bring their own gutters, and the rules
         // are meant to reach the edges of the terminal.
         let area = frame.area();
+        self.draw_into(frame, area);
+    }
+
+    /// The same frame, into a given rectangle rather than the whole terminal.
+    /// Only the preview wants this — it draws a chosen width inline, inside a
+    /// window that is usually wider.
+    pub fn draw_into(&mut self, frame: &mut Frame, area: Rect) {
         frame.render_widget(Block::default().style(theme::base()), area);
 
         // A row above the title, so it is not jammed against the terminal's
