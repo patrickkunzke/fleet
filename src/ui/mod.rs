@@ -111,6 +111,9 @@ pub struct App {
     centre_view: Option<View>,
     event_selected: usize,
     status: Option<String>,
+    /// Whether the message on screen is one refresh put there, and so one
+    /// refresh may take away.
+    status_is_db_error: bool,
     quit: bool,
 }
 
@@ -147,6 +150,7 @@ impl App {
             centre_view: None,
             event_selected: 0,
             status: None,
+            status_is_db_error: false,
             quit: false,
         }
     }
@@ -163,9 +167,19 @@ impl App {
         match self.db.agents() {
             Ok(agents) => {
                 self.rows = fleet::merge(&agents, &sessions);
-                self.status = None;
+                // Only clear what refresh itself reported. Anything else on
+                // screen was said by an action, and a refresh two ticks
+                // later must not swallow it — which is how "started X" had
+                // been going unseen.
+                if self.status_is_db_error {
+                    self.status = None;
+                    self.status_is_db_error = false;
+                }
             }
-            Err(e) => self.status = Some(format!("board unreadable: {e}")),
+            Err(e) => {
+                self.status = Some(format!("board unreadable: {e}"));
+                self.status_is_db_error = true;
+            }
         }
         if let Ok(board) = self.db.board() {
             self.tasks = board;
@@ -250,6 +264,7 @@ impl App {
                 self.centre_view = (self.centre_view != Some(View::Log)).then_some(View::Log)
             }
             (KeyCode::Char('n'), _) => self.open_picker(),
+            (KeyCode::Char('x'), _) => self.retire_selected(),
             (KeyCode::Enter, _) if self.centre_view.is_none() => self.hand_over(),
             _ if self.centre_view == Some(View::Log) => self.log_key(key),
             // Paging and the wheel move a transcript; the arrows do not.
@@ -423,6 +438,41 @@ impl App {
 
     fn start_agent(&mut self, chosen: &agent::Candidate) {
         self.launch(&chosen.name, &chosen.path.clone(), agent::Naming::Unique);
+    }
+
+    /// Take the selected agent off the rail.
+    ///
+    /// Its pane is left alone: the row is fleet's bookkeeping, and killing
+    /// somebody's running session because they tidied a list would be a
+    /// surprising thing for a list to do.
+    fn retire_selected(&mut self) {
+        let Some(row) = self.selected().cloned() else { return };
+        match self.db.retire_agent(&row.name) {
+            Ok(()) => {
+                self.status = Some(format!("{} is off the rail; its pane is untouched", row.name));
+                self.refresh();
+            }
+            Err(e) => self.status = Some(e.to_string()),
+        }
+    }
+
+    /// Clear out agents that are finished with.
+    ///
+    /// Quitting fleet leaves every agent's row behind with its session gone,
+    /// so without this the rail fills with the dead from previous runs. Only
+    /// the ones holding no task: an agent that died mid-task is exactly what
+    /// somebody needs to see.
+    fn prune_dead(&mut self) {
+        let dead: Vec<String> = self
+            .rows
+            .iter()
+            .filter(|r| r.presence == fleet::Presence::Gone && r.detail == "session ended")
+            .map(|r| r.name.clone())
+            .collect();
+        for name in dead {
+            let _ = self.db.retire_agent(&name);
+        }
+        self.refresh();
     }
 
     /// Make sure there is someone to brief.
@@ -621,8 +671,9 @@ impl App {
             spans.push(Span::styled("  ·  ", theme::faint()));
             spans.push(Span::styled(format!("{blocked} blocked"), theme::accent()));
         }
+        let n = self.rows.len();
         spans.push(Span::styled(
-            format!("  ·  {} agents", self.rows.len()),
+            format!("  ·  {n} agent{}", if n == 1 { "" } else { "s" }),
             theme::dim(),
         ));
 
@@ -657,7 +708,7 @@ impl App {
                 Paragraph::new(Line::from(vec![
                     Span::styled(" ^a ", theme::accent().add_modifier(Modifier::REVERSED)),
                     Span::styled(
-                        "  n new  z wide  g graph  l log  tab focus  r refresh  q quit",
+                        "  n new  x retire  z wide  g graph  l log  tab focus  q quit",
                         theme::dim(),
                     ),
                 ])),
@@ -732,6 +783,7 @@ pub fn run(db: Db, db_path: PathBuf, root: Option<PathBuf>) -> Result<()> {
     app.refresh();
     // Only here, never in snapshot: drawing a frame must not start a
     // Claude Code session as a side effect.
+    app.prune_dead();
     app.ensure_chief();
     if let Some(at) = app.rows.iter().position(|r| r.role == fleet::Role::Chief) {
         app.selected = at;
@@ -1049,6 +1101,42 @@ mod tests {
         app.on_key(KeyEvent::from(KeyCode::Char('g')));
         assert!(!app.armed, "and lets go after one key");
         assert_eq!(app.centre_view, Some(View::Graph));
+    }
+
+    #[test]
+    fn retiring_takes_an_agent_off_the_rail_and_leaves_its_pane_alone() {
+        let mut app = app();
+        assert_eq!(app.rows.len(), 2);
+
+        app.retire_selected();
+        assert_eq!(app.rows.len(), 1, "the row goes");
+        assert!(app.status.unwrap().contains("untouched"), "and says the pane did not");
+    }
+
+    #[test]
+    fn pruning_clears_the_dead_but_keeps_one_that_still_holds_a_task() {
+        let db = Db::open_in_memory().unwrap();
+        // Both had a session and both are gone; only one was mid-task.
+        db.upsert_agent("finished", None, Some("/repo"), Some("dead-1"), None, None)
+            .unwrap();
+        db.upsert_agent("died-working", None, Some("/repo"), Some("dead-2"), None, None)
+            .unwrap();
+        db.add_task(&crate::db::NewTask {
+            key: "ENG-1-1",
+            title: "half done",
+            repo: "/repo",
+            ..Default::default()
+        })
+        .unwrap();
+        db.claim("ENG-1-1", "died-working").unwrap();
+        db.transition("ENG-1-1", crate::db::State::Running, None).unwrap();
+
+        let mut app = App::new(db, PathBuf::from(":memory:"), None);
+        app.refresh();
+        app.prune_dead();
+
+        let names: Vec<_> = app.rows.iter().map(|r| r.name.clone()).collect();
+        assert_eq!(names, vec!["died-working"]);
     }
 
     #[test]

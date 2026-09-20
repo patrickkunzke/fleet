@@ -484,6 +484,7 @@ mod tests {
             presence: Presence::Working,
             detail: "ENG-2553-2".into(),
             bg_running: 0,
+            uptime: None,
             session_id: session.map(str::to_string),
             branch: Some("feature/ENG-2553-2".into()),
             tmux_target: None,

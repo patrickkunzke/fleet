@@ -26,8 +26,11 @@ pub fn pad(area: Rect) -> Rect {
     }
 }
 
-pub const BG: Color = Color::Rgb(0x12, 0x11, 0x0F);
-pub const PANEL: Color = Color::Rgb(0x1C, 0x18, 0x15);
+/// Deliberately not a colour. The centre pane is a real terminal drawing on
+/// the terminal's own background, and any ground we picked for the rails
+/// would differ from it — so the app takes whatever the terminal is, and
+/// only the foreground is ours.
+pub const BG: Color = Color::Reset;
 pub const BORDER: Color = Color::Rgb(0x2B, 0x27, 0x22);
 pub const TEXT: Color = Color::Rgb(0xE8, 0xE3, 0xDA);
 pub const DIM: Color = Color::Rgb(0x8B, 0x82, 0x78);
@@ -57,6 +60,8 @@ pub fn label() -> Style {
     Style::default().fg(FAINT).add_modifier(Modifier::BOLD)
 }
 
+/// Selection is a bar and brighter text, never a filled background: a panel
+/// colour that suits one terminal theme is wrong in the next.
 pub fn selected() -> Style {
-    Style::default().fg(TEXT).bg(PANEL)
+    Style::default().fg(TEXT).add_modifier(Modifier::BOLD)
 }

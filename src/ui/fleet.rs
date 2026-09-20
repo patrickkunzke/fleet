@@ -42,6 +42,8 @@ pub struct Row {
     /// The second line: the task it holds, or why there is none.
     pub detail: String,
     pub bg_running: i64,
+    /// How long the session has been up, already formatted.
+    pub uptime: Option<String>,
     pub session_id: Option<String>,
     pub branch: Option<String>,
     pub tmux_target: Option<String>,
@@ -115,6 +117,7 @@ pub fn merge(agents: &[db::Agent], sessions: &[registry::Session]) -> Vec<Row> {
             presence,
             detail,
             bg_running: a.bg_running,
+            uptime: live.and_then(|s| s.started_at).and_then(since),
             session_id: a.session_id.clone(),
             branch: a.branch.clone(),
             tmux_target: a.tmux_target.clone(),
@@ -129,6 +132,23 @@ pub fn merge(agents: &[db::Agent], sessions: &[registry::Session]) -> Vec<Row> {
     });
 
     rows
+}
+
+/// "14m", "4h12m" — the same shape the background list uses.
+///
+/// A clock that disagrees with the registry, or a timestamp that never made
+/// sense, produces a number wide enough to push the agent's name off the
+/// rail. Past a fortnight it is not an uptime, so it is not shown.
+fn since(started: std::time::SystemTime) -> Option<String> {
+    let secs = started.elapsed().ok()?.as_secs();
+    if secs > 14 * 24 * 3600 {
+        return None;
+    }
+    Some(match secs {
+        s if s >= 3600 => format!("{}h{:02}m", s / 3600, (s % 3600) / 60),
+        s if s >= 60 => format!("{}m", s / 60),
+        s => format!("{s}s"),
+    })
 }
 
 fn short_repo(path: &str) -> &str {
@@ -189,21 +209,34 @@ pub fn render(frame: &mut Frame, area: Rect, rows: &[Row], selected: usize) {
         let (glyph, colour) = row.glyph();
         let bar = if is_selected { "▌" } else { " " };
 
-        let mut head = vec![
+        // Right-hand column first, so the name knows how much room is left.
+        let right = match (row.bg_running, &row.uptime) {
+            (0, Some(up)) => up.clone(),
+            (n, Some(up)) => format!("{n}bg {up}"),
+            (0, None) => String::new(),
+            (n, None) => format!("{n}bg"),
+        };
+        let name = truncate(
+            &row.name,
+            inner.width.saturating_sub(right.chars().count() as u16 + 4),
+        );
+        let gap = (inner.width as usize)
+            .saturating_sub(3 + name.chars().count() + right.chars().count());
+        let head = vec![
             Span::styled(bar, theme::accent()),
             Span::styled(glyph, Style::default().fg(colour)),
             Span::raw(" "),
+            Span::styled(name, row.name_style()),
+            Span::raw(" ".repeat(gap)),
             Span::styled(
-                truncate(&row.name, inner.width.saturating_sub(bg_width(row) + 3)),
-                row.name_style(),
+                right,
+                if row.bg_running > 0 {
+                    Style::default().fg(theme::BUSY)
+                } else {
+                    theme::faint()
+                },
             ),
         ];
-        if row.bg_running > 0 {
-            head.push(Span::styled(
-                format!("  {}bg", row.bg_running),
-                Style::default().fg(theme::BUSY),
-            ));
-        }
 
         let detail = Line::from(vec![
             Span::styled(bar, theme::accent()),
@@ -221,15 +254,6 @@ pub fn render(frame: &mut Frame, area: Rect, rows: &[Row], selected: usize) {
     }
 
     frame.render_widget(Paragraph::new(lines), inner);
-}
-
-/// Room the background-task badge will want on the same line.
-fn bg_width(row: &Row) -> u16 {
-    if row.bg_running > 0 {
-        4 + row.bg_running.to_string().len() as u16
-    } else {
-        0
-    }
 }
 
 fn truncate(s: &str, width: u16) -> String {

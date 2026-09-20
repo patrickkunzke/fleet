@@ -82,8 +82,8 @@ everything you type reaches that session — arrows, Escape, Ctrl-C, its own
 line editor. The wheel scrolls it. There is no mode to enter first.
 
 Fleet's own keys live behind **`Ctrl-A`**, the way a multiplexer's do: `^a n`
-new agent, `^a z` fold the rails away, `^a g` graph, `^a l` log, `^a tab`
-move the keyboard, `^a q` quit. `↵` hands you the real terminal until you
+new agent, `^a x` take one off the rail, `^a z` fold the rails away, `^a g`
+graph, `^a l` log, `^a tab` move the keyboard, `^a q` quit. `↵` hands you the real terminal until you
 detach. `^a ^a` sends a literal Ctrl-A through. Where nothing is live to type
 into — a transcript, the flow views — the keys act directly without it.
 

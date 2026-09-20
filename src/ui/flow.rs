@@ -369,6 +369,7 @@ mod tests {
                 presence: Presence::Working,
                 detail: String::new(),
                 bg_running: 0,
+                uptime: None,
                 session_id: None,
                 branch: None,
                 tmux_target: None,
