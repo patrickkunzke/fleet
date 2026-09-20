@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "A terminal orchestrator for Claude Code sessions across several repos"
 license = "MIT"
+repository = "https://github.com/patrickkunzke/fleet"
 readme = "README.md"
 
 [dependencies]
