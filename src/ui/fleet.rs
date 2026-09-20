@@ -158,9 +158,12 @@ fn short_repo(path: &str) -> &str {
         .unwrap_or(path)
 }
 
-/// Lines one agent occupies: its name, its detail, and the gap after it.
-/// The gap is what stops four agents reading as one block of text.
-const ROW: u16 = 3;
+/// Lines one agent occupies: a blank, its name, its detail, a blank.
+///
+/// The two blanks are the selection's padding — filled along with the row,
+/// so the ground stands off the text instead of gripping it — and between
+/// unselected agents they are what stops four of them reading as one block.
+const ROW: u16 = 4;
 
 /// Lines the rail spends on something other than agents: the heading and
 /// its blank line at the top, the rule and the `+ new agent` strip at the
@@ -206,7 +209,10 @@ pub fn window(height: u16, count: usize, selected: usize) -> Window {
     // Two lines for the markers, and the gap under the last row is not
     // spent: it separates rows from each other, and below the last one
     // there is nothing to separate it from.
-    let len = ((lines.saturating_sub(1)) / ROW as usize).max(1).min(count);
+    // Two lines to the markers, two more to the blank each keeps below it,
+    // and the padding under the last row is not spent: nothing follows it
+    // that the selection could run into.
+    let len = ((lines.saturating_sub(3)) / ROW as usize).max(1).min(count);
     let first = selected
         .saturating_sub(len.saturating_sub(1))
         .min(count - len);
@@ -223,16 +229,24 @@ pub fn window(height: u16, count: usize, selected: usize) -> Window {
 /// line when the rail scrolls. Shared so that a click, a fill and the rows
 /// themselves cannot disagree about where the list starts.
 fn head_lines(w: &Window) -> u16 {
-    2 + u16::from(w.scrolls)
+    // The heading and its blank line; then the marker and a blank of its
+    // own. Every row carries both of its own pads, so nothing above has to
+    // lend one — which is what kept the fill off the heading's blank line.
+    2 + 2 * u16::from(w.scrolls)
 }
 
-/// Where an agent is drawn, for a fill behind it. Its two lines only — the
-/// gap below belongs to neither row, and filling it would join the selection
-/// to whatever is under it.
+/// Where an agent is drawn, for a fill behind it: its name, its detail, and
+/// the blank line either side of them. One of the two blanks between any
+/// pair of rows stays unfilled, so the selection never runs into its
+/// neighbour.
 fn row_rect(list: Rect, w: &Window, n: usize) -> Rect {
     let y = list.y + head_lines(w) + (n as u16 * ROW);
-    let height = 2.min(list.y + list.height - y.min(list.y + list.height));
-    Rect { y, height, ..list }
+    let bottom = list.y + list.height;
+    Rect {
+        y,
+        height: ROW.min(bottom.saturating_sub(y)),
+        ..list
+    }
 }
 
 /// Which agent a click at screen row `y` landed on, if any.
@@ -246,6 +260,8 @@ pub fn row_at(area: Rect, y: u16, count: usize, selected: usize) -> Option<usize
         return None;
     }
     let w = window(area.height, count, selected);
+    // The padding counts: a click on the blank directly above a name is
+    // inside the block the eye sees lit, so it selects that name.
     let offset = (y - area.y).checked_sub(head_lines(&w))?;
     let n = (offset / ROW) as usize;
     (n < w.len).then_some(w.first + n)
@@ -297,18 +313,21 @@ pub fn render(frame: &mut Frame, area: Rect, rows: &[Row], selected: usize) {
             0 => Line::raw(""),
             n => theme::more("↑", n),
         });
+        lines.push(Line::raw(""));
     }
 
     for (i, row) in rows.iter().enumerate().skip(w.first).take(w.len) {
-        // The gap goes between rows rather than after each one. Below the
-        // last row it separates nothing, and it is the line the ↓ marker
-        // needs on a short rail.
-        if i > w.first {
-            lines.push(Line::raw(""));
-        }
+        // Both pads belong to the row, so the selection can be filled to its
+        // edges without reaching into whatever is above or below it. Between
+        // two rows that leaves two blank lines, one of which is never
+        // filled: the selection cannot run into its neighbour.
+        lines.push(Line::raw(""));
         let is_selected = i == selected;
         let (glyph, colour) = row.glyph();
-        let bar = if is_selected { "▌" } else { " " };
+        // Where the bar used to be drawn. It is painted at the wall now,
+        // but the column stays: the glyph and the name line up with the
+        // task rail's, and that is what the column is for.
+        let bar = " ";
 
         // Right-hand column first, so the name knows how much room is left.
         let right = match (row.bg_running, &row.uptime) {
@@ -352,10 +371,10 @@ pub fn render(frame: &mut Frame, area: Rect, rows: &[Row], selected: usize) {
         };
         lines.push(Line::from(head).style(style));
         lines.push(detail.style(style));
+        lines.push(Line::raw(""));
     }
 
     if w.scrolls && w.below > 0 {
-        lines.push(Line::raw(""));
         lines.push(theme::more("↓", w.below));
     }
 
@@ -365,11 +384,11 @@ pub fn render(frame: &mut Frame, area: Rect, rows: &[Row], selected: usize) {
     // middle: the design fills the row edge to edge, and the gutters are
     // where a Paragraph never draws.
     if selected >= w.first && selected < w.first + w.len {
-        theme::fill(
-            frame,
-            row_rect(list, &w, selected - w.first),
-            theme::SELECTED_BG,
-        );
+        let rect = row_rect(list, &w, selected - w.first);
+        theme::fill(frame, rect, theme::SELECTED_BG);
+        // Against the outer wall, the way the design draws it — outside the
+        // gutter, not in the first column of it.
+        theme::bar(frame, rect, theme::ACCENT);
     }
 }
 
@@ -496,16 +515,19 @@ mod tests {
 
     #[test]
     fn a_click_lands_on_the_agent_it_looks_like() {
-        // Four agents in a rail that holds four: nothing scrolls.
-        let area = Rect::new(0, 0, 26, 16);
+        // Four agents in a rail that holds them: nothing scrolls.
+        let area = Rect::new(0, 0, 26, 20);
         let at = |y| row_at(area, y, 4, 0);
         assert_eq!(at(0), None, "the heading is not an agent");
         assert_eq!(at(1), None, "nor is the blank line under it");
-        assert_eq!(at(2), Some(0));
-        assert_eq!(at(3), Some(0), "its detail line is still it");
-        assert_eq!(at(4), Some(0), "and so is the gap under it");
-        assert_eq!(at(5), Some(1));
-        assert_eq!(at(16), None, "past the bottom edge");
+        // A row is four lines: padding, its name, its detail, padding — the
+        // block the selection fills, and the block a click should hit.
+        assert_eq!(at(2), Some(0), "its top padding is inside it");
+        assert_eq!(at(3), Some(0), "its name");
+        assert_eq!(at(4), Some(0), "its detail line");
+        assert_eq!(at(5), Some(0), "its bottom padding");
+        assert_eq!(at(6), Some(1));
+        assert_eq!(at(20), None, "past the bottom edge");
     }
 
     #[test]
@@ -513,16 +535,17 @@ mod tests {
         // The rail holds three of eight. It selected whatever was at that
         // position in the full list instead, so every click on a rail long
         // enough to scroll went to the wrong agent.
-        let area = Rect::new(0, 0, 26, 15);
+        let area = Rect::new(0, 0, 26, 20);
         let w = window(area.height, 8, 7);
         assert!(w.scrolls && w.first > 0, "this rail has to scroll: {w:?}");
 
-        // One line lower than before, because the ↑ marker holds a line.
+        let head = head_lines(&w);
         assert_eq!(row_at(area, 2, 8, 7), None, "the marker is not an agent");
-        assert_eq!(row_at(area, 3, 8, 7), Some(w.first));
-        assert_eq!(row_at(area, 6, 8, 7), Some(w.first + 1));
+        assert_eq!(row_at(area, 3, 8, 7), None, "nor its blank line");
+        assert_eq!(row_at(area, head, 8, 7), Some(w.first));
+        assert_eq!(row_at(area, head + ROW, 8, 7), Some(w.first + 1));
         assert_eq!(
-            row_at(area, 3 + 3 * w.len as u16, 8, 7),
+            row_at(area, head + ROW * w.len as u16, 8, 7),
             None,
             "the ↓ marker is not an agent either"
         );
@@ -567,7 +590,7 @@ mod tests {
             .collect();
         let rows = merge(&agents, &[]);
 
-        let mut term = Terminal::new(TestBackend::new(26, 9)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(26, 12)).unwrap();
         term.draw(|f| render(f, f.area(), &rows, 0)).unwrap();
         let out = format!("{}", term.backend());
         assert!(out.contains("↓ 2 more"), "{out}");
@@ -584,15 +607,18 @@ mod tests {
             .collect();
         let rows = merge(&agents, &[]);
 
+        let area = Rect::new(0, 0, 26, 20);
         let mut term = Terminal::new(TestBackend::new(26, 20)).unwrap();
-        term.draw(|f| render(f, f.area(), &rows, 1)).unwrap();
+        term.draw(|f| render(f, area, &rows, 1)).unwrap();
         let buf = term.backend().buffer();
         let bg = |x: u16, y: u16| buf.cell((x, y)).unwrap().bg;
 
-        // Agents start under the heading and its blank line; the second one
-        // is two rows further down.
-        let name = 2 + ROW;
-        for y in [name, name + 1] {
+        let w = window(area.height, rows.len(), 1);
+        let top = head_lines(&w) + ROW;
+
+        // All four lines: the padding above and below the text as well, so
+        // the ground stands off the content instead of gripping it.
+        for y in top..top + ROW {
             // The gutters too: the design fills the row edge to edge, and a
             // Paragraph never draws there.
             for x in [0, 1, 12, 24] {
@@ -603,9 +629,15 @@ mod tests {
                 );
             }
         }
-        assert_ne!(bg(2, name + 2), theme::SELECTED_BG, "the gap below it is not");
-        assert_ne!(bg(2, name - 1), theme::SELECTED_BG, "nor the gap above");
-        assert_ne!(bg(2, 2), theme::SELECTED_BG, "nor the agent above it");
+        assert_ne!(bg(2, top + ROW), theme::SELECTED_BG, "the line below is not");
+        assert_ne!(bg(2, top - 1), theme::SELECTED_BG, "nor the line above");
+
+        // The bar is at the wall, not in the gutter, and runs the whole
+        // height of the fill.
+        for y in top..top + ROW {
+            assert_eq!(buf.cell((0, y)).unwrap().symbol(), "▌", "row {y}");
+            assert_eq!(buf.cell((0, y)).unwrap().fg, theme::ACCENT);
+        }
     }
 
     #[test]
@@ -664,8 +696,8 @@ mod tests {
     #[test]
     fn capacity_leaves_room_for_the_header_and_the_footer() {
         assert_eq!(capacity(4), 0);
-        assert_eq!(capacity(7), 1);
-        assert_eq!(capacity(22), 6);
+        assert_eq!(capacity(8), 1);
+        assert_eq!(capacity(24), 5);
     }
 
     #[test]

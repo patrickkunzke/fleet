@@ -218,6 +218,21 @@ pub fn selected() -> Style {
     Style::default().fg(TEXT).add_modifier(Modifier::BOLD)
 }
 
+/// The selection's own edge, hard against the wall of the pane.
+///
+/// A left half-block rather than a border character: the design draws a 2px
+/// rule down the edge of the row, and `│` is a divider between two things,
+/// which is not what this is. Written after the fill so it keeps the ground
+/// the fill laid down.
+pub fn bar(frame: &mut ratatui::Frame, area: Rect, colour: Color) {
+    let buf = frame.buffer_mut();
+    for y in area.y..area.y + area.height {
+        if let Some(cell) = buf.cell_mut((area.x, y)) {
+            cell.set_symbol("▌").set_fg(colour);
+        }
+    }
+}
+
 /// Paint the selection behind whatever is already drawn there.
 ///
 /// Rendered after the text, not before: a widget writes its own background

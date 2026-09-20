@@ -1253,16 +1253,19 @@ mod tests {
             });
         };
 
-        // The heading and its blank line, then three rows an agent: its
-        // name, its detail, and the gap that separates it from the next.
-        click(&mut app, rail.y + 5);
+        // The heading and its blank line, then four rows an agent: padding,
+        // its name, its detail, padding. The second agent's name is on the
+        // seventh line of the rail.
+        click(&mut app, rail.y + 7);
         assert_eq!(app.selected().unwrap().name, "billing-svc");
         assert_eq!(app.focus, Focus::Rail, "clicking the rail points the keys at it");
 
-        // The gap belongs to the agent above it, which is the one whose
-        // name you were aiming at. It used to select the one below.
-        click(&mut app, rail.y + 4);
+        // The padding is part of the block the eye sees lit, so a click on
+        // it selects that agent rather than the one below.
+        click(&mut app, rail.y + 5);
         assert_eq!(app.selected().unwrap().name, "chief");
+        click(&mut app, rail.y + 6);
+        assert_eq!(app.selected().unwrap().name, "billing-svc");
     }
 
     #[test]
