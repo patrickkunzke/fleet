@@ -33,6 +33,11 @@ pub const TEXT: Color = Color::Rgb(0xE8, 0xE3, 0xDA);
 pub const DIM: Color = Color::Rgb(0x8B, 0x82, 0x78);
 pub const FAINT: Color = Color::Rgb(0x5C, 0x55, 0x4D);
 pub const ACCENT: Color = Color::Rgb(0xD9, 0x77, 0x57);
+/// The one place a background is painted. The selected agent is the thing
+/// every other key acts on, and a bar alone at the left edge does not say
+/// which of two adjacent rows it belongs to. Lifted barely off the design's
+/// ground, so it reads on a dark terminal without becoming a panel.
+pub const SELECTED_BG: Color = Color::Rgb(0x1C, 0x18, 0x15);
 pub const OK: Color = Color::Rgb(0x7F, 0xB3, 0xA3);
 pub const BUSY: Color = Color::Rgb(0xD9, 0xA7, 0x5B);
 
@@ -57,8 +62,6 @@ pub fn label() -> Style {
     Style::default().fg(FAINT).add_modifier(Modifier::BOLD)
 }
 
-/// Selection is a bar and brighter text, never a filled background: a panel
-/// colour that suits one terminal theme is wrong in the next.
 /// One line with something pushed to each edge.
 ///
 /// The design puts every count and every state against the right-hand edge
@@ -213,6 +216,23 @@ pub fn rule(frame: &mut ratatui::Frame, area: Rect) {
 
 pub fn selected() -> Style {
     Style::default().fg(TEXT).add_modifier(Modifier::BOLD)
+}
+
+/// Paint the selection behind whatever is already drawn there.
+///
+/// Rendered after the text, not before: a widget writes its own background
+/// over every cell it touches, so a fill laid down first is erased by the
+/// line that lands on it. Patching afterwards keeps the glyphs and their
+/// colours and changes only the ground — which is also how the fill reaches
+/// the gutters, where no text is drawn at all.
+pub fn fill(frame: &mut ratatui::Frame, area: Rect, colour: Color) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    frame.render_widget(
+        ratatui::widgets::Block::default().style(Style::default().bg(colour)),
+        area,
+    );
 }
 
 #[cfg(test)]

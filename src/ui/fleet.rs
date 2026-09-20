@@ -219,6 +219,22 @@ pub fn window(height: u16, count: usize, selected: usize) -> Window {
     }
 }
 
+/// Lines above the first agent: the heading, its blank line, and the marker
+/// line when the rail scrolls. Shared so that a click, a fill and the rows
+/// themselves cannot disagree about where the list starts.
+fn head_lines(w: &Window) -> u16 {
+    2 + u16::from(w.scrolls)
+}
+
+/// Where an agent is drawn, for a fill behind it. Its two lines only — the
+/// gap below belongs to neither row, and filling it would join the selection
+/// to whatever is under it.
+fn row_rect(list: Rect, w: &Window, n: usize) -> Rect {
+    let y = list.y + head_lines(w) + (n as u16 * ROW);
+    let height = 2.min(list.y + list.height - y.min(list.y + list.height));
+    Rect { y, height, ..list }
+}
+
 /// Which agent a click at screen row `y` landed on, if any.
 ///
 /// Mirrors the layout in [`render`], scroll included — it takes the same
@@ -230,9 +246,7 @@ pub fn row_at(area: Rect, y: u16, count: usize, selected: usize) -> Option<usize
         return None;
     }
     let w = window(area.height, count, selected);
-    // The heading, its blank line, and the marker line when there is one.
-    let head = 2 + u16::from(w.scrolls);
-    let offset = (y - area.y).checked_sub(head)?;
+    let offset = (y - area.y).checked_sub(head_lines(&w))?;
     let n = (offset / ROW) as usize;
     (n < w.len).then_some(w.first + n)
 }
@@ -346,6 +360,17 @@ pub fn render(frame: &mut Frame, area: Rect, rows: &[Row], selected: usize) {
     }
 
     frame.render_widget(Paragraph::new(lines), inner);
+
+    // After the text, and across the whole rail rather than the padded
+    // middle: the design fills the row edge to edge, and the gutters are
+    // where a Paragraph never draws.
+    if selected >= w.first && selected < w.first + w.len {
+        theme::fill(
+            frame,
+            row_rect(list, &w, selected - w.first),
+            theme::SELECTED_BG,
+        );
+    }
 }
 
 fn truncate(s: &str, width: u16) -> String {
@@ -546,6 +571,67 @@ mod tests {
         term.draw(|f| render(f, f.area(), &rows, 0)).unwrap();
         let out = format!("{}", term.backend());
         assert!(out.contains("↓ 2 more"), "{out}");
+    }
+
+    #[test]
+    fn the_selected_agent_is_filled_across_the_whole_rail() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let agents: Vec<_> = ["a", "b", "c"]
+            .iter()
+            .map(|n| agent(n, "worker", Some(n), None))
+            .collect();
+        let rows = merge(&agents, &[]);
+
+        let mut term = Terminal::new(TestBackend::new(26, 20)).unwrap();
+        term.draw(|f| render(f, f.area(), &rows, 1)).unwrap();
+        let buf = term.backend().buffer();
+        let bg = |x: u16, y: u16| buf.cell((x, y)).unwrap().bg;
+
+        // Agents start under the heading and its blank line; the second one
+        // is two rows further down.
+        let name = 2 + ROW;
+        for y in [name, name + 1] {
+            // The gutters too: the design fills the row edge to edge, and a
+            // Paragraph never draws there.
+            for x in [0, 1, 12, 24] {
+                assert_eq!(
+                    bg(x, y),
+                    theme::SELECTED_BG,
+                    "({x}, {y}) is inside the selected row"
+                );
+            }
+        }
+        assert_ne!(bg(2, name + 2), theme::SELECTED_BG, "the gap below it is not");
+        assert_ne!(bg(2, name - 1), theme::SELECTED_BG, "nor the gap above");
+        assert_ne!(bg(2, 2), theme::SELECTED_BG, "nor the agent above it");
+    }
+
+    #[test]
+    fn the_fill_follows_the_selection_down_a_scrolled_rail() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let agents: Vec<_> = ["a", "b", "c", "d", "e", "f"]
+            .iter()
+            .map(|n| agent(n, "worker", Some(n), None))
+            .collect();
+        let rows = merge(&agents, &[]);
+        let area = Rect::new(0, 0, 26, 15);
+        let w = window(area.height, rows.len(), 5);
+        assert!(w.scrolls, "this rail has to scroll");
+
+        let mut term = Terminal::new(TestBackend::new(26, 15)).unwrap();
+        term.draw(|f| render(f, area, &rows, 5)).unwrap();
+        let buf = term.backend().buffer();
+
+        // Where the last drawn row is, marker line included — the same sum
+        // row_at uses, so a click and the fill cannot point at different
+        // agents.
+        let y = head_lines(&w) + (5 - w.first) as u16 * ROW;
+        assert_eq!(buf.cell((2, y)).unwrap().bg, theme::SELECTED_BG);
+        assert_eq!(row_at(area, y, rows.len(), 5), Some(5));
     }
 
     #[test]

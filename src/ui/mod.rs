@@ -673,19 +673,6 @@ impl App {
             .iter()
             .filter(|t| t.state == db::State::Blocked)
             .count();
-        let root = self
-            .root
-            .as_deref()
-            .and_then(|p| p.file_name())
-            .and_then(|s| s.to_str())
-            .unwrap_or("all repos");
-
-        let left = vec![
-            Span::styled("fleet", theme::accent().add_modifier(Modifier::BOLD)),
-            Span::raw("  "),
-            Span::styled(root.to_string(), theme::faint()),
-        ];
-
         // Counts against the right edge, in the order the design has them.
         let mut right: Vec<Span> = Vec::new();
         let push = |right: &mut Vec<Span>, text: String, style: Style| {
@@ -711,6 +698,20 @@ impl App {
         );
 
         let inner = theme::pad(area);
+
+        // The path last, because how much of it fits depends on the counts.
+        // "fleet", two spaces, the counts, and the space spread keeps.
+        let taken: usize = right.iter().map(|s| s.width()).sum::<usize>() + 5 + 2;
+        let root = match self.root.as_deref() {
+            Some(p) => shorten(p, (inner.width as usize).saturating_sub(taken)),
+            None => "all repos".to_string(),
+        };
+        let left = vec![
+            Span::styled("fleet", theme::accent().add_modifier(Modifier::BOLD)),
+            Span::raw("  "),
+            Span::styled(root, theme::faint()),
+        ];
+
         frame.render_widget(Paragraph::new(theme::spread(left, right, inner.width)), inner);
     }
 
@@ -862,6 +863,38 @@ pub fn run(db: Db, db_path: PathBuf, root: Option<PathBuf>) -> Result<()> {
     let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
+}
+
+/// A path as the design writes it: home as `~`, and the whole of the rest.
+///
+/// It says which workspace you are in, and a leaf name does not — three
+/// checkouts on this machine are called `acme`. Too long for the bar, it
+/// gives up leading directories rather than its tail: the end of a path is
+/// the part that identifies it.
+fn shorten(path: &Path, width: usize) -> String {
+    let full = match std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .and_then(|home| path.strip_prefix(home).ok().map(Path::to_path_buf))
+    {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    };
+    if full.chars().count() <= width {
+        return full;
+    }
+
+    // Whole directories, never half of one: "…/service/billing-service" is a
+    // path, "…e/billing-service" is a string that happens to end like one.
+    let parts: Vec<&str> = full.split('/').collect();
+    for start in 1..parts.len() {
+        let tail = parts[start..].join("/");
+        if tail.chars().count() + 2 <= width {
+            return format!("…/{tail}");
+        }
+    }
+    // Not even the last component fits; the caller's line will cut it.
+    parts.last().unwrap_or(&"").to_string()
 }
 
 fn inside(area: Rect, (x, y): (u16, u16)) -> bool {
@@ -1169,6 +1202,39 @@ mod tests {
 
         let names: Vec<_> = app.rows.iter().map(|r| r.name.clone()).collect();
         assert_eq!(names, vec!["died-working"]);
+    }
+
+    #[test]
+    fn the_header_carries_the_whole_path_not_just_the_leaf() {
+        // Three checkouts on this machine are called acme; the leaf does
+        // not say which workspace you are in.
+        let db = Db::open_in_memory().unwrap();
+        let mut app = App::new(
+            db,
+            PathBuf::from(":memory:"),
+            Some(PathBuf::from("/w/Code/service/billing-service")),
+        );
+        app.refresh();
+        let out = drawn(&mut app, 120, 12);
+        assert!(out.contains("/w/Code/service/billing-service"), "{out}");
+    }
+
+    #[test]
+    fn a_path_too_long_for_the_bar_gives_up_its_start() {
+        // The end of a path is the part that identifies it, and a directory
+        // is given up whole: "…e/billing-service" is not a path.
+        let long = Path::new("/w/one/two/three/four/five/six/billing-service");
+        assert_eq!(shorten(long, 80), "/w/one/two/three/four/five/six/billing-service");
+        assert_eq!(shorten(long, 24), "…/six/billing-service");
+        assert_eq!(shorten(long, 20), "…/billing-service");
+    }
+
+    #[test]
+    fn home_is_written_as_a_tilde() {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let Some(home) = home else { return };
+        assert_eq!(shorten(&home.join("Code/fleet"), 40), "~/Code/fleet");
+        assert_eq!(shorten(&home, 40), "~");
     }
 
     #[test]
