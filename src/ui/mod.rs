@@ -13,6 +13,7 @@
 pub mod board;
 pub mod fleet;
 pub mod flow;
+pub mod keys;
 pub mod picker;
 pub mod mirror;
 pub mod session;
@@ -25,7 +26,11 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::Margin;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Paragraph};
 
@@ -44,6 +49,7 @@ const TICK: Duration = Duration::from_secs(2);
 
 enum Msg {
     Key(KeyEvent),
+    Mouse(MouseEvent),
     Registry,
     Tick,
     /// The selected session may have written something. Far more frequent
@@ -59,16 +65,12 @@ enum Focus {
     Session,
 }
 
-/// In Insert every key belongs to the agent, including the ones that would
-/// otherwise quit. Leaving is Ctrl-], the old telnet escape, chosen because
-/// Claude Code wants Escape for interrupting a turn and Ctrl-C for its own
-/// purposes — binding either of those to "leave" would make the two most
-/// important keys in a runaway turn do the wrong thing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    Normal,
-    Insert,
-}
+/// Fleet's own key, borrowed from every multiplexer there has ever been.
+///
+/// Typing belongs to the agent, so fleet cannot also own the alphabet. Ctrl-A
+/// rather than tmux's Ctrl-B, because `↵` hands you to tmux and the two must
+/// not be the same key. Ctrl-A twice sends a literal one through.
+const PREFIX: char = 'a';
 
 pub struct App {
     registry: Registry,
@@ -83,8 +85,11 @@ pub struct App {
     selected: usize,
     centre: session::Pane,
     focus: Focus,
-    mode: Mode,
-    input: session::Input,
+    /// Where each pane was last drawn, so a click can be routed to it.
+    rail_at: Rect,
+    centre_at: Rect,
+    /// True between the prefix and the key it modifies.
+    armed: bool,
     /// The repository picker, while it is open. An overlay rather than a
     /// mode: everything underneath keeps updating behind it.
     picker: Option<Picker>,
@@ -129,9 +134,12 @@ impl App {
             rows: Vec::new(),
             selected: 0,
             centre: session::Pane::default(),
-            focus: Focus::Rail,
-            mode: Mode::Normal,
-            input: session::Input::default(),
+            // The agent has the keyboard by default; that is the whole
+            // point of a prefix.
+            focus: Focus::Session,
+            rail_at: Rect::ZERO,
+            centre_at: Rect::ZERO,
+            armed: false,
             picker: None,
             tasks: Vec::new(),
             background: Vec::new(),
@@ -187,56 +195,156 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return;
         }
-        // The overlay and insert mode both take every key, before the ones
-        // that would quit: while typing, q is a letter.
         if self.picker.is_some() {
             self.picker_key(key);
             return;
         }
-        if self.mode == Mode::Insert {
-            self.insert_key(key);
+
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if self.armed {
+            self.armed = false;
+            // The prefix twice means the prefix itself, as everywhere else.
+            if ctrl && key.code == KeyCode::Char(PREFIX) {
+                self.forward(key);
+            } else {
+                self.command(key);
+            }
             return;
         }
+        if ctrl && key.code == KeyCode::Char(PREFIX) {
+            self.armed = true;
+            return;
+        }
+
+        // With a pane in front of you and the keyboard pointed at it, every
+        // key is the agent's. Otherwise — a transcript, the flow, the rail —
+        // there is nothing to type into, so keys act directly.
+        if self.focus == Focus::Session && self.centre_view.is_none() && self.centre.is_live() {
+            self.forward(key);
+        } else {
+            self.command(key);
+        }
+    }
+
+    /// One of fleet's own keys.
+    fn command(&mut self, key: KeyEvent) {
         match (key.code, key.modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Char('q'), _) => {
-                self.quit = true;
-                return;
+                self.quit = true
             }
             (KeyCode::Tab, _) => {
                 self.focus = match self.focus {
                     Focus::Rail => Focus::Session,
                     Focus::Session => Focus::Rail,
-                };
-                return;
+                }
             }
-            (KeyCode::Char('r'), _) => {
-                self.refresh();
-                return;
-            }
+            (KeyCode::Char('r'), _) => self.refresh(),
             (KeyCode::Char('z'), _) => {
                 self.wide = !self.wide;
-                // The rails were taking two thirds of the width from a
-                // terminal, so the pane behind them has to be resized.
                 self.focus = Focus::Session;
-                return;
             }
-            // Pressing the same key again puts the session back, so neither
-            // view is a place you get stuck in.
             (KeyCode::Char('g'), _) => {
-                self.centre_view = (self.centre_view != Some(View::Graph)).then_some(View::Graph);
-                return;
+                self.centre_view = (self.centre_view != Some(View::Graph)).then_some(View::Graph)
             }
             (KeyCode::Char('l'), _) => {
-                self.centre_view = (self.centre_view != Some(View::Log)).then_some(View::Log);
-                self.focus = Focus::Session;
-                return;
+                self.centre_view = (self.centre_view != Some(View::Log)).then_some(View::Log)
             }
+            (KeyCode::Char('n'), _) => self.open_picker(),
+            (KeyCode::Enter, _) if self.centre_view.is_none() => self.hand_over(),
+            _ if self.centre_view == Some(View::Log) => self.log_key(key),
+            // Paging and the wheel move a transcript; the arrows do not.
+            // Keys only reach here when nothing is live to type into, and in
+            // that state switching agent is what they are wanted for.
+            (KeyCode::PageUp | KeyCode::PageDown | KeyCode::End, _) => {
+                self.transcript_key(key)
+            }
+            _ => self.rail_key(key),
+        }
+    }
+
+    /// Hand a keystroke to the agent.
+    fn forward(&mut self, key: KeyEvent) {
+        let Some(translated) = keys::translate(key) else {
+            return;
+        };
+        let Some(tmux) = self.tmux.clone() else { return };
+        // Typing returns you to the live edge: writing into a screen you are
+        // scrolled away from shows nothing happening.
+        self.centre.mirror_to_live();
+        match self.centre.send(&tmux, &translated) {
+            Ok(()) => self.echo(),
+            Err(e) => self.status = Some(e.to_string()),
+        }
+    }
+
+    /// Give the user the actual terminal.
+    fn hand_over(&mut self) {
+        if Tmux::inside() {
+            if let Some(tmux) = self.tmux.as_ref() {
+                self.status = self.centre.zoom(tmux);
+            }
+        } else if self.centre.is_live() {
+            self.wants_attach = true;
+        }
+    }
+
+    fn transcript_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::PageUp => self.centre.scroll_by(1, 10),
+            KeyCode::PageDown => self.centre.scroll_by(-1, 10),
+            KeyCode::End => self.centre.to_tail(),
             _ => {}
         }
+    }
 
-        match self.focus {
-            Focus::Rail => self.rail_key(key),
-            Focus::Session => self.session_key(key),
+    fn log_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.event_selected = self.event_selected.saturating_sub(1)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.event_selected =
+                    (self.event_selected + 1).min(self.events.len().saturating_sub(1))
+            }
+            KeyCode::Enter => self.jump_to_event(),
+            _ => {}
+        }
+    }
+
+    /// Clicks and the wheel. The reason there is a prefix at all: a mouse
+    /// needs no mode.
+    fn on_mouse(&mut self, ev: MouseEvent) {
+        let at = (ev.column, ev.row);
+        match ev.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if inside(self.rail_at, at) {
+                    self.focus = Focus::Rail;
+                    if let Some(i) = fleet::row_at(self.rail_at, ev.row)
+                        && i < self.rows.len()
+                    {
+                        self.selected = i;
+                        self.retarget();
+                    }
+                } else if inside(self.centre_at, at) {
+                    // Clicking a terminal is how you say "talk to this one".
+                    self.focus = Focus::Session;
+                }
+            }
+            // The live pane and the transcript each keep their own history,
+            // so the wheel means the same thing over either.
+            MouseEventKind::ScrollUp if inside(self.centre_at, at) => {
+                if !self.centre.scroll_mirror(3) {
+                    self.centre.scroll_by(1, 3);
+                }
+            }
+            MouseEventKind::ScrollDown if inside(self.centre_at, at) => {
+                if !self.centre.scroll_mirror(-3) {
+                    self.centre.scroll_by(-1, 3);
+                }
+            }
+            MouseEventKind::ScrollUp => self.rail_key(KeyEvent::from(KeyCode::Up)),
+            MouseEventKind::ScrollDown => self.rail_key(KeyEvent::from(KeyCode::Down)),
+            _ => {}
         }
     }
 
@@ -380,116 +488,7 @@ impl App {
         });
     }
 
-    fn session_key(&mut self, key: KeyEvent) {
-        // The log owns the arrows while it is up.
-        if self.centre_view == Some(View::Log) {
-            match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.event_selected = self.event_selected.saturating_sub(1)
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.event_selected =
-                        (self.event_selected + 1).min(self.events.len().saturating_sub(1))
-                }
-                // Jump to whoever the event is about, and show their session.
-                KeyCode::Enter => self.jump_to_event(),
-                _ => {}
-            }
-            return;
-        }
-        if key.code == KeyCode::Char('i') && self.centre.is_live() {
-            self.mode = Mode::Insert;
-            self.status = None;
-            return;
-        }
-        if key.code == KeyCode::Enter {
-            // Hand over the real terminal. Inside tmux, selecting the window
-            // is enough. Outside it — which is the normal case, since fleet
-            // is meant to start anywhere — the run loop gives up the screen
-            // and attaches until the user detaches again.
-            if Tmux::inside() {
-                if let Some(tmux) = self.tmux.as_ref() {
-                    self.status = self.centre.zoom(tmux);
-                }
-            } else if self.centre.is_live() {
-                self.wants_attach = true;
-            }
-            return;
-        }
-        // A mirrored pane is the live screen: there is no history to scroll
-        // through, and tmux owns the scrollback.
-        if self.centre.is_live() {
-            return;
-        }
-        // Up scrolls back through history, which means increasing the offset
-        // from the bottom.
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k') => self.centre.scroll_by(1, 1),
-            KeyCode::Down | KeyCode::Char('j') => self.centre.scroll_by(-1, 1),
-            KeyCode::PageUp => self.centre.scroll_by(1, 10),
-            KeyCode::PageDown => self.centre.scroll_by(-1, 10),
-            KeyCode::Char('G') | KeyCode::End => self.centre.to_tail(),
-            _ => {}
-        }
-    }
-
-    /// Everything typed while the agent has the keyboard.
-    fn insert_key(&mut self, key: KeyEvent) {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        match key.code {
-            // Ctrl-] hands the keyboard back.
-            KeyCode::Char(']') if ctrl => {
-                self.mode = Mode::Normal;
-                return;
-            }
-            KeyCode::Char('c') if ctrl => {
-                self.forward("C-c");
-                return;
-            }
-            _ => {}
-        }
-
-        match key.code {
-            KeyCode::Char(c) => self.input.insert(c),
-            KeyCode::Backspace => self.input.backspace(),
-            KeyCode::Left => self.input.left(),
-            KeyCode::Right => self.input.right(),
-            KeyCode::Home => self.input.home(),
-            KeyCode::End => self.input.end(),
-            KeyCode::Enter => {
-                let line = self.input.take();
-                self.send(&line);
-            }
-            // With something typed, Escape is "forget it"; with an empty line
-            // it is the agent's interrupt, which is the only way to stop a
-            // turn that has gone wrong.
-            KeyCode::Esc if !self.input.is_empty() => self.input.clear(),
-            KeyCode::Esc => self.forward("Escape"),
-            // A permission prompt is answered by moving and pressing Enter,
-            // and no line of text can do that.
-            KeyCode::Up if self.input.is_empty() => self.forward("Up"),
-            KeyCode::Down if self.input.is_empty() => self.forward("Down"),
-            KeyCode::Tab if self.input.is_empty() => self.forward("Tab"),
-            _ => {}
-        }
-    }
-
-    fn send(&mut self, line: &str) {
-        let Some(tmux) = self.tmux.clone() else { return };
-        match self.centre.send(&tmux, line) {
-            Ok(()) => self.echo(),
-            Err(e) => self.status = Some(e.to_string()),
-        }
-    }
-
-    fn forward(&mut self, key: &str) {
-        let Some(tmux) = self.tmux.clone() else { return };
-        match self.centre.send_key(&tmux, key) {
-            Ok(()) => self.echo(),
-            Err(e) => self.status = Some(e.to_string()),
-        }
-    }
-
+    /// Select the agent an event came from, and go back to watching it.
     /// Wait briefly for the pane to echo what was just sent.
     ///
     /// Without this a keystroke is invisible until the next poll, up to
@@ -518,12 +517,20 @@ impl App {
     }
 
     pub fn draw(&mut self, frame: &mut Frame) {
-        let area = frame.area();
-        frame.render_widget(Block::default().style(theme::base()), area);
+        let whole = frame.area();
+        frame.render_widget(Block::default().style(theme::base()), whole);
+        // Standing off the terminal's own edges is most of what makes this
+        // look placed rather than pasted in.
+        let area = whole.inner(Margin {
+            horizontal: theme::MARGIN_X,
+            vertical: theme::MARGIN_Y,
+        });
 
-        let [top, body, keys] = Layout::vertical([
+        let [top, _, body, _, keys] = Layout::vertical([
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(0),
+            Constraint::Length(1),
             Constraint::Length(1),
         ])
         .areas(area);
@@ -545,6 +552,8 @@ impl App {
             (rail, centre, side)
         };
 
+        self.rail_at = rail;
+        self.centre_at = centre;
         self.centre_size = (
             centre.width.saturating_sub(theme::GUTTER * 2 + 1),
             centre.height.saturating_sub(3),
@@ -564,8 +573,8 @@ impl App {
             ),
             None => {
                 let row = self.rows.get(self.selected).cloned();
-                let input = (self.mode == Mode::Insert).then_some(&self.input);
-                self.centre.render(frame, centre, row.as_ref(), input, !self.wide);
+                let typing = self.focus == Focus::Session;
+                self.centre.render(frame, centre, row.as_ref(), typing, !self.wide);
             }
         }
         if !self.wide {
@@ -641,49 +650,48 @@ impl App {
             );
             return;
         }
-        let keys: &[(&str, &str)] = match self.focus {
-            _ if self.mode == Mode::Insert => &[
-                ("typing", "→ pane"),
-                ("esc", "interrupt"),
-                ("^]", "stop typing"),
+        // What the prefix is for is worth saying, since nothing else on the
+        // screen can: every other key is going to the agent.
+        if self.armed {
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(" ^a ", theme::accent().add_modifier(Modifier::REVERSED)),
+                    Span::styled(
+                        "  n new  z wide  g graph  l log  tab focus  r refresh  q quit",
+                        theme::dim(),
+                    ),
+                ])),
+                area,
+            );
+            return;
+        }
+
+        let typing = self.focus == Focus::Session
+            && self.centre_view.is_none()
+            && self.centre.is_live();
+        let keys: &[(&str, &str)] = match self.centre_view {
+            _ if typing => &[
+                ("keys", "→ agent"),
+                ("^a", "fleet"),
+                ("↵", "attach"),
+                ("click", "a pane"),
             ],
-            _ if self.centre_view == Some(View::Log) => &[
+            Some(View::Log) => &[
                 ("↑↓", "event"),
                 ("↵", "jump to agent"),
                 ("l", "back"),
-                ("g", "graph"),
-                ("q", "quit"),
+                ("^a q", "quit"),
             ],
-            _ if self.centre_view == Some(View::Graph) => &[
-                ("g", "back"),
-                ("l", "log"),
-                ("n", "new agent"),
-                ("q", "quit"),
-            ],
-            Focus::Rail => &[
+            Some(View::Graph) => &[("g", "back"), ("l", "log"), ("^a q", "quit")],
+            None => &[
                 ("↑↓", "agent"),
                 ("n", "new agent"),
                 ("z", "wide"),
-                ("g", "graph"),
-                ("l", "log"),
-                ("tab", "session"),
-                ("q", "quit"),
-            ],
-            Focus::Session if self.centre.is_live() => &[
-                ("i", "type"),
-                ("↵", if Tmux::inside() { "zoom to pane" } else { "attach" }),
-                ("z", if self.wide { "rails" } else { "wide" }),
-                ("tab", "agents"),
-                ("q", "quit"),
-            ],
-            Focus::Session => &[
-                ("↑↓", "scroll"),
-                ("G", "live"),
-                ("↵", "zoom to pane"),
-                ("tab", "agents"),
+                ("tab", "focus"),
                 ("q", "quit"),
             ],
         };
+
         let mut spans = vec![Span::raw(" ")];
         for (key, what) in keys.iter().copied() {
             spans.push(Span::styled(key, theme::dim()));
@@ -739,11 +747,15 @@ pub fn run(db: Db, db_path: PathBuf, root: Option<PathBuf>) -> Result<()> {
     spawn_ticker(tx);
 
     let mut term = ratatui::init();
+    // Clicking a pane and scrolling it is the point; without capture the
+    // terminal keeps the mouse to itself.
+    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
     let result = (|| -> Result<()> {
         term.draw(|f| app.draw(f))?;
         while let Ok(msg) = rx.recv() {
             match msg {
                 Msg::Key(key) => app.on_key(key),
+                Msg::Mouse(ev) => app.on_mouse(ev),
                 Msg::Registry | Msg::Tick => app.refresh(),
                 Msg::Transcript => {
                     // Nothing new is the common case; redrawing anyway would
@@ -764,8 +776,17 @@ pub fn run(db: Db, db_path: PathBuf, root: Option<PathBuf>) -> Result<()> {
         }
         Ok(())
     })();
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
+}
+
+fn inside(area: Rect, (x, y): (u16, u16)) -> bool {
+    area.width > 0
+        && x >= area.x
+        && x < area.x + area.width
+        && y >= area.y
+        && y < area.y + area.height
 }
 
 /// Give the terminal to tmux, and take it back when the user detaches.
@@ -784,9 +805,11 @@ fn attach(
     paused.store(true, Ordering::SeqCst);
     std::thread::sleep(POLL * 2);
 
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     let failed = app.centre.attach(&tmux);
     *term = ratatui::init();
+    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
 
     paused.store(false, Ordering::SeqCst);
     term.clear()?;
@@ -818,6 +841,11 @@ fn spawn_input(tx: Sender<Msg>, paused: Arc<AtomicBool>) {
             match event::read() {
                 Ok(Event::Key(key)) => {
                     if tx.send(Msg::Key(key)).is_err() {
+                        return;
+                    }
+                }
+                Ok(Event::Mouse(ev)) => {
+                    if tx.send(Msg::Mouse(ev)).is_err() {
                         return;
                     }
                 }
@@ -912,6 +940,7 @@ mod tests {
     #[test]
     fn selection_moves_and_stops_at_the_ends() {
         let mut app = app();
+        // No agent here has a live pane, so the arrows are fleet's.
         assert_eq!(app.selected().unwrap().name, "chief");
 
         app.on_key(KeyEvent::from(KeyCode::Down));
@@ -1002,53 +1031,62 @@ mod tests {
     }
 
     #[test]
-    fn typing_is_not_offered_where_there_is_no_pane_to_type_into() {
+    fn keys_act_directly_when_there_is_no_pane_to_type_into() {
+        // Nothing is mirrored here, so q must still quit rather than being
+        // swallowed as a keystroke for an agent that does not exist.
         let mut app = app();
-        app.on_key(KeyEvent::from(KeyCode::Tab));
-        app.on_key(KeyEvent::from(KeyCode::Char('i')));
-        assert_eq!(
-            app.mode,
-            Mode::Normal,
-            "a transcript-only agent cannot be typed at"
-        );
+        app.on_key(KeyEvent::from(KeyCode::Char('q')));
+        assert!(app.quit);
     }
 
     #[test]
-    fn insert_mode_keeps_the_keys_that_would_otherwise_quit() {
+    fn the_prefix_takes_the_next_key_for_fleet_and_then_lets_go() {
         let mut app = app();
-        app.mode = Mode::Insert;
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert!(app.armed, "the key bar shows what the prefix can do");
+        assert!(drawn(&mut app, 110, 24).contains("new"));
 
-        app.on_key(KeyEvent::from(KeyCode::Char('q')));
-        assert!(!app.quit, "q is a letter while typing");
-
-        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
-        assert!(!app.quit, "and Ctrl-C interrupts the agent, not the program");
-
-        app.on_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL));
-        assert_eq!(app.mode, Mode::Normal, "Ctrl-] hands the keyboard back");
-
-        app.on_key(KeyEvent::from(KeyCode::Char('q')));
-        assert!(app.quit, "and then q quits again");
+        app.on_key(KeyEvent::from(KeyCode::Char('g')));
+        assert!(!app.armed, "and lets go after one key");
+        assert_eq!(app.centre_view, Some(View::Graph));
     }
 
     #[test]
-    fn escape_clears_a_typed_line_but_interrupts_an_empty_one() {
+    fn a_click_selects_the_agent_it_landed_on() {
         let mut app = app();
-        app.mode = Mode::Insert;
-        for c in "half a thought".chars() {
-            app.on_key(KeyEvent::from(KeyCode::Char(c)));
-        }
-        assert!(!app.input.is_empty());
+        drawn(&mut app, 110, 24); // the rail has to have been drawn to be clicked
+        assert_eq!(app.selected().unwrap().name, "chief");
 
-        app.on_key(KeyEvent::from(KeyCode::Esc));
-        assert!(app.input.is_empty(), "the first Escape discards the line");
-        assert_eq!(app.mode, Mode::Insert, "and stays in insert mode");
+        let rail = app.rail_at;
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rail.x + 2,
+            row: rail.y + 3,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.selected().unwrap().name, "billing-svc");
+        assert_eq!(app.focus, Focus::Rail, "clicking the rail points the keys at it");
+    }
+
+    #[test]
+    fn clicking_the_centre_points_the_keyboard_at_the_agent() {
+        let mut app = app();
+        drawn(&mut app, 110, 24);
+        app.focus = Focus::Rail;
+
+        let centre = app.centre_at;
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: centre.x + 4,
+            row: centre.y + 4,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.focus, Focus::Session);
     }
 
     #[test]
     fn enter_on_a_transcript_only_agent_does_not_pretend_to_zoom() {
         let mut app = app();
-        app.on_key(KeyEvent::from(KeyCode::Tab));
         app.on_key(KeyEvent::from(KeyCode::Enter));
         // Nothing to hand over, so nothing is claimed and nothing is queued.
         assert!(app.status.is_none());
@@ -1117,23 +1155,13 @@ mod tests {
     }
 
     #[test]
-    fn tab_moves_the_arrow_keys_between_the_rail_and_the_session() {
+    fn tab_moves_the_keyboard_between_the_rail_and_the_session() {
         let mut app = app();
-        assert_eq!(app.focus, Focus::Rail);
-        assert!(drawn(&mut app,  110, 24).contains("agent"));
-
+        app.focus = Focus::Rail;
         app.on_key(KeyEvent::from(KeyCode::Tab));
         assert_eq!(app.focus, Focus::Session);
-
-        // Down no longer changes which agent is selected.
-        let before = app.selected().unwrap().name.clone();
-        app.on_key(KeyEvent::from(KeyCode::Down));
-        assert_eq!(app.selected().unwrap().name, before);
-        assert!(drawn(&mut app,  110, 24).contains("scroll"), "the key bar follows focus");
-
         app.on_key(KeyEvent::from(KeyCode::Tab));
-        app.on_key(KeyEvent::from(KeyCode::Down));
-        assert_ne!(app.selected().unwrap().name, before);
+        assert_eq!(app.focus, Focus::Rail);
     }
 
     #[test]

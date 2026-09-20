@@ -197,6 +197,15 @@ impl Tmux {
         Ok(())
     }
 
+    /// Send text exactly as written, with no Enter after it.
+    ///
+    /// `-l` is what makes it text: without it tmux reads "Enter" or "C-c" as
+    /// key names and delivers keystrokes into a running agent.
+    pub fn send_text(&self, pane: &Pane, text: &str) -> Result<()> {
+        self.run(&["send-keys", "-t", &pane.id, "-l", "--", text])?;
+        Ok(())
+    }
+
     /// Type a line into a pane and press Enter.
     ///
     /// The text goes with `-l` so tmux takes it literally: without it a

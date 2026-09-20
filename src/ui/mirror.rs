@@ -27,9 +27,9 @@ use crate::tmux::{Pane, Tmux};
 /// day would otherwise fill the disk with scrollback nobody reads.
 const MAX_STREAM_BYTES: u64 = 4 * 1024 * 1024;
 
-/// Lines of scrollback the parser keeps. The pane is a live view; history
-/// belongs to the transcript.
-const SCROLLBACK: usize = 200;
+/// Lines of scrollback the parser keeps. Deep enough to read back through a
+/// long turn with the wheel; the transcript is there for anything older.
+const SCROLLBACK: usize = 2000;
 
 pub struct Mirror {
     tmux: Tmux,
@@ -112,6 +112,26 @@ impl Mirror {
         self.parser = vt100::Parser::new(rows, cols, SCROLLBACK);
         let _ = self.seed();
         true
+    }
+
+    /// Scroll the mirrored screen, in lines. Positive goes back in time.
+    ///
+    /// Ours, not the pane's: tmux would have to be put into copy mode, which
+    /// produces no output for `pipe-pane` to carry, so the view would freeze
+    /// rather than scroll. The parser already keeps the history.
+    pub fn scroll_by(&mut self, delta: isize) {
+        let at = self.parser.screen().scrollback() as isize;
+        let wanted = (at + delta).max(0) as usize;
+        self.parser.screen_mut().set_scrollback(wanted);
+    }
+
+    /// Back to the live edge.
+    pub fn to_live(&mut self) {
+        self.parser.screen_mut().set_scrollback(0);
+    }
+
+    pub fn scrolled_back(&self) -> bool {
+        self.parser.screen().scrollback() > 0
     }
 
     /// Feed the parser whatever the pane has printed. True when the screen

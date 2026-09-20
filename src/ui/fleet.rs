@@ -143,6 +143,19 @@ pub fn capacity(height: u16) -> usize {
     (height.saturating_sub(2) / 2) as usize
 }
 
+/// Which agent a click at screen row `y` landed on, if any.
+///
+/// Mirrors the layout in [`render`]: one header line, then two lines per
+/// agent. Kept beside it so the two cannot drift, because a rail that
+/// selects the wrong agent when clicked is worse than one that ignores the
+/// mouse.
+pub fn row_at(area: Rect, y: u16) -> Option<usize> {
+    if y <= area.y || y >= area.y + area.height {
+        return None;
+    }
+    Some(((y - area.y - 1) / 2) as usize)
+}
+
 pub fn render(frame: &mut Frame, area: Rect, rows: &[Row], selected: usize) {
     let block = Block::default()
         .borders(Borders::RIGHT)
@@ -338,6 +351,17 @@ mod tests {
 
         let names: Vec<_> = merge(&agents, &live).into_iter().map(|r| r.name).collect();
         assert_eq!(names, vec!["billing-svc"]);
+    }
+
+    #[test]
+    fn a_click_lands_on_the_agent_it_looks_like() {
+        let area = Rect::new(0, 0, 26, 12);
+        assert_eq!(row_at(area, 0), None, "the header is not an agent");
+        assert_eq!(row_at(area, 1), Some(0));
+        assert_eq!(row_at(area, 2), Some(0), "both of an agent's two lines");
+        assert_eq!(row_at(area, 3), Some(1));
+        assert_eq!(row_at(area, 4), Some(1));
+        assert_eq!(row_at(area, 12), None, "past the bottom edge");
     }
 
     #[test]

@@ -77,9 +77,15 @@ takes a SELECT and refuses anything else: every write goes through a verb that
 records the matching flow event, and a bare UPDATE is the one way to break
 that.
 
-Keys: `↑↓` agent, `n` new agent, `z` fold the rails away, `tab` session, `i`
-type into it, `↵` attach to the pane, `g` the flow graph, `l` the flow log,
-`q` quit.
+**Typing goes to the agent.** Click a pane to point the keyboard at it, and
+everything you type reaches that session — arrows, Escape, Ctrl-C, its own
+line editor. The wheel scrolls it. There is no mode to enter first.
+
+Fleet's own keys live behind **`Ctrl-A`**, the way a multiplexer's do: `^a n`
+new agent, `^a z` fold the rails away, `^a g` graph, `^a l` log, `^a tab`
+move the keyboard, `^a q` quit. `↵` hands you the real terminal until you
+detach. `^a ^a` sends a literal Ctrl-A through. Where nothing is live to type
+into — a transcript, the flow views — the keys act directly without it.
 
 Starting fleet in a workspace starts a **chief of staff** there if one is not
 already running — an ordinary Claude Code session with the board skill. That

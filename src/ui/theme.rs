@@ -12,6 +12,11 @@ use ratatui::style::{Color, Modifier, Style};
 /// wedged.
 pub const GUTTER: u16 = 2;
 
+/// Space between the app and the edges of the terminal it is running in.
+/// Without it everything reads as pasted into the corner.
+pub const MARGIN_X: u16 = 2;
+pub const MARGIN_Y: u16 = 1;
+
 pub fn pad(area: Rect) -> Rect {
     Rect {
         x: area.x + GUTTER,

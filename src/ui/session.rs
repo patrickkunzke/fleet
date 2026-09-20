@@ -20,81 +20,11 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::tmux::{Pane as TmuxPane, Tmux};
+use crate::ui::keys::Key;
 use crate::transcript::{BACKFILL_BYTES, Entry, Outcome, Transcript};
 use crate::ui::fleet::{Presence, Row};
 use crate::ui::mirror::Mirror;
 use crate::ui::theme;
-
-/// The line being composed for the pane, and where the cursor sits in it.
-///
-/// Held here rather than typed straight through, because a keystroke only
-/// becomes visible after tmux echoes it and we read it back. Editing a local
-/// line stays instant; only sending it makes the round trip.
-#[derive(Default)]
-pub struct Input {
-    text: String,
-    /// In characters, not bytes — a cursor that lands mid-codepoint panics.
-    cursor: usize,
-}
-
-impl Input {
-    pub fn insert(&mut self, c: char) {
-        let at = self.byte_at(self.cursor);
-        self.text.insert(at, c);
-        self.cursor += 1;
-    }
-
-    pub fn backspace(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let at = self.byte_at(self.cursor - 1);
-        self.text.remove(at);
-        self.cursor -= 1;
-    }
-
-    pub fn left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
-    }
-
-    pub fn right(&mut self) {
-        self.cursor = (self.cursor + 1).min(self.len());
-    }
-
-    pub fn home(&mut self) {
-        self.cursor = 0;
-    }
-
-    pub fn end(&mut self) {
-        self.cursor = self.len();
-    }
-
-    pub fn clear(&mut self) {
-        self.text.clear();
-        self.cursor = 0;
-    }
-
-    pub fn take(&mut self) -> String {
-        self.cursor = 0;
-        std::mem::take(&mut self.text)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.text.is_empty()
-    }
-
-    fn len(&self) -> usize {
-        self.text.chars().count()
-    }
-
-    fn byte_at(&self, chars: usize) -> usize {
-        self.text
-            .char_indices()
-            .nth(chars)
-            .map(|(i, _)| i)
-            .unwrap_or(self.text.len())
-    }
-}
 
 #[derive(Default)]
 pub struct Pane {
@@ -215,25 +145,32 @@ impl Pane {
         self.mirror.as_ref().map(|m| m.pane())
     }
 
-    /// Send a composed line to the agent. An empty line is a bare Enter,
-    /// which is how you accept a default at a prompt.
-    pub fn send(&self, tmux: &Tmux, text: &str) -> Result<()> {
+    /// Deliver one keystroke to the agent.
+    pub fn send(&self, tmux: &Tmux, key: &Key) -> Result<()> {
         let Some(pane) = self.tmux_pane() else {
             bail!("this agent has no pane to type into");
         };
-        if text.is_empty() {
-            tmux.send_key(pane, "Enter")
-        } else {
-            tmux.send_line(pane, text)
+        match key {
+            Key::Literal(text) => tmux.send_text(pane, text),
+            Key::Named(name) => tmux.send_key(pane, name),
         }
     }
 
-    /// Send one key straight through, for the things a line cannot say.
-    pub fn send_key(&self, tmux: &Tmux, key: &str) -> Result<()> {
-        let Some(pane) = self.tmux_pane() else {
-            bail!("this agent has no pane to type into");
-        };
-        tmux.send_key(pane, key)
+    /// Scroll the mirrored screen. Ignored on a transcript, which has its own.
+    pub fn scroll_mirror(&mut self, delta: isize) -> bool {
+        match self.mirror.as_mut() {
+            Some(m) => {
+                m.scroll_by(delta);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn mirror_to_live(&mut self) {
+        if let Some(m) = self.mirror.as_mut() {
+            m.to_live();
+        }
     }
 
     /// Hand the user the actual pane, from inside tmux, where selecting it is
@@ -266,8 +203,12 @@ impl Pane {
         self.scroll = 0;
     }
 
+    /// Looking at the live edge, whichever view is up.
     pub fn following(&self) -> bool {
-        self.scroll == 0
+        match &self.mirror {
+            Some(m) => !m.scrolled_back(),
+            None => self.scroll == 0,
+        }
     }
 
     pub fn render(
@@ -275,7 +216,9 @@ impl Pane {
         frame: &mut Frame,
         area: Rect,
         row: Option<&Row>,
-        input: Option<&Input>,
+        // Whether keystrokes are going here, which the header says so that
+        // nobody types into the wrong place.
+        focused: bool,
         // A divider only means something when there is a pane on the other
         // side of it; at the screen edge it is a stray line.
         bordered: bool,
@@ -287,26 +230,17 @@ impl Pane {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        // The input line only exists where there is something to type into.
-        let footer = if self.is_live() { 1 } else { 0 };
-        let [head, body, foot] = Layout::vertical([
-            Constraint::Length(2),
-            Constraint::Min(0),
-            Constraint::Length(footer),
-        ])
-        .areas(inner);
+        let [head, body] =
+            Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(inner);
 
-        self.render_head(frame, head, row);
-        if footer > 0 {
-            self.render_input(frame, foot, input);
-        }
+        self.render_head(frame, head, row, focused);
 
         if let Some(m) = self.mirror.as_mut() {
-            let inner = theme::pad(body);
-            // tmux has to believe the pane is the size we are drawing it, or
-            // the agent wraps its output to a width nobody is looking at.
-            m.resize(inner.width, inner.height);
-            m.render(frame, inner);
+            // No gutter here. Every other pane is text we lay out; this one
+            // is a terminal, and a terminal inset inside a box reads as a
+            // picture of one.
+            m.resize(body.width, body.height);
+            m.render(frame, body);
             return;
         }
 
@@ -334,33 +268,7 @@ impl Pane {
         frame.render_widget(Paragraph::new(visible), theme::pad(body));
     }
 
-    fn render_input(&self, frame: &mut Frame, area: Rect, input: Option<&Input>) {
-        let line = match input {
-            Some(input) => {
-                // The cursor is drawn rather than placed: the mirrored pane
-                // has its own cursor, and two of them on screen is a puzzle.
-                let before: String = input.text.chars().take(input.cursor).collect();
-                let at = input.text.chars().nth(input.cursor);
-                let after: String = input.text.chars().skip(input.cursor + 1).collect();
-                Line::from(vec![
-                    Span::styled("› ", theme::accent()),
-                    Span::styled(before, Style::default().fg(theme::TEXT)),
-                    Span::styled(
-                        at.map(String::from).unwrap_or_else(|| " ".into()),
-                        Style::default().fg(theme::BG).bg(theme::ACCENT),
-                    ),
-                    Span::styled(after, Style::default().fg(theme::TEXT)),
-                ])
-            }
-            None => Line::from(vec![
-                Span::styled("› ", theme::faint()),
-                Span::styled("i  type into this pane", theme::faint()),
-            ]),
-        };
-        frame.render_widget(Paragraph::new(line), theme::pad(area));
-    }
-
-    fn render_head(&self, frame: &mut Frame, area: Rect, row: Option<&Row>) {
+    fn render_head(&self, frame: &mut Frame, area: Rect, row: Option<&Row>, focused: bool) {
         let Some(row) = row else { return };
         let (glyph, colour) = match row.presence {
             Presence::Working => ("●", theme::BUSY),
@@ -392,7 +300,14 @@ impl Pane {
         // it: a long branch name would otherwise push this off the edge, and
         // "you are not looking at the live edge" is the one thing in the
         // header that must never be the part that gets clipped.
-        if !self.is_live() && !self.following() {
+        if focused && self.is_live() {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled("typing here ", theme::accent())))
+                    .alignment(Alignment::Right),
+                theme::pad(area),
+            );
+        }
+        if !self.following() {
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled("scrolled back ", theme::accent())))
                     .alignment(Alignment::Right),
@@ -595,7 +510,7 @@ mod tests {
 
     fn drawn(pane: &mut Pane, row: Option<&Row>, w: u16, h: u16) -> String {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-        term.draw(|f| pane.render(f, f.area(), row, None, true)).unwrap();
+        term.draw(|f| pane.render(f, f.area(), row, false, true)).unwrap();
         format!("{}", term.backend())
     }
 
@@ -710,35 +625,6 @@ mod tests {
     }
 
     #[test]
-    fn the_input_line_edits_by_character_not_by_byte() {
-        let mut input = Input::default();
-        for c in "héllo".chars() {
-            input.insert(c);
-        }
-        assert_eq!(input.text, "héllo");
-
-        input.left();
-        input.left();
-        input.left();
-        input.left();
-        // Now sitting just after the 'h', which is where a multi-byte
-        // character would trip a byte-indexed cursor.
-        input.backspace();
-        assert_eq!(input.text, "éllo");
-
-        input.home();
-        input.insert('H');
-        assert_eq!(input.text, "Héllo");
-
-        input.end();
-        input.insert('!');
-        assert_eq!(input.text, "Héllo!");
-
-        assert_eq!(input.take(), "Héllo!");
-        assert!(input.is_empty());
-    }
-
-    #[test]
     fn a_transcript_only_agent_has_nothing_to_type_into() {
         let dir = tempfile::tempdir().unwrap();
         let mut pane = Pane::default();
@@ -748,8 +634,8 @@ mod tests {
         assert!(pane.tmux_pane().is_none());
         let out = drawn(&mut pane, Some(&row), 64, 10);
         assert!(
-            !out.contains("type into this pane"),
-            "no input line where there is no pane: {out}"
+            !out.contains("typing here"),
+            "nothing claims to take keystrokes where there is no pane: {out}"
         );
     }
 
