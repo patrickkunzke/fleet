@@ -11,6 +11,7 @@
 //! to keep showing elapsed time.
 
 pub mod fleet;
+pub mod mirror;
 pub mod session;
 pub mod theme;
 
@@ -25,6 +26,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::db::{self, Db};
 use crate::registry::{self, Registry, Watcher};
+use crate::tmux::Tmux;
 use crate::ui::fleet::Row;
 
 /// How often to redraw when nothing has happened. Slow on purpose: the only
@@ -54,6 +56,10 @@ pub struct App {
     db: Db,
     root: Option<PathBuf>,
     projects: PathBuf,
+    tmux: Option<Tmux>,
+    /// The centre column as last drawn, so a mirror can be attached at the
+    /// right size before its first frame.
+    centre_size: (u16, u16),
     rows: Vec<Row>,
     selected: usize,
     centre: session::Pane,
@@ -73,6 +79,10 @@ impl App {
             db,
             root,
             projects: registry::default_projects_dir(),
+            // No tmux is survivable: every agent then falls back to its
+            // transcript, which is exactly the non-local case.
+            tmux: Tmux::detect(None).ok(),
+            centre_size: (80, 24),
             rows: Vec::new(),
             selected: 0,
             centre: session::Pane::default(),
@@ -119,7 +129,8 @@ impl App {
     /// Point the centre pane at the selection. Cheap when it has not changed.
     fn retarget(&mut self) {
         let row = self.selected().cloned();
-        self.centre.follow(row.as_ref(), &self.projects);
+        self.centre
+            .follow(row.as_ref(), &self.projects, self.tmux.as_ref(), self.centre_size);
     }
 
     fn on_key(&mut self, key: KeyEvent) {
@@ -168,6 +179,19 @@ impl App {
     }
 
     fn session_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Enter {
+            // Hand over the real terminal. Inside tmux this moves you there;
+            // outside it, the pane is selected and we say how to attach.
+            if let Some(tmux) = self.tmux.as_ref() {
+                self.status = self.centre.zoom(tmux);
+            }
+            return;
+        }
+        // A mirrored pane is the live screen: there is no history to scroll
+        // through, and tmux owns the scrollback.
+        if self.centre.is_live() {
+            return;
+        }
         // Up scrolls back through history, which means increasing the offset
         // from the bottom.
         match key.code {
@@ -193,7 +217,7 @@ impl App {
         self.rows.get(self.selected)
     }
 
-    pub fn draw(&self, frame: &mut Frame) {
+    pub fn draw(&mut self, frame: &mut Frame) {
         let area = frame.area();
         frame.render_widget(Block::default().style(theme::base()), area);
 
@@ -213,8 +237,10 @@ impl App {
         ])
         .areas(body);
 
+        self.centre_size = (centre.width.saturating_sub(3), centre.height.saturating_sub(2));
         fleet::render(frame, rail, &self.rows, self.selected);
-        self.centre.render(frame, centre, self.selected());
+        let row = self.rows.get(self.selected).cloned();
+        self.centre.render(frame, centre, row.as_ref());
         self.draw_side(frame, side);
         self.draw_keys(frame, keys);
     }
@@ -312,9 +338,15 @@ impl App {
                 ("r", "refresh"),
                 ("q", "quit"),
             ],
+            Focus::Session if self.centre.is_live() => &[
+                ("↵", "zoom to pane"),
+                ("tab", "agents"),
+                ("q", "quit"),
+            ],
             Focus::Session => &[
                 ("↑↓", "scroll"),
                 ("G", "live"),
+                ("↵", "zoom to pane"),
                 ("tab", "agents"),
                 ("q", "quit"),
             ],
@@ -469,7 +501,7 @@ mod tests {
         app
     }
 
-    fn drawn(app: &App, w: u16, h: u16) -> String {
+    fn drawn(app: &mut App, w: u16, h: u16) -> String {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         term.draw(|f| app.draw(f)).unwrap();
         format!("{}", term.backend())
@@ -477,7 +509,7 @@ mod tests {
 
     #[test]
     fn the_frame_has_all_three_columns_and_a_key_bar() {
-        let out = drawn(&app(), 110, 24);
+        let out = drawn(&mut app(), 110, 24);
         assert!(out.contains("fleet"), "{out}");
         assert!(out.contains("FLEET"), "the rail: {out}");
         assert!(out.contains("no session linked"), "the centre: {out}");
@@ -509,7 +541,7 @@ mod tests {
         let mut app = app();
         app.on_key(KeyEvent::from(KeyCode::Down));
 
-        let out = drawn(&app, 110, 24);
+        let out = drawn(&mut app,  110, 24);
         assert!(out.contains("billing-svc"), "{out}");
         assert!(
             out.contains("no session linked"),
@@ -518,10 +550,19 @@ mod tests {
     }
 
     #[test]
+    fn enter_on_a_transcript_only_agent_does_not_pretend_to_zoom() {
+        let mut app = app();
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        // Nothing to zoom to, so nothing is claimed.
+        assert!(app.status.is_none());
+    }
+
+    #[test]
     fn tab_moves_the_arrow_keys_between_the_rail_and_the_session() {
         let mut app = app();
         assert_eq!(app.focus, Focus::Rail);
-        assert!(drawn(&app, 110, 24).contains("agent"));
+        assert!(drawn(&mut app,  110, 24).contains("agent"));
 
         app.on_key(KeyEvent::from(KeyCode::Tab));
         assert_eq!(app.focus, Focus::Session);
@@ -530,7 +571,7 @@ mod tests {
         let before = app.selected().unwrap().name.clone();
         app.on_key(KeyEvent::from(KeyCode::Down));
         assert_eq!(app.selected().unwrap().name, before);
-        assert!(drawn(&app, 110, 24).contains("scroll"), "the key bar follows focus");
+        assert!(drawn(&mut app,  110, 24).contains("scroll"), "the key bar follows focus");
 
         app.on_key(KeyEvent::from(KeyCode::Tab));
         app.on_key(KeyEvent::from(KeyCode::Down));
@@ -567,7 +608,7 @@ mod tests {
         // Layout maths that overflows a narrow terminal is the classic way a
         // TUI dies on someone else's machine.
         for (w, h) in [(40, 8), (60, 10), (200, 60)] {
-            let _ = drawn(&app(), w, h);
+            let _ = drawn(&mut app(), w, h);
         }
     }
 }

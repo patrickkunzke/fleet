@@ -1,21 +1,33 @@
-//! The centre pane: the selected agent's live session.
+//! The centre pane: the selected agent's session.
 //!
-//! Not a summary of the session — the session itself, in the order it
-//! happened, as the transcript records it. The pane follows the tail the way
-//! a terminal does: new output pushes the view along until you scroll back,
-//! and then it holds still until you return to the bottom. Scrolling away and
-//! silently being yanked back by an agent's next tool call is the single most
-//! annoying thing a live log can do.
+//! Two ways of showing one, and the first is preferred wherever it works:
+//!
+//! 1. **The pane itself**, mirrored from tmux. The real REPL — spinners,
+//!    permission prompts, its own colours. This is what an agent running in
+//!    our tmux gets.
+//! 2. **The transcript**, re-rendered from the jsonl. The only thing that can
+//!    show a session which is not in our tmux, or one that has ended, and it
+//!    reads back further than a pane's screen. A structured view rather than
+//!    the thing itself, so it is the fallback, not the default.
+//!
+//! The transcript view follows the tail the way a terminal does: new output
+//! pushes the view along until you scroll back, and then it holds still until
+//! you return to the bottom. Being yanked to the bottom by an agent's next
+//! tool call is the single most annoying thing a live log can do.
 
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
+use crate::tmux::Tmux;
 use crate::transcript::{BACKFILL_BYTES, Entry, Outcome, Transcript};
 use crate::ui::fleet::{Presence, Row};
+use crate::ui::mirror::Mirror;
 use crate::ui::theme;
 
 #[derive(Default)]
 pub struct Pane {
+    /// The live terminal, when the agent is one of ours in tmux.
+    mirror: Option<Mirror>,
     /// Which session this pane is showing, so a changed selection reopens.
     session_id: Option<String>,
     /// Whether `follow` has ever run. Without it the first call on an agent
@@ -34,16 +46,41 @@ pub struct Pane {
 
 impl Pane {
     /// Point the pane at whatever is selected, reopening only on a change.
-    pub fn follow(&mut self, row: Option<&Row>, projects_dir: &std::path::Path) {
+    pub fn follow(
+        &mut self,
+        row: Option<&Row>,
+        projects_dir: &std::path::Path,
+        tmux: Option<&Tmux>,
+        area: (u16, u16),
+    ) {
         let wanted = row.and_then(|r| r.session_id.clone());
         if self.targeted && wanted == self.session_id {
             return;
         }
         self.targeted = true;
         self.session_id = wanted.clone();
+        // Dropping the old mirror is what stops tmux piping the pane we are
+        // no longer looking at.
+        self.mirror = None;
         self.transcript = None;
         self.scroll = 0;
         self.note = None;
+
+        // The live pane first: it is the actual terminal rather than our
+        // reading of it.
+        if let (Some(tmux), Some(target)) = (tmux, row.and_then(|r| r.tmux_target.as_deref()))
+            && let Ok(Some(pane)) = tmux.find(target)
+        {
+            match Mirror::attach(tmux, pane, area.0, area.1) {
+                Ok(m) => {
+                    self.mirror = Some(m);
+                    return;
+                }
+                // Falling through to the transcript is better than an empty
+                // pane, so this is a note rather than a failure.
+                Err(e) => self.note = Some(format!("cannot mirror the pane: {e}")),
+            }
+        }
 
         let Some(id) = wanted else {
             self.note = Some("no session linked".into());
@@ -73,6 +110,9 @@ impl Pane {
     /// there is something new, so the caller can skip a redraw when there is
     /// not.
     pub fn poll(&mut self) -> bool {
+        if let Some(m) = self.mirror.as_mut() {
+            return m.poll();
+        }
         let Some(t) = self.transcript.as_mut() else {
             return false;
         };
@@ -93,6 +133,25 @@ impl Pane {
         }
     }
 
+    /// Is the centre showing the real terminal rather than our reading of it?
+    pub fn is_live(&self) -> bool {
+        self.mirror.is_some()
+    }
+
+    /// Hand the user the actual pane, if there is one.
+    pub fn zoom(&self, tmux: &Tmux) -> Option<String> {
+        let m = self.mirror.as_ref()?;
+        match tmux.zoom(m.pane()) {
+            Ok(()) if Tmux::inside() => None,
+            Ok(()) => Some(format!(
+                "selected {} — attach with: tmux attach -t {}",
+                m.pane().window_name,
+                m.pane().session
+            )),
+            Err(e) => Some(format!("cannot zoom: {e}")),
+        }
+    }
+
     pub fn scroll_by(&mut self, delta: isize, page: usize) {
         let max = self.max_scroll.get() as isize;
         let next = self.scroll as isize + delta * page as isize;
@@ -107,7 +166,7 @@ impl Pane {
         self.scroll == 0
     }
 
-    pub fn render(&self, frame: &mut Frame, area: Rect, row: Option<&Row>) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, row: Option<&Row>) {
         let block = Block::default()
             .borders(Borders::RIGHT)
             .border_style(Style::default().fg(theme::BORDER));
@@ -118,6 +177,15 @@ impl Pane {
             Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).areas(inner);
 
         self.render_head(frame, head, row);
+
+        if let Some(m) = self.mirror.as_mut() {
+            let inner = pad(body);
+            // tmux has to believe the pane is the size we are drawing it, or
+            // the agent wraps its output to a width nobody is looking at.
+            m.resize(inner.width, inner.height);
+            m.render(frame, inner);
+            return;
+        }
 
         let width = body.width.saturating_sub(2);
         let mut lines: Vec<Line> = Vec::new();
@@ -164,13 +232,18 @@ impl Pane {
         if let Some(branch) = &row.branch {
             spans.push(Span::styled(format!("  {branch}"), theme::faint()));
         }
+        if !self.is_live() && row.session_id.is_some() {
+            // Say which of the two views this is, so nobody wonders why the
+            // spinner is missing.
+            spans.push(Span::styled("  transcript", theme::faint()));
+        }
         frame.render_widget(Paragraph::new(Line::from(spans)), pad(area));
 
         // Right-aligned, and drawn over the left half rather than appended to
         // it: a long branch name would otherwise push this off the edge, and
         // "you are not looking at the live edge" is the one thing in the
         // header that must never be the part that gets clipped.
-        if !self.following() {
+        if !self.is_live() && !self.following() {
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled("scrolled back ", theme::accent())))
                     .alignment(Alignment::Right),
@@ -380,7 +453,7 @@ mod tests {
     const TOOL: &str = r#"{"type":"assistant","timestamp":"2026-09-20T14:01:07.000Z","message":{"content":[{"type":"tool_use","id":"tu_1","name":"Edit","input":{"file_path":"/repo/src/AccountClient.kt"}}]}}"#;
     const RESULT: &str = r#"{"type":"user","timestamp":"2026-09-20T14:01:09.000Z","toolUseResult":{"filePath":"/repo/src/AccountClient.kt","structuredPatch":[{"lines":[" a","+b","-c"]}]},"message":{"content":[{"type":"tool_result","tool_use_id":"tu_1","content":"ok"}]}}"#;
 
-    fn drawn(pane: &Pane, row: Option<&Row>, w: u16, h: u16) -> String {
+    fn drawn(pane: &mut Pane, row: Option<&Row>, w: u16, h: u16) -> String {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         term.draw(|f| pane.render(f, f.area(), row)).unwrap();
         format!("{}", term.backend())
@@ -391,9 +464,9 @@ mod tests {
         let dir = projects("sess-1", &[PROMPT, SAY, TOOL, RESULT]);
         let mut pane = Pane::default();
         let row = row(Some("sess-1"));
-        pane.follow(Some(&row), dir.path());
+        pane.follow(Some(&row), dir.path(), None, (64, 10));
 
-        let out = drawn(&pane, Some(&row), 64, 16);
+        let out = drawn(&mut pane, Some(&row), 64, 16);
         assert!(out.contains("billing-svc"), "the header: {out}");
         assert!(out.contains("feature/ENG-2553-2"), "the branch: {out}");
         assert!(out.contains("thread the service param"), "the prompt: {out}");
@@ -408,9 +481,9 @@ mod tests {
         let dir = projects("sess-1", &[TOOL]);
         let mut pane = Pane::default();
         let row = row(Some("sess-1"));
-        pane.follow(Some(&row), dir.path());
+        pane.follow(Some(&row), dir.path(), None, (64, 10));
 
-        let out = drawn(&pane, Some(&row), 64, 10);
+        let out = drawn(&mut pane, Some(&row), 64, 10);
         assert!(out.contains("running"), "{out}");
     }
 
@@ -419,9 +492,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut pane = Pane::default();
         let row = row(None);
-        pane.follow(Some(&row), dir.path());
+        pane.follow(Some(&row), dir.path(), None, (64, 10));
 
-        let out = drawn(&pane, Some(&row), 64, 10);
+        let out = drawn(&mut pane, Some(&row), 64, 10);
         assert!(out.contains("no session linked"), "{out}");
     }
 
@@ -430,9 +503,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut pane = Pane::default();
         let row = row(Some("sess-missing"));
-        pane.follow(Some(&row), dir.path());
+        pane.follow(Some(&row), dir.path(), None, (64, 10));
 
-        let out = drawn(&pane, Some(&row), 64, 10);
+        let out = drawn(&mut pane, Some(&row), 64, 10);
         assert!(out.contains("no transcript yet"), "{out}");
     }
 
@@ -442,19 +515,19 @@ mod tests {
         let mut pane = Pane::default();
         let row = row(Some("sess-1"));
 
-        pane.follow(Some(&row), dir.path());
-        drawn(&pane, Some(&row), 64, 5); // scrolling is bounded by the last draw
+        pane.follow(Some(&row), dir.path(), None, (64, 10));
+        drawn(&mut pane, Some(&row), 64, 5); // scrolling is bounded by the last draw
         pane.scroll_by(1, 3);
         let scrolled = pane.scroll;
         assert!(scrolled > 0);
 
         // Same session: the scroll position is where the user put it.
-        pane.follow(Some(&row), dir.path());
+        pane.follow(Some(&row), dir.path(), None, (64, 10));
         assert_eq!(pane.scroll, scrolled);
 
         // A different one starts at the tail.
         let elsewhere = super::tests::row(Some("sess-2"));
-        pane.follow(Some(&elsewhere), dir.path());
+        pane.follow(Some(&elsewhere), dir.path(), None, (64, 10));
         assert_eq!(pane.scroll, 0);
     }
 
@@ -464,9 +537,9 @@ mod tests {
         let path = dir.path().join("-repo-content").join("sess-1.jsonl");
         let mut pane = Pane::default();
         let row = row(Some("sess-1"));
-        pane.follow(Some(&row), dir.path());
+        pane.follow(Some(&row), dir.path(), None, (64, 10));
 
-        drawn(&pane, Some(&row), 64, 4);
+        drawn(&mut pane, Some(&row), 64, 4);
         pane.scroll_by(1, 1);
         let before = pane.scroll;
         assert!(!pane.following());
@@ -489,11 +562,11 @@ mod tests {
         let dir = projects("sess-1", &[PROMPT, SAY, TOOL, RESULT]);
         let mut pane = Pane::default();
         let row = row(Some("sess-1"));
-        pane.follow(Some(&row), dir.path());
+        pane.follow(Some(&row), dir.path(), None, (64, 10));
 
-        assert!(!drawn(&pane, Some(&row), 64, 6).contains("scrolled back"));
+        assert!(!drawn(&mut pane, Some(&row), 64, 6).contains("scrolled back"));
         pane.scroll_by(1, 2);
-        assert!(drawn(&pane, Some(&row), 64, 6).contains("scrolled back"));
+        assert!(drawn(&mut pane, Some(&row), 64, 6).contains("scrolled back"));
     }
 
     #[test]
@@ -514,10 +587,10 @@ mod tests {
         let dir = projects("sess-1", &[PROMPT, SAY, TOOL, RESULT]);
         let mut pane = Pane::default();
         let row = row(Some("sess-1"));
-        pane.follow(Some(&row), dir.path());
+        pane.follow(Some(&row), dir.path(), None, (64, 10));
 
         for (w, h) in [(20, 4), (30, 6), (200, 50)] {
-            let _ = drawn(&pane, Some(&row), w, h);
+            let _ = drawn(&mut pane, Some(&row), w, h);
         }
     }
 }

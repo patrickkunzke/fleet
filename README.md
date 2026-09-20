@@ -19,7 +19,8 @@ already runs on the machine.
 | `src/db.rs` — fleet.db reads and writes | done, 11 tests |
 | `fleet board` reads in the binary | done; writes still cli/board.sh |
 | `src/tmux.rs` — spawning and pane control | done, 8 tests |
-| `src/ui/` — frame, fleet rail, session pane | done, 26 tests; the right rail is still a stub |
+| `src/ui/` — frame, fleet rail, session pane | done, 34 tests; the right rail is still a stub |
+| `src/ui/mirror.rs` — the live tmux pane | done, 5 tests |
 | TUI panes | not started |
 | `board` subcommand in the binary | not started |
 
@@ -137,3 +138,14 @@ the project's design canvas.
 The frame: a left rail of **spawned agents only** (no idle repo list), a centre
 pane showing whatever is selected — an agent's live session, or the flow — and
 a right rail carrying the chief's tasks above and background processes below.
+
+The centre pane shows two different things, and prefers the first:
+
+1. **The agent's actual terminal**, mirrored out of tmux with `pipe-pane` and
+   replayed through a vt100 parser. The real REPL — spinners, permission
+   prompts, its own colours. tmux still owns the process, so an agent outlives
+   this program and `↵` hands over the unmodified terminal.
+2. **The transcript**, re-rendered from the jsonl. The only thing that can show
+   a session which is not in our tmux, or one that has ended, and the
+   structured source the flow pane is built on. A reading of the session
+   rather than the session, so it is the fallback.
