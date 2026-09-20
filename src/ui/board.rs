@@ -68,19 +68,22 @@ fn render_tasks(frame: &mut Frame, area: Rect, tasks: &[Task], selected_agent: O
             "the chief writes it",
             theme::faint(),
         )));
-        frame.render_widget(Paragraph::new(lines), pad(area));
+        frame.render_widget(Paragraph::new(lines), theme::pad(area));
         return;
     }
 
-    let width = area.width.saturating_sub(2);
+    let width = area.width.saturating_sub(theme::GUTTER * 2);
     let room = area.height as usize;
     let mut epic: Option<&str> = None;
+    // Counted rather than derived from the line count, which also holds the
+    // epic headings and the blank lines between them — deriving it printed
+    // "+0 more" on a list that fitted perfectly.
+    let mut shown = 0usize;
 
     for task in tasks {
         if lines.len() + 1 >= room {
-            let shown = lines.len();
             lines.push(Line::from(Span::styled(
-                format!("+{} more", tasks.len().saturating_sub(shown)),
+                format!("+{} more", tasks.len() - shown),
                 theme::faint(),
             )));
             break;
@@ -134,6 +137,7 @@ fn render_tasks(frame: &mut Frame, area: Rect, tasks: &[Task], selected_agent: O
             Span::raw(" "),
             Span::styled(clip(&body, width.saturating_sub(3)), style),
         ]));
+        shown += 1;
 
         if let Some(why) = &task.blocked_on
             && lines.len() < room
@@ -153,7 +157,7 @@ fn render_tasks(frame: &mut Frame, area: Rect, tasks: &[Task], selected_agent: O
         }
     }
 
-    frame.render_widget(Paragraph::new(lines), pad(area));
+    frame.render_widget(Paragraph::new(lines), theme::pad(area));
 }
 
 fn render_background(frame: &mut Frame, area: Rect, background: &[BgTask]) {
@@ -166,11 +170,11 @@ fn render_background(frame: &mut Frame, area: Rect, background: &[BgTask]) {
 
     if background.is_empty() {
         lines.push(Line::from(Span::styled("nothing running", theme::faint())));
-        frame.render_widget(Paragraph::new(lines), pad(area));
+        frame.render_widget(Paragraph::new(lines), theme::pad(area));
         return;
     }
 
-    let width = area.width.saturating_sub(2);
+    let width = area.width.saturating_sub(theme::GUTTER * 2);
     let room = area.height as usize;
 
     for bg in background {
@@ -222,7 +226,7 @@ fn render_background(frame: &mut Frame, area: Rect, background: &[BgTask]) {
         ]));
     }
 
-    frame.render_widget(Paragraph::new(lines), pad(area));
+    frame.render_widget(Paragraph::new(lines), theme::pad(area));
 }
 
 /// "4h12m", "1m02s", "8s" — fixed width enough to sit in a column.
@@ -242,15 +246,6 @@ fn clip(s: &str, width: u16) -> String {
     }
     let cut: String = s.chars().take(width.saturating_sub(1)).collect();
     format!("{cut}…")
-}
-
-fn pad(area: Rect) -> Rect {
-    Rect {
-        x: area.x + 1,
-        y: area.y,
-        width: area.width.saturating_sub(2),
-        height: area.height,
-    }
 }
 
 #[cfg(test)]
@@ -373,6 +368,16 @@ mod tests {
     }
 
     #[test]
+    fn a_list_that_fits_does_not_claim_to_have_hidden_anything() {
+        let tasks = [
+            task("ENG-1-1", "ENG-1", State::Queued, None, "one"),
+            task("ENG-1-2", "ENG-1", State::Queued, None, "two"),
+        ];
+        let out = drawn(&tasks, &[], None, 34, 24);
+        assert!(!out.contains("more"), "{out}");
+    }
+
+    #[test]
     fn an_empty_rail_says_what_would_fill_it() {
         let out = drawn(&[], &[], None, 34, 24);
         assert!(out.contains("nothing on the board"), "{out}");
@@ -387,6 +392,7 @@ mod tests {
             .collect();
         let out = drawn(&tasks, &[], None, 34, 12);
         assert!(out.contains("more"), "a truncated list must admit it: {out}");
+        assert!(!out.contains("+0 more"), "and must not claim to hide nothing: {out}");
     }
 
     #[test]

@@ -18,7 +18,7 @@ pub mod mirror;
 pub mod session;
 pub mod theme;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -93,6 +93,8 @@ pub struct App {
     db_path: PathBuf,
     tx: Sender<Msg>,
     rx: Option<Receiver<Msg>>,
+    /// Rails folded away, leaving the agent's terminal the whole window.
+    wide: bool,
     /// Set when the user asked for the real terminal. Acted on by the run
     /// loop, which owns the screen — the key handler does not.
     wants_attach: bool,
@@ -114,6 +116,7 @@ impl App {
             db_path,
             tx,
             rx: Some(rx),
+            wide: false,
             wants_attach: false,
             registry: Registry::new(registry::default_dir()),
             db,
@@ -151,7 +154,7 @@ impl App {
 
         match self.db.agents() {
             Ok(agents) => {
-                self.rows = fleet::merge(&agents, &sessions, self.root.as_deref());
+                self.rows = fleet::merge(&agents, &sessions);
                 self.status = None;
             }
             Err(e) => self.status = Some(format!("board unreadable: {e}")),
@@ -208,6 +211,13 @@ impl App {
             }
             (KeyCode::Char('r'), _) => {
                 self.refresh();
+                return;
+            }
+            (KeyCode::Char('z'), _) => {
+                self.wide = !self.wide;
+                // The rails were taking two thirds of the width from a
+                // terminal, so the pane behind them has to be resized.
+                self.focus = Focus::Session;
                 return;
             }
             // Pressing the same key again puts the session back, so neither
@@ -303,20 +313,46 @@ impl App {
         }
     }
 
+    fn start_agent(&mut self, chosen: &agent::Candidate) {
+        self.launch(&chosen.name, &chosen.path.clone(), agent::Naming::Unique);
+    }
+
+    /// Make sure there is someone to brief.
+    ///
+    /// The chief is the first thing the workflow needs and the last thing
+    /// anyone wants to set up by hand, so fleet starts one in the workspace
+    /// if there is not a live one already. It is an ordinary Claude Code
+    /// session; the board skill is what makes it a chief of staff.
+    fn ensure_chief(&mut self) {
+        let live = self.rows.iter().any(|r| {
+            r.role == fleet::Role::Chief
+                && matches!(r.presence, fleet::Presence::Working | fleet::Presence::Waiting)
+        });
+        if live {
+            return;
+        }
+        let Some(root) = self.root.clone() else { return };
+        self.launch("chief", &root, agent::Naming::Exact);
+        if let Err(e) = self.db.upsert_agent("chief", Some("chief"), None, None, None, None) {
+            self.status = Some(format!("cannot record the chief: {e}"));
+        }
+        self.refresh();
+    }
+
     /// Open the pane now, and let the session catch up on its own.
     ///
     /// Waiting here for Claude Code to register itself would freeze the UI
     /// for several seconds on every spawn, which is how a key stops being
     /// worth pressing.
-    fn start_agent(&mut self, chosen: &agent::Candidate) {
+    fn launch(&mut self, name: &str, repo: &Path, naming: agent::Naming) {
         let Some(tmux) = self.tmux.clone() else {
             self.status = Some("no tmux — agents are started in tmux panes".into());
             return;
         };
-        let spawned = match agent::start(&tmux, &self.db, &chosen.name, &chosen.path, "claude") {
+        let spawned = match agent::start(&tmux, &self.db, name, repo, "claude", naming) {
             Ok(s) => s,
             Err(e) => {
-                self.status = Some(format!("cannot start {}: {e}", chosen.name));
+                self.status = Some(format!("cannot start {name}: {e}"));
                 return;
             }
         };
@@ -494,15 +530,28 @@ impl App {
 
         self.draw_top(frame, top);
 
-        let [rail, centre, side] = Layout::horizontal([
-            Constraint::Length(26),
-            Constraint::Min(20),
-            Constraint::Length(34),
-        ])
-        .areas(body);
+        // Folded away, the terminal is the window. That is the point of the
+        // key: a REPL rendered into a third of the screen is a preview of a
+        // terminal rather than one.
+        let (rail, centre, side) = if self.wide {
+            (Rect::ZERO, body, Rect::ZERO)
+        } else {
+            let [rail, centre, side] = Layout::horizontal([
+                Constraint::Length(28),
+                Constraint::Min(24),
+                Constraint::Length(36),
+            ])
+            .areas(body);
+            (rail, centre, side)
+        };
 
-        self.centre_size = (centre.width.saturating_sub(3), centre.height.saturating_sub(2));
-        fleet::render(frame, rail, &self.rows, self.selected);
+        self.centre_size = (
+            centre.width.saturating_sub(theme::GUTTER * 2 + 1),
+            centre.height.saturating_sub(3),
+        );
+        if !self.wide {
+            fleet::render(frame, rail, &self.rows, self.selected);
+        }
         match self.centre_view {
             Some(view) => flow::render(
                 frame,
@@ -511,14 +560,17 @@ impl App {
                 &self.events,
                 &self.rows,
                 self.event_selected,
+                !self.wide,
             ),
             None => {
                 let row = self.rows.get(self.selected).cloned();
                 let input = (self.mode == Mode::Insert).then_some(&self.input);
-                self.centre.render(frame, centre, row.as_ref(), input);
+                self.centre.render(frame, centre, row.as_ref(), input, !self.wide);
             }
         }
-        self.draw_side(frame, side);
+        if !self.wide {
+            self.draw_side(frame, side);
+        }
         self.draw_keys(frame, keys);
 
         if let Some(picker) = &self.picker {
@@ -611,6 +663,7 @@ impl App {
             Focus::Rail => &[
                 ("↑↓", "agent"),
                 ("n", "new agent"),
+                ("z", "wide"),
                 ("g", "graph"),
                 ("l", "log"),
                 ("tab", "session"),
@@ -619,6 +672,7 @@ impl App {
             Focus::Session if self.centre.is_live() => &[
                 ("i", "type"),
                 ("↵", if Tmux::inside() { "zoom to pane" } else { "attach" }),
+                ("z", if self.wide { "rails" } else { "wide" }),
                 ("tab", "agents"),
                 ("q", "quit"),
             ],
@@ -668,6 +722,13 @@ pub fn snapshot(
 pub fn run(db: Db, db_path: PathBuf, root: Option<PathBuf>) -> Result<()> {
     let mut app = App::new(db, db_path, root);
     app.refresh();
+    // Only here, never in snapshot: drawing a frame must not start a
+    // Claude Code session as a side effect.
+    app.ensure_chief();
+    if let Some(at) = app.rows.iter().position(|r| r.role == fleet::Role::Chief) {
+        app.selected = at;
+        app.retarget();
+    }
 
     let rx = app.rx.take().expect("the app owns its channel until run takes it");
     let tx = app.tx.clone();

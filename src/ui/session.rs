@@ -276,9 +276,13 @@ impl Pane {
         area: Rect,
         row: Option<&Row>,
         input: Option<&Input>,
+        // A divider only means something when there is a pane on the other
+        // side of it; at the screen edge it is a stray line.
+        bordered: bool,
     ) {
+        let borders = if bordered { Borders::RIGHT } else { Borders::NONE };
         let block = Block::default()
-            .borders(Borders::RIGHT)
+            .borders(borders)
             .border_style(Style::default().fg(theme::BORDER));
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -298,7 +302,7 @@ impl Pane {
         }
 
         if let Some(m) = self.mirror.as_mut() {
-            let inner = pad(body);
+            let inner = theme::pad(body);
             // tmux has to believe the pane is the size we are drawing it, or
             // the agent wraps its output to a width nobody is looking at.
             m.resize(inner.width, inner.height);
@@ -306,7 +310,7 @@ impl Pane {
             return;
         }
 
-        let width = body.width.saturating_sub(2);
+        let width = body.width.saturating_sub(theme::GUTTER * 2);
         let mut lines: Vec<Line> = Vec::new();
         match (&self.transcript, &self.note) {
             (Some(t), _) => {
@@ -327,7 +331,7 @@ impl Pane {
         let start = end.saturating_sub(height);
         let visible: Vec<Line> = lines[start..end].to_vec();
 
-        frame.render_widget(Paragraph::new(visible), pad(body));
+        frame.render_widget(Paragraph::new(visible), theme::pad(body));
     }
 
     fn render_input(&self, frame: &mut Frame, area: Rect, input: Option<&Input>) {
@@ -353,7 +357,7 @@ impl Pane {
                 Span::styled("i  type into this pane", theme::faint()),
             ]),
         };
-        frame.render_widget(Paragraph::new(line), pad(area));
+        frame.render_widget(Paragraph::new(line), theme::pad(area));
     }
 
     fn render_head(&self, frame: &mut Frame, area: Rect, row: Option<&Row>) {
@@ -382,7 +386,7 @@ impl Pane {
             // spinner is missing.
             spans.push(Span::styled("  transcript", theme::faint()));
         }
-        frame.render_widget(Paragraph::new(Line::from(spans)), pad(area));
+        frame.render_widget(Paragraph::new(Line::from(spans)), theme::pad(area));
 
         // Right-aligned, and drawn over the left half rather than appended to
         // it: a long branch name would otherwise push this off the edge, and
@@ -392,18 +396,9 @@ impl Pane {
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled("scrolled back ", theme::accent())))
                     .alignment(Alignment::Right),
-                pad(area),
+                theme::pad(area),
             );
         }
-    }
-}
-
-fn pad(area: Rect) -> Rect {
-    Rect {
-        x: area.x + 1,
-        y: area.y,
-        width: area.width.saturating_sub(2),
-        height: area.height,
     }
 }
 
@@ -600,7 +595,7 @@ mod tests {
 
     fn drawn(pane: &mut Pane, row: Option<&Row>, w: u16, h: u16) -> String {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-        term.draw(|f| pane.render(f, f.area(), row, None)).unwrap();
+        term.draw(|f| pane.render(f, f.area(), row, None, true)).unwrap();
         format!("{}", term.backend())
     }
 

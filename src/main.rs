@@ -312,7 +312,7 @@ fn spawn(
 ) -> Result<()> {
     let tmux = Tmux::detect(session)?;
     let db = Db::open(db_path.unwrap_or_else(db::default_path))?;
-    let spawned = agent::start(&tmux, &db, name, repo, command)?;
+    let spawned = agent::start(&tmux, &db, name, repo, command, agent::Naming::Unique)?;
     println!(
         "{}  pane {} in session {}",
         spawned.name, spawned.pane.id, spawned.pane.session

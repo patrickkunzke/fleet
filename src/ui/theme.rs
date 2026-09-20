@@ -4,7 +4,22 @@
 //! and red mean something rather than decorate. Kept together so the panes
 //! cannot drift apart as they are written.
 
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
+
+/// Breathing room inside a pane. One column read as cramped against the
+/// borders; two is what makes a column of text look placed rather than
+/// wedged.
+pub const GUTTER: u16 = 2;
+
+pub fn pad(area: Rect) -> Rect {
+    Rect {
+        x: area.x + GUTTER,
+        y: area.y,
+        width: area.width.saturating_sub(GUTTER * 2),
+        height: area.height,
+    }
+}
 
 pub const BG: Color = Color::Rgb(0x12, 0x11, 0x0F);
 pub const PANEL: Color = Color::Rgb(0x1C, 0x18, 0x15);

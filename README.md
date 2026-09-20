@@ -77,8 +77,14 @@ takes a SELECT and refuses anything else: every write goes through a verb that
 records the matching flow event, and a bare UPDATE is the one way to break
 that.
 
-Keys: `↑↓` agent, `n` new agent, `tab` session, `i` type into it, `↵` zoom to
-the pane, `g` the flow graph, `l` the flow log, `q` quit.
+Keys: `↑↓` agent, `n` new agent, `z` fold the rails away, `tab` session, `i`
+type into it, `↵` attach to the pane, `g` the flow graph, `l` the flow log,
+`q` quit.
+
+Starting fleet in a workspace starts a **chief of staff** there if one is not
+already running — an ordinary Claude Code session with the board skill. That
+is who you talk to; it plans the work and starts the agents that do it. The
+rail lists only agents the fleet started, not every session on the machine.
 
 The flow views read the `events` table, which every state change and every
 `fleet msg` writes. **A message sent with `SendMessage` and never logged does

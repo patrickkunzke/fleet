@@ -1,12 +1,8 @@
 //! The left rail: the agents this fleet created, and what each is doing.
 //!
-//! Deliberately not a list of repositories. A repo with no agent in it is not
-//! shown, because a rail of twenty-five idle names is a rail nobody reads.
-//!
-//! What it does show beyond the fleet's own agents is a live Claude Code
-//! session running somewhere the fleet is not tracking. Hiding a running
-//! agent would defeat the point of the view, so those appear at the bottom,
-//! dimmed, ready to be adopted.
+//! Only agents the fleet started. Not repositories, and not every Claude
+//! Code session on the machine: this is the crew working on the thing in
+//! front of you, and anything else in the list is noise competing with it.
 
 use std::path::Path;
 
@@ -35,8 +31,6 @@ pub enum Presence {
 pub enum Role {
     Chief,
     Worker,
-    /// A live session the fleet did not start.
-    Unmanaged,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,7 +62,7 @@ impl Row {
 
     fn name_style(&self) -> Style {
         match (self.role, self.presence) {
-            (Role::Unmanaged, _) | (_, Presence::Gone | Presence::Unlinked) => theme::dim(),
+            (_, Presence::Gone | Presence::Unlinked) => theme::dim(),
             _ => Style::default().fg(theme::TEXT),
         }
     }
@@ -80,11 +74,7 @@ impl Row {
 /// which are alive right now. Neither alone is the rail: an agent whose
 /// process died still has a task assigned, and a session nobody registered is
 /// still doing work.
-pub fn merge(
-    agents: &[db::Agent],
-    sessions: &[registry::Session],
-    root: Option<&Path>,
-) -> Vec<Row> {
+pub fn merge(agents: &[db::Agent], sessions: &[registry::Session]) -> Vec<Row> {
     let mut rows = Vec::new();
 
     for a in agents {
@@ -132,41 +122,11 @@ pub fn merge(
         });
     }
 
+    // The chief first — it is the one you brief.
     rows.sort_by(|a, b| {
-        // The chief first — it is the one you brief.
-        let rank = |r: &Row| match r.role {
-            Role::Chief => 0,
-            Role::Worker => 1,
-            Role::Unmanaged => 2,
-        };
+        let rank = |r: &Row| if r.role == Role::Chief { 0 } else { 1 };
         rank(a).cmp(&rank(b)).then_with(|| a.name.cmp(&b.name))
     });
-
-    let claimed: Vec<&str> = rows.iter().filter_map(|r| r.session_id.as_deref()).collect();
-    let mut loose: Vec<Row> = sessions
-        .iter()
-        .filter(|s| s.is_interactive())
-        .filter(|s| !claimed.contains(&s.session_id.as_str()))
-        .filter(|s| root.is_none_or(|r| s.cwd.starts_with(r)))
-        .map(|s| Row {
-            name: s.name.clone(),
-            role: Role::Unmanaged,
-            repo: s.repo().to_string(),
-            presence: if s.status == Status::Busy {
-                Presence::Working
-            } else {
-                Presence::Waiting
-            },
-            detail: "not on the board".to_string(),
-            bg_running: 0,
-            session_id: Some(s.session_id.clone()),
-            branch: None,
-            tmux_target: None,
-            pid: Some(s.pid),
-        })
-        .collect();
-    loose.sort_by(|a, b| a.name.cmp(&b.name));
-    rows.append(&mut loose);
 
     rows
 }
@@ -187,7 +147,7 @@ pub fn render(frame: &mut Frame, area: Rect, rows: &[Row], selected: usize) {
     let block = Block::default()
         .borders(Borders::RIGHT)
         .border_style(Style::default().fg(theme::BORDER));
-    let inner = block.inner(area);
+    let inner = theme::pad(block.inner(area));
     frame.render_widget(block, area);
 
     let working = rows.iter().filter(|r| r.presence == Presence::Working).count();
@@ -203,10 +163,7 @@ pub fn render(frame: &mut Frame, area: Rect, rows: &[Row], selected: usize) {
             "no agents yet",
             theme::faint(),
         )));
-        lines.push(Line::from(Span::styled(
-            "n  spawn one",
-            theme::faint(),
-        )));
+        lines.push(Line::from(Span::styled("n  spawn one", theme::faint())));
     }
 
     // Keep the selected row on screen by scrolling whole rows, never halves:
@@ -238,7 +195,7 @@ pub fn render(frame: &mut Frame, area: Rect, rows: &[Row], selected: usize) {
         let detail = Line::from(vec![
             Span::styled(bar, theme::accent()),
             Span::raw("  "),
-            Span::styled(truncate(&row.detail, inner.width.saturating_sub(4)), theme::faint()),
+            Span::styled(truncate(&row.detail, inner.width.saturating_sub(3)), theme::faint()),
         ]);
 
         let style = if is_selected {
@@ -313,7 +270,7 @@ mod tests {
             agent("chief", "chief", None, None),
             agent("billing-svc", "worker", None, None),
         ];
-        let names: Vec<_> = merge(&agents, &[], None)
+        let names: Vec<_> = merge(&agents, &[])
             .into_iter()
             .map(|r| r.name)
             .collect();
@@ -325,7 +282,7 @@ mod tests {
         let agents = [agent("billing-svc", "worker", Some("sess-1"), Some("ENG-1"))];
         let live = [session("billing-service-50", "sess-1", "/repo/content", Status::Busy)];
 
-        let rows = merge(&agents, &live, None);
+        let rows = merge(&agents, &live);
         assert_eq!(rows[0].presence, Presence::Working);
         assert_eq!(rows[0].pid, Some(4242));
         assert_eq!(rows[0].detail, "ENG-1 · consume the param");
@@ -334,12 +291,12 @@ mod tests {
     #[test]
     fn never_linked_is_not_the_same_as_died() {
         // Registered by hand, never spawned: nothing has been lost.
-        let rows = merge(&[agent("chief", "chief", None, None)], &[], None);
+        let rows = merge(&[agent("chief", "chief", None, None)], &[]);
         assert_eq!(rows[0].presence, Presence::Unlinked);
         assert_eq!(rows[0].detail, "no session yet");
 
         // Spawned, adopted, and then the process went away: something has.
-        let rows = merge(&[agent("billing-svc", "worker", Some("sess-1"), None)], &[], None);
+        let rows = merge(&[agent("billing-svc", "worker", Some("sess-1"), None)], &[]);
         assert_eq!(rows[0].presence, Presence::Gone);
         assert_eq!(rows[0].detail, "session ended");
     }
@@ -350,7 +307,7 @@ mod tests {
         use ratatui::backend::TestBackend;
 
         let agents = [agent("dev-tools", "worker", None, None)];
-        let rows = merge(&agents, &[], None);
+        let rows = merge(&agents, &[]);
 
         let mut term = Terminal::new(TestBackend::new(26, 8)).unwrap();
         term.draw(|f| render(f, f.area(), &rows, 0)).unwrap();
@@ -363,7 +320,7 @@ mod tests {
     #[test]
     fn an_agent_whose_process_died_is_shown_as_gone_not_dropped() {
         let agents = [agent("billing-svc", "worker", Some("sess-1"), None)];
-        let rows = merge(&agents, &[], None);
+        let rows = merge(&agents, &[]);
 
         assert_eq!(rows.len(), 1, "it still holds a row on the board");
         assert_eq!(rows[0].presence, Presence::Gone);
@@ -371,30 +328,16 @@ mod tests {
     }
 
     #[test]
-    fn a_live_session_nobody_registered_is_listed_last_as_unmanaged() {
+    fn a_session_the_fleet_did_not_start_is_not_in_the_rail() {
         let agents = [agent("billing-svc", "worker", Some("sess-1"), None)];
         let live = [
             session("billing-service-50", "sess-1", "/repo/content", Status::Idle),
+            // Someone's own terminal, in the same workspace. Not our crew.
             session("scratch", "sess-2", "/repo/workspace", Status::Idle),
         ];
 
-        let rows = merge(&agents, &live, None);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[1].name, "scratch");
-        assert_eq!(rows[1].role, Role::Unmanaged);
-        assert_eq!(rows[1].detail, "not on the board");
-    }
-
-    #[test]
-    fn a_session_outside_the_workspace_is_someone_elses_business() {
-        let live = [
-            session("acme-de", "sess-1", "/work/acme/ui", Status::Idle),
-            session("elsewhere", "sess-2", "/tmp/other", Status::Idle),
-        ];
-        let rows = merge(&[], &live, Some(Path::new("/work/acme")));
-
-        let names: Vec<_> = rows.into_iter().map(|r| r.name).collect();
-        assert_eq!(names, vec!["acme-de"]);
+        let names: Vec<_> = merge(&agents, &live).into_iter().map(|r| r.name).collect();
+        assert_eq!(names, vec!["billing-svc"]);
     }
 
     #[test]
@@ -417,7 +360,7 @@ mod tests {
 
         let agents = [agent("billing-svc", "worker", Some("sess-1"), Some("ENG-2553-2"))];
         let live = [session("billing-service-50", "sess-1", "/repo/content", Status::Busy)];
-        let rows = merge(&agents, &live, None);
+        let rows = merge(&agents, &live);
 
         let mut term = Terminal::new(TestBackend::new(26, 12)).unwrap();
         term.draw(|f| render(f, f.area(), &rows, 0)).unwrap();
@@ -438,7 +381,7 @@ mod tests {
         let agents: Vec<_> = (0..12)
             .map(|i| agent(&format!("agent-{i:02}"), "worker", None, None))
             .collect();
-        let rows = merge(&agents, &[], None);
+        let rows = merge(&agents, &[]);
 
         // Room for three rows; select the last one.
         let mut term = Terminal::new(TestBackend::new(26, 8)).unwrap();

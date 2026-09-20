@@ -64,9 +64,10 @@ pub fn render(
     events: &[Event],
     rows: &[Row],
     selected: usize,
+    bordered: bool,
 ) {
     let block = Block::default()
-        .borders(Borders::RIGHT)
+        .borders(if bordered { Borders::RIGHT } else { Borders::NONE })
         .border_style(Style::default().fg(theme::BORDER));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -89,11 +90,11 @@ pub fn render(
             Span::raw("  "),
             Span::styled(format!("{} events", events.len()), theme::faint()),
         ])),
-        pad(head),
+        theme::pad(head),
     );
 
     match view {
-        View::Graph => graph(frame, pad(body), events, rows),
+        View::Graph => graph(frame, theme::pad(body), events, rows),
         View::Log => log(frame, body, events, selected),
     }
 }
@@ -212,7 +213,7 @@ fn log(frame: &mut Frame, area: Rect, events: &[Event], selected: usize) {
     if events.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled("nothing has happened yet", theme::faint()))),
-            pad(list),
+            theme::pad(list),
         );
         return;
     }
@@ -223,7 +224,7 @@ fn log(frame: &mut Frame, area: Rect, events: &[Event], selected: usize) {
     // width rather than merely padded to it: "accounts-svc ▸ billing-svc" is
     // longer than the column, and padding alone lets it run into the summary.
     const ROUTE: usize = 24;
-    let inner = list.width.saturating_sub(2) as usize;
+    let inner = list.width.saturating_sub(theme::GUTTER * 2) as usize;
     let summary_width = inner.saturating_sub(1 + 5 + 1 + 1 + 1 + ROUTE) as u16;
     let mut lines = Vec::new();
     for (i, e) in events.iter().enumerate().skip(first).take(room) {
@@ -264,7 +265,7 @@ fn log(frame: &mut Frame, area: Rect, events: &[Event], selected: usize) {
             }),
         );
     }
-    frame.render_widget(Paragraph::new(lines), pad(list));
+    frame.render_widget(Paragraph::new(lines), theme::pad(list));
 
     let divider = Block::default()
         .borders(Borders::TOP)
@@ -294,7 +295,7 @@ fn log(frame: &mut Frame, area: Rect, events: &[Event], selected: usize) {
         ),
     ])];
     body.push(Line::raw(""));
-    let width = inner.width.saturating_sub(2);
+    let width = inner.width.saturating_sub(theme::GUTTER * 2);
     // The summary is the one line; the body is what it would not fit.
     for line in wrap(e.body.as_deref().unwrap_or(&e.summary), width) {
         body.push(Line::from(Span::styled(
@@ -302,7 +303,7 @@ fn log(frame: &mut Frame, area: Rect, events: &[Event], selected: usize) {
             Style::default().fg(theme::TEXT),
         )));
     }
-    frame.render_widget(Paragraph::new(body), pad(inner));
+    frame.render_widget(Paragraph::new(body), theme::pad(inner));
 }
 
 fn hhmm(ts: &str) -> String {
@@ -337,15 +338,6 @@ fn wrap(text: &str, width: u16) -> Vec<String> {
         out.push(line);
     }
     out
-}
-
-fn pad(area: Rect) -> Rect {
-    Rect {
-        x: area.x + 1,
-        y: area.y,
-        width: area.width.saturating_sub(2),
-        height: area.height,
-    }
 }
 
 #[cfg(test)]
@@ -388,7 +380,7 @@ mod tests {
     fn drawn(view: View, events: &[Event], selected: usize, w: u16, h: u16) -> String {
         let rows = rows();
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-        term.draw(|f| render(f, f.area(), view, events, &rows, selected))
+        term.draw(|f| render(f, f.area(), view, events, &rows, selected, true))
             .unwrap();
         format!("{}", term.backend())
     }

@@ -33,6 +33,17 @@ pub struct Spawned {
     pub pane: Pane,
 }
 
+/// Whether a clashing name is worked around or reused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Naming {
+    /// A second agent in a repo gets its own name.
+    Unique,
+    /// Take the name as given, replacing whatever row holds it. What
+    /// restarting a named agent — the chief — has to do, or every launch
+    /// would leave another chief-2 behind.
+    Exact,
+}
+
 /// Open a pane and put the agent on the board, without waiting for it.
 pub fn start(
     tmux: &Tmux,
@@ -40,11 +51,15 @@ pub fn start(
     name: &str,
     repo: &Path,
     command: &str,
+    naming: Naming,
 ) -> Result<Spawned> {
     let repo = repo
         .canonicalize()
         .with_context(|| format!("no such repository: {}", repo.display()))?;
-    let name = unique_name(db, name)?;
+    let name = match naming {
+        Naming::Unique => unique_name(db, name)?,
+        Naming::Exact => name.to_string(),
+    };
     let pane = tmux.spawn(&name, &repo, command)?;
     let target = format!("{}:{}", pane.session, pane.window_name);
 
