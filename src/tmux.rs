@@ -100,8 +100,10 @@ impl Tmux {
             .is_ok()
     }
 
-    /// Create the session if it is not there. Detached: creating it must not
-    /// yank the user out of whatever they are doing.
+    /// Create an empty session. Only tests want one: spawning creates the
+    /// session along with its first agent, so that no placeholder window is
+    /// left behind.
+    #[cfg(test)]
     pub fn ensure_session(&self) -> Result<()> {
         if self.has_session() {
             return Ok(());
@@ -116,26 +118,47 @@ impl Tmux {
     /// a dispatch that jumped the terminal to a new agent every time would be
     /// unusable with more than two.
     pub fn spawn(&self, window_name: &str, cwd: &Path, command: &str) -> Result<Pane> {
-        self.ensure_session()?;
         if !cwd.is_dir() {
             bail!("cannot spawn in '{}': not a directory", cwd.display());
         }
         let target = format!("={}", self.session);
         let cwd = cwd.to_string_lossy().to_string();
-        let printed = self.run(&[
-            "new-window",
-            "-d",
-            "-P",
-            "-F",
-            "#{pane_id}",
-            "-t",
-            &target,
-            "-n",
-            window_name,
-            "-c",
-            &cwd,
-            command,
-        ])?;
+
+        // Creating the session and its first agent separately would leave a
+        // placeholder shell in window 0 forever — a window that looks like an
+        // agent, holds nothing, and is the one your keystrokes land in if you
+        // ever address the session rather than the pane.
+        let printed = if self.has_session() {
+            self.run(&[
+                "new-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-t",
+                &target,
+                "-n",
+                window_name,
+                "-c",
+                &cwd,
+                command,
+            ])?
+        } else {
+            self.run(&[
+                "new-session",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-s",
+                &self.session,
+                "-n",
+                window_name,
+                "-c",
+                &cwd,
+                command,
+            ])?
+        };
         let id = printed.trim().to_string();
         self.pane(&id)?
             .with_context(|| format!("tmux reported pane {id} but it is not listed"))
@@ -186,6 +209,16 @@ impl Tmux {
         }
         self.run(&["send-keys", "-t", &pane.id, "-l", "--", text])?;
         self.run(&["send-keys", "-t", &pane.id, "Enter"])?;
+        Ok(())
+    }
+
+    /// Send one key by its tmux name: `Enter`, `Escape`, `C-c`, `Up`.
+    ///
+    /// Separate from send_line because these are the things a line of text
+    /// cannot express, and they are exactly what a permission prompt or a
+    /// runaway turn needs.
+    pub fn send_key(&self, pane: &Pane, key: &str) -> Result<()> {
+        self.run(&["send-keys", "-t", &pane.id, key])?;
         Ok(())
     }
 
@@ -418,6 +451,27 @@ mod tests {
     }
 
     #[test]
+    fn the_first_agent_is_the_sessions_first_window_not_its_second() {
+        // No ensure_session first: this is what spawning into a fresh fleet
+        // looks like.
+        let name = format!("fleet-first-{}", std::process::id());
+        let tmux = Tmux::detect(Some(&name)).unwrap().on_socket(&name);
+        let dir = tempfile::tempdir().unwrap();
+
+        let pane = tmux.spawn("billing-svc", dir.path(), "sleep 20").unwrap();
+        let windows = tmux
+            .run(&["list-windows", "-t", &format!("={name}"), "-F", "#{window_name}"])
+            .unwrap();
+
+        assert_eq!(
+            windows, "billing-svc",
+            "a placeholder shell window would be an agent that is not one"
+        );
+        assert_eq!(pane.window_name, "billing-svc");
+        let _ = tmux.kill_server();
+    }
+
+    #[test]
     fn a_spawned_pane_owns_the_process_it_started() {
         let Some(s) = Scratch::new("owns") else { return };
         let dir = tempfile::tempdir().unwrap();
@@ -483,6 +537,29 @@ mod tests {
 
         let err = s.tmux.send_line(&pane, "first\nsecond").unwrap_err();
         assert!(err.to_string().contains("one line"), "{err}");
+    }
+
+    #[test]
+    fn a_named_key_arrives_as_that_key_and_not_as_its_name() {
+        let Some(s) = Scratch::new("keys") else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("typed.txt");
+        let pane = s
+            .tmux
+            .spawn("keys", dir.path(), &format!("cat > {}", out.to_string_lossy()))
+            .unwrap();
+
+        s.tmux.run(&["send-keys", "-t", &pane.id, "-l", "--", "line one"]).unwrap();
+        s.tmux.send_key(&pane, "Enter").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        s.tmux.run(&["send-keys", "-t", &pane.id, "C-d"]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let typed = std::fs::read_to_string(&out).unwrap_or_default();
+        assert_eq!(
+            typed, "line one\n",
+            "Enter must submit the line, not type the word"
+        );
     }
 
     #[test]
