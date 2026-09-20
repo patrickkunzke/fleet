@@ -16,6 +16,8 @@ already runs on the machine.
 | `skills/board` — the `/board` skill | done |
 | `src/registry.rs` — session discovery and watching | done, 6 tests |
 | `src/transcript.rs` — transcript reading and tailing | done, 8 tests |
+| `src/db.rs` — fleet.db reads and writes | done, 11 tests |
+| `fleet board` reads in the binary | done; writes still cli/board.sh |
 | TUI panes | not started |
 | `board` subcommand in the binary | not started |
 
@@ -92,7 +94,7 @@ binary. The cost is startup, size, and hand-rolling the braille drawing.
 ```
 Cargo.toml
 src/main.rs          clap — default subcommand is the TUI, `board` is the CLI
-src/db.rs            fleet.db
+src/db.rs            fleet.db  [done]
 src/registry.rs      ~/.claude/sessions watcher (notify / FSEvents)  [done]
 src/transcript.rs    jsonl tail  [done]
 src/tmux.rs          spawn a session into a pane, zoom to it

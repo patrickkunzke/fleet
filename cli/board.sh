@@ -123,14 +123,14 @@ cmd_show() {
   need_db; task_exists "$1"
   sql "SELECT * FROM v_board WHERE key = $(q "$1");"
   sql "SELECT ts, kind, from_agent, to_agent, summary
-       FROM events WHERE task_key = $(q "$1") ORDER BY ts;"
+       FROM events WHERE task_key = $(q "$1") ORDER BY ts, id;"
   run "SELECT body FROM tasks WHERE key = $(q "$1");"
 }
 
 cmd_log() {
   need_db
   sql "SELECT ts, kind, from_agent AS \"from\", to_agent AS \"to\", task_key AS task, summary
-       FROM events ORDER BY ts DESC LIMIT ${1:-20};"
+       FROM events ORDER BY ts DESC, id DESC LIMIT ${1:-20};"
 }
 
 cmd_epic() {
