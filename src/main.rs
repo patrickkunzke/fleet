@@ -10,6 +10,7 @@ mod db;
 mod registry;
 mod tmux;
 mod transcript;
+mod ui;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -31,6 +32,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// The fleet view. This is what running `fleet` with no arguments does.
+    Tui {
+        /// Only show sessions working under this directory.
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long, env = "FLEET_DB")]
+        db: Option<PathBuf>,
+        /// Draw one frame to stdout instead of taking over the terminal.
+        #[arg(long, value_name = "WIDTHxHEIGHT")]
+        snapshot: Option<String>,
+    },
     /// Live sessions and what they are doing.
     Sessions {
         /// Follow the registry and report each change.
@@ -96,7 +108,28 @@ enum BoardView {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    match cli.command.unwrap_or(Command::Sessions { watch: false }) {
+    match cli.command.unwrap_or(Command::Tui {
+        root: None,
+        db: None,
+        snapshot: None,
+    }) {
+        Command::Tui {
+            root,
+            db,
+            snapshot,
+        } => {
+            let db = Db::open(db.unwrap_or_else(db::default_path))?;
+            match snapshot {
+                Some(size) => {
+                    let (w, h) = size
+                        .split_once('x')
+                        .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
+                        .context("--snapshot wants WIDTHxHEIGHT, such as 110x28")?;
+                    ui::snapshot(db, root, w, h)
+                }
+                None => ui::run(db, root),
+            }
+        }
         Command::Sessions { watch } => sessions(watch),
         Command::Session { name, watch, lines } => session(&name, watch, lines),
         Command::Board { view, db } => board(view, db),

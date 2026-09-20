@@ -18,6 +18,8 @@ already runs on the machine.
 | `src/transcript.rs` — transcript reading and tailing | done, 8 tests |
 | `src/db.rs` — fleet.db reads and writes | done, 11 tests |
 | `fleet board` reads in the binary | done; writes still cli/board.sh |
+| `src/tmux.rs` — spawning and pane control | done, 8 tests |
+| `src/ui/` — frame and fleet rail | done, 16 tests; centre and right rails are stubs |
 | TUI panes | not started |
 | `board` subcommand in the binary | not started |
 
@@ -64,6 +66,15 @@ fleet log
 `FLEET_JSON=1` before any read gives JSON. `FLEET_DB` overrides the database
 path, which is how the tests run against a scratch copy.
 
+The Rust binary carries the same reads plus the view itself:
+
+```bash
+cargo run -- tui --root ~/Code/acme      # the fleet view
+cargo run -- spawn billing-svc --repo ~/Code/acme/service/billing-service
+cargo run -- sessions --watch
+cargo run -- tui --snapshot 104x20          # one frame to stdout
+```
+
 ## Packaging plan
 
 **Rust + ratatui, shipped as a Homebrew tap.** The shell CLI is a placeholder
@@ -97,8 +108,8 @@ src/main.rs          clap — default subcommand is the TUI, `board` is the CLI
 src/db.rs            fleet.db  [done]
 src/registry.rs      ~/.claude/sessions watcher (notify / FSEvents)  [done]
 src/transcript.rs    jsonl tail  [done]
-src/tmux.rs          spawn a session into a pane, zoom to it
-src/ui/…             fleet rail, session pane, flow, board rail
+src/tmux.rs          spawn a session into a pane, zoom to it  [done]
+src/ui/…             fleet rail [done], session pane, flow, board rail
 schema.sql           embedded with include_str!
 skills/board/        installed by `fleet install-skill`
 ```
