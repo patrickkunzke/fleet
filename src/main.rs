@@ -9,6 +9,7 @@
 mod agent;
 mod brief;
 mod db;
+mod msg;
 mod registry;
 mod tmux;
 mod transcript;
@@ -257,6 +258,44 @@ enum BgCmd {
     },
     /// List them.
     Ls,
+}
+
+/// Knock at the recipient's door, and say whether anyone was in.
+///
+/// Every outcome is reported rather than returned as an error: the message
+/// is already on the board by the time this runs, and a sender who is told
+/// "failed" will send it again.
+fn knock(
+    db: &Db,
+    from: &str,
+    to: &str,
+    task: Option<&str>,
+    summary: &str,
+    body: Option<&str>,
+) -> String {
+    if from == to {
+        return "not delivered: a message to yourself is a note".into();
+    }
+    let Ok(agents) = db.agents() else {
+        return "not delivered: the board could not be read".into();
+    };
+    let Some(agent) = agents.iter().find(|a| a.name == to) else {
+        // Almost always a typo in the name, and the flow log would show the
+        // message going to an agent that does not exist.
+        return format!("not delivered: no agent '{to}' on the board");
+    };
+    let Some(target) = agent.tmux_target.as_deref() else {
+        return format!("not delivered: {to} has no pane fleet can reach");
+    };
+    let Ok(tmux) = Tmux::detect(None) else {
+        return "not delivered: no tmux".into();
+    };
+    let text = msg::line(from, task, summary, body);
+    match msg::deliver(&tmux, target, &text) {
+        Ok(true) => format!("delivered to {to} in {target}"),
+        Ok(false) => format!("not delivered: nothing running in {target}"),
+        Err(e) => format!("not delivered: {e}"),
+    }
 }
 
 /// `110x32`, as both `--snapshot` and `--preview` spell a size.
@@ -717,6 +756,9 @@ fn board(cmd: BoardCmd, path: Option<PathBuf>) -> Result<()> {
             body,
             task,
         } => {
+            // The record first. Delivery is best-effort and must never cost
+            // us the event: an agent that has died still said this, and the
+            // flow log is the only place that survives it.
             db.log_event(
                 "message",
                 Some(&from),
@@ -727,6 +769,7 @@ fn board(cmd: BoardCmd, path: Option<PathBuf>) -> Result<()> {
                 None,
             )?;
             println!("{from} -> {to}: {summary}");
+            println!("      {}", knock(&db, &from, &to, task.as_deref(), &summary, body.as_deref()));
         }
 
         BoardCmd::Note {

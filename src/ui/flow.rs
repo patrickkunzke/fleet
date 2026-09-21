@@ -7,7 +7,7 @@
 //! so both exist and `g` and `l` switch between them.
 //!
 //! Both read the events table, which is written by every state change and by
-//! `fleet msg`. A message sent with SendMessage and never logged does not
+//! `fleet board msg`. A message sent with SendMessage and never logged does not
 //! appear here — the board is the record, and an agent that does not report
 //! is invisible to it by construction.
 
@@ -125,7 +125,7 @@ fn graph(frame: &mut Frame, area: Rect, events: &[Event], rows: &[Row]) {
                 ]
                 .into_iter()
                 .chain(wrap(
-                    "agents record them with: fleet msg <from> <to> …",
+                    "agents send them with: fleet board msg <from> <to> …",
                     area.width,
                 ))
                 .map(|l| Line::from(Span::styled(l, theme::faint())))
@@ -636,7 +636,7 @@ mod tests {
     fn an_empty_graph_says_how_messages_get_recorded() {
         let out = drawn(View::Graph, &[], 0, 60, 14);
         assert!(out.contains("no messages logged yet"), "{out}");
-        assert!(out.contains("fleet msg"), "{out}");
+        assert!(out.contains("fleet board msg"), "{out}");
     }
 
     #[test]

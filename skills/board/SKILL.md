@@ -70,11 +70,17 @@ fleet board ready
 fleet board claim ENG-2553-1 accounts-svc
 ```
 
-Then message that agent with `SendMessage`, and log it so the flow pane sees it:
+Then interrupt that agent. One command both records the message and types it
+into their pane, so the record and the interrupt cannot come apart — you do
+not also need `SendMessage`:
 
 ```bash
 fleet board msg chief accounts-svc "start ENG-2553-1" --task ENG-2553-1
 ```
+
+It prints whether it landed. `not delivered` is worth reading rather than
+scrolling past: the usual cause is a typo in the name, and the flow log will
+otherwise show you messaging an agent that does not exist.
 
 Starting an agent does the registering for you — it opens a tmux pane, writes
 the row, and links the session once Claude Code reports it:

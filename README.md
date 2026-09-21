@@ -21,6 +21,7 @@ already runs on the machine.
 | `src/ui/` — frame, fleet rail, session pane, board rail | done, 57 tests |
 | `src/agent.rs` — starting an agent, repo discovery | done, 4 tests |
 | `src/brief.rs` — what an agent is told when it starts | done, 9 tests |
+| `src/msg.rs` — delivering a message to its recipient | done, 6 tests |
 | `n` to spawn from the rail | done |
 | `src/ui/flow.rs` — graph and log views | done, 18 tests |
 | `src/ui/mirror.rs` — the live tmux pane | done, 6 tests |
@@ -128,10 +129,26 @@ pane opens. `--command` overrides the whole thing and skips the briefing,
 which is how the plumbing is tested without starting a real agent.
 
 The flow views read the `events` table, which every state change and every
-`fleet msg` writes. **A message sent with `SendMessage` and never logged does
-not appear there** — the board is the record, so an agent that does not report
-is invisible to it by construction. That is why the `/board` skill asks for
-both: the board is the state, the message is the interrupt.
+`fleet board msg` writes. **A message sent with `SendMessage` and never logged
+does not appear there** — the board is the record, so an agent that does not
+report is invisible to it by construction.
+
+`fleet board msg` is both halves at once: it writes the event *and* types the
+message into the recipient's pane, so the interrupt and the record cannot come
+apart. Delivery is best-effort and never costs the write — an agent that has
+died still said what it said — and the CLI reports which happened:
+
+```
+accounts-svc -> chief: the parameter is yours
+      delivered to chief in fleet:chief
+```
+
+It arrives as one line, marked, so the agent does not read a peer as the
+person at the keyboard: `[fleet · accounts-svc · ENG-2553-2] the parameter is
+yours`. A body is folded onto the same line, because `send-keys` types what it
+is given and a newline would submit half a message; past ~1500 characters it
+is a document and the delivery says so rather than pasting a page into
+somebody's prompt.
 
 ## Working on the layout
 

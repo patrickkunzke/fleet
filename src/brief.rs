@@ -72,8 +72,9 @@ pub fn worker(name: &str, repo: &Path, task: Option<&Task>, body: Option<&str>) 
         "\nMark it running with `fleet board start {}` when you begin, and \
          `fleet board done {}` when it is finished. If you are blocked, \
          `fleet board block {} --reason ...` and tell the chief with \
-         `fleet msg {} chief '...'`, because the board is the record and the \
-         message is what interrupts them.\n\n\
+         `fleet board msg {} chief '...'`, which both records it and lands in \
+         their pane — the board is the record and the message is what \
+         interrupts them.\n\n\
          Start by reading enough of the repository to say back what you intend \
          to do, then wait for me. Be brief.",
         task.key, task.key, task.key, name
