@@ -7,6 +7,7 @@
 //! It migrates in one step when the TUI needs it.
 
 mod agent;
+mod brief;
 mod db;
 mod registry;
 mod tmux;
@@ -86,10 +87,14 @@ enum Command {
         /// The repository the agent works in.
         #[arg(long)]
         repo: PathBuf,
-        /// What to run. Overridable so the plumbing can be exercised without
-        /// starting a real agent.
-        #[arg(long, default_value = "claude")]
-        command: String,
+        /// The task it is for, as a board key. The agent opens already
+        /// briefed on it, and the board records it as claimed.
+        #[arg(long)]
+        task: Option<String>,
+        /// What to run instead. Overriding it skips the briefing, which is
+        /// how the plumbing is exercised without starting a real agent.
+        #[arg(long)]
+        command: Option<String>,
         /// tmux session to spawn into. Defaults to the current one, else "fleet".
         #[arg(long)]
         session: Option<String>,
@@ -315,27 +320,60 @@ fn main() -> Result<()> {
         Command::Spawn {
             name,
             repo,
+            task,
             command,
             session,
             timeout,
             db,
-        } => spawn(&name, &repo, &command, session.as_deref(), timeout, db),
+        } => spawn(
+            &name,
+            &repo,
+            task.as_deref(),
+            command.as_deref(),
+            session.as_deref(),
+            timeout,
+            db,
+        ),
     }
 }
 
 /// Start an agent and join the three sources back together: a tmux pane, the
 /// Claude Code session that appears inside it, and the row on the board.
+#[allow(clippy::too_many_arguments)]
 fn spawn(
     name: &str,
     repo: &Path,
-    command: &str,
+    task: Option<&str>,
+    command: Option<&str>,
     session: Option<&str>,
     timeout: u64,
     db_path: Option<PathBuf>,
 ) -> Result<()> {
     let tmux = Tmux::detect(session)?;
     let db = Db::open(db_path.unwrap_or_else(db::default_path))?;
-    let spawned = agent::start(&tmux, &db, name, repo, command, agent::Naming::Unique)?;
+
+    // Read the task before the pane exists: a key that is not on the board
+    // is a typo worth refusing, not an agent to start and then correct.
+    let assignment = task.map(|key| db.show(key)).transpose()?;
+    let command = match command {
+        Some(given) => given.to_string(),
+        None => {
+            let brief = assignment
+                .as_ref()
+                .map_or_else(
+                    || brief::worker(name, repo, None, None),
+                    |(t, body, _)| brief::worker(name, repo, Some(t), body.as_deref()),
+                );
+            brief::command(&brief)
+        }
+    };
+
+    let spawned = agent::start(&tmux, &db, name, repo, &command, agent::Naming::Unique)?;
+    if let Some(key) = task {
+        // The agent has been told; the board has to agree, or the chief
+        // dispatches the same task twice.
+        db.claim(key, &spawned.name)?;
+    }
     println!(
         "{}  pane {} in session {}",
         spawned.name, spawned.pane.id, spawned.pane.session

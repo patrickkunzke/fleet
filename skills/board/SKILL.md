@@ -80,8 +80,17 @@ Starting an agent does the registering for you — it opens a tmux pane, writes
 the row, and links the session once Claude Code reports it:
 
 ```bash
-fleet spawn accounts-svc --repo ~/Code/acme/service/accounts-service
+fleet spawn accounts-svc --repo ~/Code/acme/service/accounts-service --task ENG-2553-1
 ```
+
+**Pass `--task`.** The agent then opens already briefed: it is told which repo
+is its own, what the task is, what the task waits on, and how to report. You
+do not have to repeat any of it, and the board records the task as claimed in
+the same step, so you cannot dispatch it twice. Without `--task` the agent
+starts knowing only that it is a fleet worker, and has to go looking for work.
+
+A key that is not on the board is refused before the pane opens, so add the
+task first.
 
 Use `fleet board agent …` only to correct or add to a row afterwards, such as
 recording the branch it ended up on.
@@ -97,7 +106,9 @@ unblocked: ENG-2553-2
 
 ## As a worker
 
-You were handed a task key. The protocol is four commands:
+You were handed a task key — in your opening brief if the chief dispatched you
+with `--task`, otherwise from `fleet board agent <your-name>`. The protocol is
+four commands:
 
 ```bash
 fleet board start ENG-2553-2                              # picking it up

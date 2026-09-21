@@ -37,6 +37,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Paragraph};
 
 use crate::agent;
+use crate::brief;
 use crate::db::{self, Db};
 use crate::registry::{self, Registry, Watcher};
 use crate::tmux::Tmux;
@@ -461,7 +462,16 @@ impl App {
     }
 
     fn start_agent(&mut self, chosen: &agent::Candidate) {
-        self.launch(&chosen.name, &chosen.path.clone(), agent::Naming::Unique);
+        // Started by hand rather than dispatched, so there is no task yet.
+        // The brief says how to go and look for one, which is better than an
+        // agent sitting at an empty prompt waiting to be told it exists.
+        let brief = brief::worker(&chosen.name, &chosen.path, None, None);
+        self.launch(
+            &chosen.name,
+            &chosen.path.clone(),
+            agent::Naming::Unique,
+            &brief,
+        );
     }
 
     /// Take the selected agent off the rail.
@@ -537,7 +547,12 @@ impl App {
             return;
         }
         let Some(root) = self.root.clone() else { return };
-        self.launch("chief", &root, agent::Naming::Exact);
+        self.launch(
+            "chief",
+            &root,
+            agent::Naming::Exact,
+            &brief::chief(&root),
+        );
         if let Err(e) = self.db.upsert_agent("chief", Some("chief"), None, None, None, None) {
             self.status = Some(format!("cannot record the chief: {e}"));
         }
@@ -549,12 +564,13 @@ impl App {
     /// Waiting here for Claude Code to register itself would freeze the UI
     /// for several seconds on every spawn, which is how a key stops being
     /// worth pressing.
-    fn launch(&mut self, name: &str, repo: &Path, naming: agent::Naming) {
+    fn launch(&mut self, name: &str, repo: &Path, naming: agent::Naming, brief: &str) {
         let Some(tmux) = self.tmux.clone() else {
             self.status = Some("no tmux — agents are started in tmux panes".into());
             return;
         };
-        let spawned = match agent::start(&tmux, &self.db, name, repo, "claude", naming) {
+        let command = brief::command(brief);
+        let spawned = match agent::start(&tmux, &self.db, name, repo, &command, naming) {
             Ok(s) => s,
             Err(e) => {
                 self.status = Some(format!("cannot start {name}: {e}"));
