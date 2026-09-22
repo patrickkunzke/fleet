@@ -98,6 +98,12 @@ END;
 
 -- ------------------------------------------------------------ task_deps ---
 -- A DAG. "task_id cannot start until depends_on is done."
+--
+-- The CHECK keeps a task off its own back; the acyclic half is enforced in
+-- add_dep, which walks the existing edges before writing a new one. It has to
+-- be, because a loop is not a row SQLite can look at and refuse — and the
+-- only symptom would be tasks that never appear in v_ready, with nothing
+-- anywhere saying why.
 
 CREATE TABLE IF NOT EXISTS task_deps (
   task_id    INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,

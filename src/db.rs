@@ -383,6 +383,21 @@ impl Db {
 
     #[allow(dead_code)]
     pub fn add_dep(&self, task: &str, depends_on: &str) -> Result<()> {
+        if task == depends_on {
+            bail!("'{task}' cannot wait on itself");
+        }
+        // Before the insert, because afterwards the damage is done and the
+        // only symptom is two tasks that never turn up in `ready` — no
+        // error, nothing on the board saying why, just work that never
+        // starts.
+        if let Some(path) = self.path_back(task, depends_on)? {
+            bail!(
+                "'{task}' cannot wait on '{depends_on}': that closes a loop, \
+                 because {path} already runs the other way, and nothing in a \
+                 loop ever becomes ready"
+            );
+        }
+
         let n = self.conn.execute(
             "INSERT OR IGNORE INTO task_deps (task_id, depends_on)
              SELECT t.id, d.id FROM tasks t, tasks d WHERE t.key = ?1 AND d.key = ?2",
@@ -392,6 +407,41 @@ impl Db {
             bail!("cannot add dependency: '{task}' or '{depends_on}' does not exist");
         }
         Ok(())
+    }
+
+    /// The chain by which `depends_on` already waits on `task`, if there is
+    /// one. Its existence is what would make a new edge between them a loop.
+    ///
+    /// Reported as the whole chain rather than a yes: a loop closed at the
+    /// twelfth task is not one anybody can see by reading the board, and
+    /// "that would be circular" leaves them to find it themselves.
+    fn path_back(&self, task: &str, depends_on: &str) -> Result<Option<String>> {
+        let path: Option<String> = self
+            .conn
+            .query_row(
+                // Walking from `depends_on` through what it waits on. The
+                // depth cap is not about this graph, which has no loop yet
+                // by construction — it is so that a database which somehow
+                // already holds one cannot hang the command that refuses to
+                // add another.
+                "WITH RECURSIVE waits(id, path, depth) AS (
+                     SELECT id, key, 0 FROM tasks WHERE key = ?2
+                   UNION ALL
+                     SELECT d.depends_on, w.path || ' -> ' || t.key, w.depth + 1
+                       FROM task_deps d
+                       JOIN waits w ON d.task_id = w.id
+                       JOIN tasks t ON t.id = d.depends_on
+                      WHERE w.depth < 64
+                 )
+                 SELECT path FROM waits
+                   JOIN tasks t ON t.id = waits.id
+                  WHERE t.key = ?1 AND waits.depth > 0
+                  LIMIT 1",
+                params![task, depends_on],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(path)
     }
 
     fn dep_exists(&self, task: &str, depends_on: &str) -> Result<bool> {
@@ -877,6 +927,83 @@ mod tests {
             .unwrap();
         assert_eq!(a.session_id.as_deref(), Some("sess-1"));
         assert_eq!(a.repo.as_deref(), Some("/repo/setting"), "the repo survived");
+    }
+
+    fn chain(db: &Db, keys: &[&str]) {
+        for key in keys {
+            db.add_task(&NewTask {
+                key,
+                title: "a task",
+                repo: "/repo",
+                ..Default::default()
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_task_cannot_wait_on_itself() {
+        let db = Db::open_in_memory().unwrap();
+        chain(&db, &["A"]);
+        let err = db.add_dep("A", "A").unwrap_err().to_string();
+        assert!(err.contains("cannot wait on itself"), "{err}");
+    }
+
+    #[test]
+    fn two_tasks_cannot_wait_on_each_other() {
+        let db = Db::open_in_memory().unwrap();
+        chain(&db, &["A", "B"]);
+        db.add_dep("B", "A").unwrap();
+
+        let err = db.add_dep("A", "B").unwrap_err().to_string();
+        assert!(err.contains("closes a loop"), "{err}");
+        // Nothing was written: a refusal that half-applies is worse than the
+        // loop it was refusing.
+        assert!(!db.dep_exists("A", "B").unwrap());
+    }
+
+    #[test]
+    fn a_loop_closed_the_long_way_round_is_refused_too() {
+        // The case nobody spots by reading the board: four tasks, and the
+        // edge that closes it looks like any other.
+        let db = Db::open_in_memory().unwrap();
+        chain(&db, &["A", "B", "C", "D"]);
+        db.add_dep("B", "A").unwrap();
+        db.add_dep("C", "B").unwrap();
+        db.add_dep("D", "C").unwrap();
+
+        let err = db.add_dep("A", "D").unwrap_err().to_string();
+        assert!(err.contains("closes a loop"), "{err}");
+        // And says which way round, so it can be found without re-deriving
+        // it from twelve rows.
+        assert!(err.contains("D -> C -> B -> A"), "{err}");
+    }
+
+    #[test]
+    fn a_task_two_others_wait_on_is_not_a_loop() {
+        // The shape that matters: one task unblocks several, and they join
+        // again later. Refusing this would make the check useless.
+        let db = Db::open_in_memory().unwrap();
+        chain(&db, &["shared", "left", "right", "join"]);
+        db.add_dep("left", "shared").unwrap();
+        db.add_dep("right", "shared").unwrap();
+        db.add_dep("join", "left").unwrap();
+        db.add_dep("join", "right").unwrap();
+
+        assert_eq!(db.ready().unwrap().len(), 1, "only 'shared' is ready");
+        db.transition("shared", State::Done, None).unwrap();
+        let ready: Vec<_> = db.ready().unwrap().into_iter().map(|t| t.key).collect();
+        assert_eq!(ready, vec!["left", "right"], "both, and not the join");
+    }
+
+    #[test]
+    fn saying_the_same_dependency_twice_is_still_fine() {
+        // It is already there, so it is not a loop — the check must not read
+        // the edge being added as one that already runs the other way.
+        let db = Db::open_in_memory().unwrap();
+        chain(&db, &["A", "B"]);
+        db.add_dep("B", "A").unwrap();
+        db.add_dep("B", "A").unwrap();
     }
 
     #[test]

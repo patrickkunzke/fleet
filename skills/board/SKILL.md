@@ -62,6 +62,11 @@ fleet board add ENG-2553-2 ~/Code/acme/service/billing-service "consume the serv
   --epic ENG-2553 --dep ENG-2553-1
 ```
 
+Dependencies must stay a one-way flow. `fleet board dep` refuses an edge that
+would close a loop, and names the chain that already runs the other way — take
+it as a sign you have the direction backwards, because tasks in a loop would
+never appear in `ready` at all.
+
 Dispatching — `ready` is the queue, and it only ever lists tasks whose
 dependencies are all done:
 

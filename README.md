@@ -15,7 +15,7 @@ already runs on the machine.
 | `skills/board` — the `/board` skill | done |
 | `src/registry.rs` — session discovery and watching | done, 6 tests |
 | `src/transcript.rs` — transcript reading and tailing | done, 8 tests |
-| `src/db.rs` — fleet.db reads and writes | done, 11 tests |
+| `src/db.rs` — fleet.db reads and writes | done, 19 tests |
 | `fleet board` — the whole board, in the binary | done, 13 tests |
 | `src/tmux.rs` — spawning and pane control | done, 8 tests |
 | `src/ui/` — frame, fleet rail, session pane, board rail | done, 57 tests |
