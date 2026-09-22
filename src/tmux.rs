@@ -33,6 +33,19 @@ pub struct Pane {
     pub cwd: PathBuf,
 }
 
+/// What the program inside a pane expects, as tmux understands it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneMode {
+    /// On the alternate screen, which has no scrollback: nothing ever falls
+    /// off the top of it.
+    pub alternate: bool,
+    /// Asked to receive mouse events itself.
+    pub mouse: bool,
+    /// Wants them in SGR encoding, which is the only one without a limit on
+    /// how far right a report can point.
+    pub sgr: bool,
+}
+
 #[derive(Clone)]
 pub struct Tmux {
     bin: PathBuf,
@@ -248,6 +261,46 @@ impl Tmux {
     /// Separate from send_line because these are the things a line of text
     /// cannot express, and they are exactly what a permission prompt or a
     /// runaway turn needs.
+    /// What the program in a pane has asked the terminal for.
+    ///
+    /// Asked of tmux rather than worked out from the byte stream. The modes
+    /// are set once at startup, and fleet attaches to agents that have been
+    /// running for hours: `capture-pane` reproduces the screen, not the
+    /// flags behind it, and `pipe-pane` only ever carries what comes next.
+    /// tmux has been tracking them all along.
+    pub fn mode(&self, pane: &Pane) -> Result<PaneMode> {
+        let out = self.run(&[
+            "display-message",
+            "-p",
+            "-t",
+            &pane.id,
+            "#{?alternate_on,1,0}#{?mouse_any_flag,1,0}#{?mouse_sgr_flag,1,0}",
+        ])?;
+        let flags: Vec<char> = out.trim().chars().collect();
+        let on = |i: usize| flags.get(i) == Some(&'1');
+        Ok(PaneMode {
+            alternate: on(0),
+            mouse: on(1),
+            sgr: on(2),
+        })
+    }
+
+    /// Send raw bytes to a pane, as hex, so that control characters survive.
+    ///
+    /// `send-keys -l` is for text and would type an escape sequence out as
+    /// its characters. This is for the sequences an application expects to
+    /// receive rather than to display — mouse reports, chiefly.
+    pub fn send_raw(&self, pane: &Pane, bytes: &[u8]) -> Result<()> {
+        let mut args: Vec<String> = ["send-keys", "-t", &pane.id, "-H"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        args.extend(bytes.iter().map(|b| format!("{b:02x}")));
+        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+        self.run(&borrowed)?;
+        Ok(())
+    }
+
     pub fn send_key(&self, pane: &Pane, key: &str) -> Result<()> {
         self.run(&["send-keys", "-t", &pane.id, key])?;
         Ok(())

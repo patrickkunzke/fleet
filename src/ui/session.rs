@@ -218,17 +218,16 @@ impl Pane {
     /// Scroll the mirrored screen. Ignored on a transcript, which has its own.
     /// Scroll the mirrored pane. The selection goes: it is anchored to cells
     /// on the screen, and everything under it has just moved.
+    /// A wheel notch over the live pane.
+    ///
+    /// Where the program inside asks for mouse events, it gets them: it is
+    /// in the alternate screen, which has no scrollback for us to move, and
+    /// it keeps its own history. Only a plain pane — a shell, a log — scrolls
+    /// through our view of it.
     pub fn scroll_mirror(&mut self, delta: isize) -> bool {
         self.selection = None;
-        self.scroll_mirror_inner(delta)
-    }
-
-    fn scroll_mirror_inner(&mut self, delta: isize) -> bool {
         match self.mirror.as_mut() {
-            Some(m) => {
-                m.scroll_by(delta);
-                true
-            }
+            Some(m) => m.scroll(delta).is_ok(),
             None => false,
         }
     }

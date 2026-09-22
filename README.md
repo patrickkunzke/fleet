@@ -24,7 +24,7 @@ already runs on the machine.
 | `src/msg.rs` — delivering a message to its recipient | done, 6 tests |
 | `n` to spawn from the rail | done |
 | `src/ui/flow.rs` — graph and log views | done, 18 tests |
-| `src/ui/mirror.rs` — the live tmux pane | done, 6 tests |
+| `src/ui/mirror.rs` — the live tmux pane | done, 8 tests |
 | `src/ui/selection.rs` — drag to copy from a pane | done, 6 tests |
 | `src/ui/clipboard.rs` — pbcopy and OSC 52 | done, 3 tests |
 | `src/ui/preview.rs` — the fixture fleet, for layout work | done, 4 tests |
@@ -85,6 +85,16 @@ that.
 **Typing goes to the agent.** Click a pane to point the keyboard at it, and
 everything you type reaches that session — arrows, Escape, Ctrl-C, its own
 line editor. The wheel scrolls it. There is no mode to enter first.
+
+**The wheel goes where the program inside expects it.** Claude Code runs on
+the alternate screen and captures the mouse itself, so there is no scrollback
+for fleet to move through and the wheel is forwarded to it as a mouse report —
+it scrolls its own history. A program on the alternate screen that did not ask
+for the mouse gets arrow keys instead, which is what tmux sends in the same
+situation. Only a plain pane, a shell or a log, is scrolled through fleet's own
+view of it. Which case applies is asked of tmux rather than worked out from the
+byte stream: the modes are set once at startup and fleet attaches to agents
+that have been running for hours.
 
 **Drag over an agent's output to copy it.** Capturing the mouse is what lets
 a pane be clicked and scrolled, and it takes the terminal's own selection

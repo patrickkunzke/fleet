@@ -1074,10 +1074,20 @@ fn spawn_registry(tx: Sender<Msg>) {
 
 /// A live agent writes to its transcript continuously, and those writes
 /// produce no event this loop would otherwise see.
+/// How often the mirrored pane is checked for new output.
+///
+/// This is the frame rate of the centre pane, and it has to be a terminal's
+/// rather than a dashboard's: at 400ms an agent's output arrived in visible
+/// chunks and the pane felt slower than the terminal it is a picture of.
+/// The check itself is one `stat`, and the loop skips the redraw when the
+/// file has not grown, so the cost of the shorter interval is a syscall
+/// twenty-five times a second.
+const MIRROR_POLL: Duration = Duration::from_millis(40);
+
 fn spawn_transcript_poll(tx: Sender<Msg>) {
     std::thread::spawn(move || {
         loop {
-            std::thread::sleep(Duration::from_millis(400));
+            std::thread::sleep(MIRROR_POLL);
             if tx.send(Msg::Transcript).is_err() {
                 return;
             }

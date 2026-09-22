@@ -119,6 +119,54 @@ impl Mirror {
     /// Ours, not the pane's: tmux would have to be put into copy mode, which
     /// produces no output for `pipe-pane` to carry, so the view would freeze
     /// rather than scroll. The parser already keeps the history.
+    /// A wheel notch over this pane, delivered the way the program inside
+    /// expects it.
+    ///
+    /// Three cases, and only the last is ours to handle. A program that
+    /// asked for the mouse gets a mouse report: Claude Code does, and it
+    /// keeps its own history. A program on the alternate screen that did
+    /// not gets arrow keys, which is what tmux sends in the same situation —
+    /// the alternate screen has no scrollback, so there is nothing for us to
+    /// move through. Only a plain pane is scrolled through our view of it.
+    pub fn scroll(&mut self, delta: isize) -> Result<()> {
+        let mode = self.tmux.mode(&self.pane)?;
+        let up = delta > 0;
+        let notches = delta.unsigned_abs();
+
+        if mode.mouse {
+            for _ in 0..notches {
+                self.wheel(up, mode.sgr)?;
+            }
+        } else if mode.alternate {
+            let key = if up { "Up" } else { "Down" };
+            for _ in 0..notches {
+                self.tmux.send_key(&self.pane, key)?;
+            }
+        } else {
+            self.scroll_by(delta);
+        }
+        Ok(())
+    }
+
+    /// One wheel report, aimed at the middle of the pane: a report carries a
+    /// position, some programs route by it, and the centre is inside every
+    /// pane and belongs to no edge.
+    fn wheel(&self, up: bool, sgr: bool) -> Result<()> {
+        let (rows, cols) = self.parser.screen().size();
+        let col = (cols / 2).max(1);
+        let row = (rows / 2).max(1);
+        let button = if up { 64u16 } else { 65 };
+        let bytes = if sgr {
+            format!("\x1b[<{button};{col};{row}M").into_bytes()
+        } else {
+            // X10 biases everything by 32 and cannot express a coordinate
+            // past 223. The cap is the protocol's, not ours.
+            let at = |n: u16| (32 + n.min(223)) as u8;
+            vec![0x1b, b'[', b'M', at(button), at(col), at(row)]
+        };
+        self.tmux.send_raw(&self.pane, &bytes)
+    }
+
     pub fn scroll_by(&mut self, delta: isize) {
         let at = self.parser.screen().scrollback() as isize;
         let wanted = (at + delta).max(0) as usize;
@@ -249,6 +297,82 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
         }
         mirror.contents()
+    }
+
+    #[test]
+    fn the_wheel_reaches_a_program_that_asked_for_the_mouse() {
+        // Claude Code does exactly this: alternate screen, so there is no
+        // scrollback for us to move, and mouse capture, so the wheel is its
+        // to handle. Scrolling our own view of such a pane moves nothing.
+        let Some(s) = Scratch::new("wheel") else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let got = dir.path().join("input");
+        let pane = s
+            .tmux
+            .spawn(
+                "grabby",
+                dir.path(),
+                &format!(
+                    // Raw mode, as any program that reads the mouse must
+                    // use: a wheel report carries no newline, and a tty in
+                    // canonical mode would hold it until one arrived.
+                    "sh -c 'stty raw -echo; \
+                     printf \"\\033[?1049h\\033[?1000h\\033[?1006h\"; cat > {}'",
+                    got.display()
+                ),
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+
+        let mut mirror = Mirror::attach(&s.tmux, pane, 40, 10).unwrap();
+        // Asked of tmux, not of the byte stream: the modes were set before
+        // we attached, which is the ordinary case for an agent that has been
+        // running for hours.
+        let mode = s.tmux.mode(mirror.pane()).unwrap();
+        assert!(mode.mouse, "the pane never asked for the mouse");
+        assert!(mode.alternate, "nor moved to the alternate screen");
+
+        mirror.scroll(1).unwrap();
+        for _ in 0..40 {
+            if std::fs::read(&got).is_ok_and(|b| !b.is_empty()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let seen = String::from_utf8_lossy(&std::fs::read(&got).unwrap_or_default()).to_string();
+        assert!(seen.contains("\x1b[<64;"), "not an SGR wheel-up report: {seen:?}");
+        assert!(seen.ends_with('M'), "{seen:?}");
+
+        mirror.scroll(-1).unwrap();
+        for _ in 0..40 {
+            if std::fs::read_to_string(&got).is_ok_and(|s| s.contains("65;")) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let seen = std::fs::read_to_string(&got).unwrap_or_default();
+        assert!(seen.contains("\x1b[<65;"), "wheel-down is a different button: {seen:?}");
+    }
+
+    #[test]
+    fn a_plain_pane_is_scrolled_through_our_own_view_of_it() {
+        // A shell or a log has real scrollback and never asked for the
+        // mouse; there is nothing to forward the wheel to.
+        let Some(s) = Scratch::new("plain") else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let pane = s
+            .tmux
+            .spawn("plain", dir.path(), "sh -c 'echo plain here; sleep 20'")
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        let mut mirror = Mirror::attach(&s.tmux, pane, 40, 10).unwrap();
+        settle(&mut mirror, "plain here");
+        let mode = s.tmux.mode(mirror.pane()).unwrap();
+        assert!(!mode.mouse, "a shell does not ask for the mouse");
+        assert!(!mode.alternate, "nor use the alternate screen");
+
+        // So the wheel moves our own view, and nothing is typed at it.
+        mirror.scroll(1).unwrap();
     }
 
     #[test]
