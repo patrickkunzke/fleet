@@ -14,80 +14,134 @@ use std::path::Path;
 
 use crate::db::Task;
 
+/// What an agent is started with.
+///
+/// Split in two because the halves carry differently. The role goes into the
+/// system prompt, where it outranks whatever a hook injects as context later
+/// and survives compaction; the opening is an ordinary first turn, which is
+/// the right weight for "here is what to do now" and the wrong weight for
+/// "here is who you are".
+pub struct Brief {
+    pub role: String,
+    pub opening: String,
+    /// Tools withheld for the whole session.
+    pub deny: &'static [&'static str],
+}
+
+/// The tools that change a file. Withheld from the chief, because asking it
+/// not to do the work was not enough: given a ticket touching one repository
+/// it did the work itself, which is the one thing it is not for.
+const EDITING: &[&str] = &["Edit", "Write", "NotebookEdit"];
+
 /// The session you talk to. It plans, it dispatches, and it is the only one
 /// that writes tasks.
-pub fn chief(root: &Path) -> String {
+pub fn chief(root: &Path) -> Brief {
     let where_ = root.display();
-    format!(
-        "You are the chief of staff of a fleet of Claude Code sessions working \
-         across the repositories under {where_}.\n\n\
-         Use the board skill for everything shared: `fleet board --help`. The \
-         board is what the other agents read, so anything they must act on \
-         goes there rather than staying in this conversation.\n\n\
-         Your job is to plan and delegate, not to do the work. Break an ask \
-         into one task per repository with `fleet board add`, record what \
-         blocks what with `--dep`, and start an agent for each ready task with \
-         `fleet spawn <name> --repo <path> --task <key>` — that agent opens \
-         already briefed on its task, so you do not have to repeat it.\n\n\
-         Begin by running `fleet board ls` and telling me where things stand, \
-         then ask what I want to work on. Be brief."
-    )
+    Brief {
+        role: format!(
+            "You are the chief of staff of a fleet of Claude Code sessions working \
+             across the repositories under {where_}.\n\n\
+             You plan and delegate. You do not write code: the editing tools are \
+             withheld from this session deliberately, and that is not an obstacle \
+             to work around with shell commands. One task per repository, on the \
+             board, dispatched to an agent that does it.\n\n\
+             This holds when the work touches a single repository and looks small. \
+             Write the task, start an agent, let it do the work. What you are for \
+             is holding the whole picture; an hour spent editing one file is an \
+             hour in which nobody is.\n\n\
+             Everything shared goes through the board skill, `fleet board --help`. \
+             The board is what the other agents read, so anything they must act on \
+             belongs there rather than in this conversation. Dispatch with \
+             `fleet spawn <name> --repo <path> --task <key>`, which briefs the \
+             agent on its task for you, and interrupt one with \
+             `fleet board msg chief <name> '...'`."
+        ),
+        opening: "Run `fleet board ls` and tell me where things stand, then ask \
+                  what I want to work on. Be brief."
+            .to_string(),
+        deny: EDITING,
+    }
 }
 
 /// A worker, and what it is for.
-pub fn worker(name: &str, repo: &Path, task: Option<&Task>, body: Option<&str>) -> String {
+pub fn worker(name: &str, repo: &Path, task: Option<&Task>, body: Option<&str>) -> Brief {
     let here = repo.display();
-    let mut out = format!(
+    let role = format!(
         "You are `{name}`, one agent of a fleet working across several \
          repositories. Yours is {here}; stay in it — another agent has each of \
-         the others, and two agents editing one repo is how the fleet breaks.\n\n\
-         Use the board skill to report: `fleet board --help`. The board is how \
-         the chief of staff and the other agents see what you are doing, so \
-         state changes and blockers go there as they happen, not at the end.\n\n"
+         the others, and two agents editing one repository is how the fleet \
+         breaks.\n\n\
+         Report through the board skill, `fleet board --help`. It is how the \
+         chief of staff and the other agents see what you are doing, so state \
+         changes and blockers go there as they happen, not at the end. To reach \
+         the chief directly, `fleet board msg {name} chief '...'`, which both \
+         records the message and lands it in their session."
     );
 
     let Some(task) = task else {
-        out.push_str(&format!(
-            "You have no task yet. Run `fleet board agent {name}` to see \
-             whether one has been assigned, and `fleet board ready` for what \
-             is unblocked. If neither has anything for you, say so and wait."
-        ));
-        return out;
+        return Brief {
+            role,
+            opening: format!(
+                "You have no task yet. Run `fleet board agent {name}` to see \
+                 whether one has been assigned, and `fleet board ready` for what \
+                 is unblocked. If neither has anything for you, say so and wait."
+            ),
+            deny: &[],
+        };
     };
 
-    out.push_str(&format!("Your task is {} — {}.\n", task.key, task.title));
+    let mut opening = format!("Your task is {} — {}.\n", task.key, task.title);
     if let Some(body) = body.map(str::trim).filter(|b| !b.is_empty()) {
-        out.push_str(&format!("\n{body}\n"));
+        opening.push_str(&format!("\n{body}\n"));
     }
     if !task.waiting_on.is_empty() {
         // Said outright, because an agent that starts work on a blocked task
         // writes code against an interface that does not exist yet.
-        out.push_str(&format!(
+        opening.push_str(&format!(
             "\nIt waits on {}. Do not start until those are done — check with \
              `fleet board ls`. You can read the code and plan in the meantime.\n",
             task.waiting_on.join(", ")
         ));
     }
-    out.push_str(&format!(
+    opening.push_str(&format!(
         "\nMark it running with `fleet board start {}` when you begin, and \
          `fleet board done {}` when it is finished. If you are blocked, \
-         `fleet board block {} --reason ...` and tell the chief with \
-         `fleet board msg {} chief '...'`, which both records it and lands in \
-         their pane — the board is the record and the message is what \
-         interrupts them.\n\n\
+         `fleet board block {} --reason ...` and tell the chief.\n\n\
          Start by reading enough of the repository to say back what you intend \
          to do, then wait for me. Be brief.",
-        task.key, task.key, task.key, name
+        task.key, task.key, task.key
     ));
+
+    Brief {
+        role,
+        opening,
+        deny: &[],
+    }
+}
+
+/// The command line that starts the agent.
+///
+/// The opening is a positional argument rather than typed into the pane once
+/// it is up: typing means waiting for a REPL that has not said it is ready,
+/// and half a prompt delivered mid-start is worse than none. `--disallowed-tools`
+/// is variadic, so it goes last — anything after it would be eaten.
+pub fn command(brief: &Brief) -> String {
+    let mut out = format!(
+        "claude --append-system-prompt {} {}",
+        quote(&brief.role),
+        quote(&brief.opening)
+    );
+    if !brief.deny.is_empty() {
+        out.push_str(" --disallowed-tools ");
+        out.push_str(&brief.deny.join(" "));
+    }
     out
 }
 
-/// `claude '<brief>'` — the agent starts with this as its first prompt.
-///
-/// Single quotes, because the brief is prose with apostrophes, backticks and
+/// Single quotes, because a brief is prose with apostrophes, backticks and
 /// newlines in it, and a shell would otherwise read some of it as commands.
-pub fn command(brief: &str) -> String {
-    format!("claude '{}'", brief.replace('\'', r"'\''"))
+fn quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', r"'\''"))
 }
 
 #[cfg(test)]
@@ -109,24 +163,57 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_chief_is_told_it_dispatches_rather_than_does() {
-        let brief = chief(Path::new("/w"));
-        assert!(brief.contains("chief of staff"));
-        assert!(brief.contains("/w"), "the workspace it covers");
-        assert!(brief.contains("fleet spawn"), "how to delegate");
-        assert!(brief.contains("plan and delegate, not to do the work"));
+    /// Everything the session is told, whichever half it arrives in.
+    fn all(b: &Brief) -> String {
+        format!("{}\n{}", b.role, b.opening)
     }
 
     #[test]
-    fn a_worker_is_told_its_task_and_where_it_may_work() {
+    fn the_chief_cannot_edit_anything() {
+        // Asking was not enough: given a ticket touching one repository it
+        // did the work itself. The tools are withheld now.
+        let b = chief(Path::new("/w"));
+        assert!(b.deny.contains(&"Edit"), "{:?}", b.deny);
+        assert!(b.deny.contains(&"Write"), "{:?}", b.deny);
+        assert!(command(&b).contains("--disallowed-tools Edit Write"), "{}", command(&b));
+    }
+
+    #[test]
+    fn the_chief_is_told_that_one_small_repo_is_still_delegated() {
+        // The case it got wrong, named outright rather than left to be
+        // inferred from "plan and delegate".
+        let b = chief(Path::new("/w"));
+        assert!(b.role.contains("chief of staff"));
+        assert!(b.role.contains("/w"), "the workspace it covers");
+        assert!(b.role.contains("single repository"), "{}", b.role);
+        assert!(b.role.contains("fleet spawn"), "how to delegate");
+    }
+
+    #[test]
+    fn who_an_agent_is_goes_in_the_system_prompt_and_what_to_do_now_does_not() {
+        // The role has to outrank whatever a hook injects as context later,
+        // and has to survive compaction; the opening is a first turn.
+        let b = chief(Path::new("/w"));
+        assert!(b.role.contains("You are the chief"));
+        assert!(!b.opening.contains("You are the chief"));
+        assert!(b.opening.contains("fleet board ls"));
+
+        let cmd = command(&b);
+        let role_at = cmd.find("You are the chief").unwrap();
+        let flag_at = cmd.find("--append-system-prompt").unwrap();
+        assert!(flag_at < role_at, "the role is the appended system prompt");
+    }
+
+    #[test]
+    fn a_worker_may_edit_and_is_told_which_repo_is_its_own() {
         let t = task("ENG-2553-2", &[]);
-        let brief = worker("billing-svc", Path::new("/w/billing-service"), Some(&t), None);
-        assert!(brief.contains("`billing-svc`"));
-        assert!(brief.contains("/w/billing-service"));
-        assert!(brief.contains("ENG-2553-2"));
-        assert!(brief.contains("consume the parameter"));
-        assert!(brief.contains("fleet board done ENG-2553-2"));
+        let b = worker("billing-svc", Path::new("/w/billing-service"), Some(&t), None);
+        assert!(b.deny.is_empty(), "a worker is the one that does the work");
+        assert!(b.role.contains("`billing-svc`"));
+        assert!(b.role.contains("/w/billing-service"));
+        assert!(b.opening.contains("ENG-2553-2"));
+        assert!(b.opening.contains("consume the parameter"));
+        assert!(b.opening.contains("fleet board done ENG-2553-2"));
     }
 
     #[test]
@@ -134,40 +221,68 @@ mod tests {
         // An agent that begins a blocked task writes code against an
         // interface that does not exist yet.
         let t = task("ENG-2553-2", &["ENG-2553-1", "ENG-2553-3"]);
-        let brief = worker("billing-svc", Path::new("/w"), Some(&t), None);
-        assert!(brief.contains("waits on ENG-2553-1, ENG-2553-3"), "{brief}");
-        assert!(brief.contains("Do not start"));
+        let b = worker("billing-svc", Path::new("/w"), Some(&t), None);
+        assert!(b.opening.contains("waits on ENG-2553-1, ENG-2553-3"), "{}", b.opening);
+        assert!(b.opening.contains("Do not start"));
     }
 
     #[test]
     fn an_agent_with_no_task_is_told_how_to_find_one() {
-        let brief = worker("storefront", Path::new("/w/storefront"), None, None);
-        assert!(brief.contains("no task yet"));
-        assert!(brief.contains("fleet board agent storefront"));
-        assert!(!brief.contains("Mark it running"), "there is nothing to mark");
+        let b = worker("storefront", Path::new("/w/storefront"), None, None);
+        assert!(b.opening.contains("no task yet"));
+        assert!(b.opening.contains("fleet board agent storefront"));
+        assert!(!b.opening.contains("Mark it running"), "there is nothing to mark");
     }
 
     #[test]
     fn the_body_of_a_task_reaches_the_agent() {
         let t = task("ENG-2553-2", &[]);
-        let brief = worker("c", Path::new("/w"), Some(&t), Some("  the old header is the fallback  "));
-        assert!(brief.contains("the old header is the fallback"));
-        // Not the surrounding whitespace, which is an artefact of however it
-        // was written to the board.
-        assert!(!brief.contains("  the old header"));
+        let b = worker("c", Path::new("/w"), Some(&t), Some("  the old header is the fallback  "));
+        assert!(all(&b).contains("the old header is the fallback"));
+        // Not the surrounding whitespace, an artefact of however it was
+        // written to the board.
+        assert!(!all(&b).contains("  the old header"));
+    }
+
+    #[test]
+    fn every_agent_is_told_the_command_that_actually_exists() {
+        // It was `fleet msg` for one commit, which is not a command.
+        for b in [
+            chief(Path::new("/w")),
+            worker("c", Path::new("/w"), None, None),
+        ] {
+            let text = all(&b);
+            assert!(!text.contains("fleet msg "), "{text}");
+            assert!(text.contains("fleet board msg"), "{text}");
+        }
     }
 
     #[test]
     fn a_brief_with_quotes_in_it_survives_the_shell() {
         // Apostrophes are ordinary in prose and fatal in a single-quoted
-        // shell word; the whole rest of the brief would be read as commands.
-        let out = command("don't stop; rm -rf / # 'nested'");
-        assert!(out.starts_with("claude '"));
-        assert!(out.ends_with('\''));
-        assert_eq!(
-            out,
-            r"claude 'don'\''t stop; rm -rf / # '\''nested'\'''"
-        );
+        // shell word; the rest of the brief would be read as commands.
+        assert_eq!(quote("don't stop; rm -rf /"), r"'don'\''t stop; rm -rf /'");
+    }
+
+    #[test]
+    fn the_deny_list_goes_last_because_it_swallows_what_follows_it() {
+        // --disallowed-tools is variadic: anything after it is read as
+        // another tool name rather than as the prompt.
+        let cmd = command(&chief(Path::new("/w")));
+        assert!(cmd.ends_with("--disallowed-tools Edit Write NotebookEdit"), "{cmd}");
+    }
+
+    #[test]
+    fn the_shell_reads_a_quoted_brief_back_as_one_word() {
+        // The real check: hand it to a shell and see what the program gets.
+        let b = chief(Path::new("/w/it's here"));
+        let printed = format!("printf %s {}", quote(&b.role));
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&printed)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), b.role);
     }
 
     #[test]
@@ -175,20 +290,24 @@ mod tests {
         use crate::tmux::Tmux;
         use std::time::Duration;
 
-        // The whole path this feature rests on: our quoting, tmux's own
-        // parsing of the command it is handed, and the shell in the pane.
-        // Three layers, each of which would happily eat an apostrophe.
+        // The whole path this rests on: our quoting, tmux's parsing of the
+        // command it is handed, and the shell in the pane. Three layers,
+        // each of which would happily eat an apostrophe.
         let name = format!("fleet-brief-{}", std::process::id());
         let Ok(tmux) = Tmux::detect(Some(&name)) else { return };
         let tmux = tmux.on_socket(&name);
 
         let dir = tempfile::tempdir().unwrap();
         let landed = dir.path().join("argv");
-        // A stand-in for Claude Code that records the prompt it was given.
         let fake = dir.path().join("claude");
+        // A stand-in for Claude Code that records what it was given: the
+        // appended system prompt, then the opening, then the deny list.
         std::fs::write(
             &fake,
-            format!("#!/bin/sh\nprintf %s \"$1\" > {}\n", landed.display()),
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\000' \"$a\"; done > {}\n",
+                landed.display()
+            ),
         )
         .unwrap();
         #[cfg(unix)]
@@ -199,14 +318,13 @@ mod tests {
 
         let t = task("ENG-2553-2", &["ENG-2553-1"]);
         let expected = worker("billing-svc", dir.path(), Some(&t), Some("the old header is the fallback"));
-        let command = format!(
+        let line = format!(
             "PATH={}:$PATH {}",
             dir.path().display(),
             command(&expected)
         );
 
-        let spawned = tmux.spawn("briefed", dir.path(), &command);
-        assert!(spawned.is_ok(), "{spawned:?}");
+        assert!(tmux.spawn("briefed", dir.path(), &line).is_ok());
         for _ in 0..40 {
             if landed.is_file() {
                 break;
@@ -216,21 +334,11 @@ mod tests {
         let got = std::fs::read_to_string(&landed).unwrap_or_default();
         let _ = tmux.kill_server();
 
-        assert_eq!(got, expected, "the brief did not survive the trip");
-        assert!(got.contains("ENG-2553-2"), "and it is the right brief");
-    }
-
-    #[test]
-    fn the_shell_reads_a_quoted_brief_back_as_one_word() {
-        // The real check: hand it to a shell and see what the program gets.
-        let brief = chief(Path::new("/w/it's here"));
-        let quoted = command(&brief);
-        let printed = quoted.replacen("claude ", "printf %s ", 1);
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(&printed)
-            .output()
-            .unwrap();
-        assert_eq!(String::from_utf8_lossy(&out.stdout), brief);
+        // NUL-separated, because a role runs to several lines and a newline
+        // would not tell one argument from the next.
+        let args: Vec<&str> = got.split('\0').filter(|a| !a.is_empty()).collect();
+        assert_eq!(args.first(), Some(&"--append-system-prompt"), "{args:?}");
+        assert_eq!(args.get(1), Some(&expected.role.as_str()), "the role, intact");
+        assert_eq!(args.get(2), Some(&expected.opening.as_str()), "then the opening");
     }
 }

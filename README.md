@@ -20,7 +20,7 @@ already runs on the machine.
 | `src/tmux.rs` — spawning and pane control | done, 8 tests |
 | `src/ui/` — frame, fleet rail, session pane, board rail | done, 57 tests |
 | `src/agent.rs` — starting an agent, repo discovery | done, 4 tests |
-| `src/brief.rs` — what an agent is told when it starts | done, 9 tests |
+| `src/brief.rs` — what an agent is told when it starts | done, 13 tests |
 | `src/msg.rs` — delivering a message to its recipient | done, 6 tests |
 | `n` to spawn from the rail | done |
 | `src/ui/flow.rs` — graph and log views | done, 18 tests |
@@ -121,13 +121,22 @@ already running. That is who you talk to; it plans the work and starts the
 agents that do it. The rail lists only agents the fleet started, not every
 session on the machine.
 
-**Every agent opens already briefed.** The brief goes in as Claude Code's own
-first prompt — `claude '<brief>'` — rather than being typed into the pane
-afterwards, because a REPL that has not said it is ready will swallow half of
-it. The chief is told it plans and delegates rather than doing the work, and
-where its workspace is. A worker is told which repo is its own and not to
-leave it, and, when it was dispatched with `--task`, the task, the body, what
-it waits on, and how to report:
+**Every agent opens already briefed**, in two halves. Who it is goes into the
+system prompt with `--append-system-prompt`, where it outranks whatever a hook
+injects as context later and survives compaction; what to do now goes in as the
+first turn. Both as arguments rather than typed into the pane afterwards,
+because a REPL that has not said it is ready will swallow half of a prompt.
+
+**The chief cannot edit.** It starts with `--disallowed-tools Edit Write
+NotebookEdit`, because asking was not enough: given a ticket touching a single
+repository it did the work itself, which is the one thing it is not for. Its
+role says so outright, including for the small single-repo case. Not airtight —
+Bash can still write a file — but it removes the path of least resistance,
+which is what matters against a session that drifts.
+
+A worker keeps its tools and is told which repo is its own and not to leave it,
+and, when dispatched with `--task`, the task, the body, what it waits on, and
+how to report:
 
 ```bash
 fleet spawn billing-svc --repo ~/Code/acme/service/billing-service --task ENG-2553-2
@@ -135,8 +144,10 @@ fleet spawn billing-svc --repo ~/Code/acme/service/billing-service --task ENG-25
 
 That also claims the task on the board in the same step, so it cannot be
 dispatched twice, and a key that is not on the board is refused before the
-pane opens. `--command` overrides the whole thing and skips the briefing,
-which is how the plumbing is tested without starting a real agent.
+pane opens. `--role chief` starts a chief instead — the other brief, the deny
+list, and a row the rail draws as one. `--command` overrides the whole thing
+and skips the briefing, which is how the plumbing is tested without starting a
+real agent.
 
 The flow views read the `events` table, which every state change and every
 `fleet board msg` writes. **A message sent with `SendMessage` and never logged

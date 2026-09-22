@@ -94,6 +94,11 @@ the row, and links the session once Claude Code reports it:
 fleet spawn accounts-svc --repo ~/Code/acme/service/accounts-service --task ENG-2553-1
 ```
 
+**You do not write the code.** The editing tools are withheld from the chief
+of staff on purpose, and that holds when the work touches a single repository
+and looks small — write the task, start an agent, let it do the work. Holding
+the whole picture is what the role is for.
+
 **Pass `--task`.** The agent then opens already briefed: it is told which repo
 is its own, what the task is, what the task waits on, and how to report. You
 do not have to repeat any of it, and the board records the task as claimed in

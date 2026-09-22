@@ -564,7 +564,7 @@ impl App {
     /// Waiting here for Claude Code to register itself would freeze the UI
     /// for several seconds on every spawn, which is how a key stops being
     /// worth pressing.
-    fn launch(&mut self, name: &str, repo: &Path, naming: agent::Naming, brief: &str) {
+    fn launch(&mut self, name: &str, repo: &Path, naming: agent::Naming, brief: &brief::Brief) {
         let Some(tmux) = self.tmux.clone() else {
             self.status = Some("no tmux — agents are started in tmux panes".into());
             return;

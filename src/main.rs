@@ -92,6 +92,10 @@ enum Command {
         /// briefed on it, and the board records it as claimed.
         #[arg(long)]
         task: Option<String>,
+        /// `chief` for the session that plans and dispatches. It is briefed
+        /// differently and starts without the editing tools.
+        #[arg(long, default_value = "worker")]
+        role: String,
         /// What to run instead. Overriding it skips the briefing, which is
         /// how the plumbing is exercised without starting a real agent.
         #[arg(long)]
@@ -360,6 +364,7 @@ fn main() -> Result<()> {
             name,
             repo,
             task,
+            role,
             command,
             session,
             timeout,
@@ -368,6 +373,7 @@ fn main() -> Result<()> {
             &name,
             &repo,
             task.as_deref(),
+            &role,
             command.as_deref(),
             session.as_deref(),
             timeout,
@@ -383,6 +389,7 @@ fn spawn(
     name: &str,
     repo: &Path,
     task: Option<&str>,
+    role: &str,
     command: Option<&str>,
     session: Option<&str>,
     timeout: u64,
@@ -394,20 +401,32 @@ fn spawn(
     // Read the task before the pane exists: a key that is not on the board
     // is a typo worth refusing, not an agent to start and then correct.
     let assignment = task.map(|key| db.show(key)).transpose()?;
+    let chief = role == "chief";
     let command = match command {
         Some(given) => given.to_string(),
+        None if chief => brief::command(&brief::chief(repo)),
         None => {
-            let brief = assignment
-                .as_ref()
-                .map_or_else(
-                    || brief::worker(name, repo, None, None),
-                    |(t, body, _)| brief::worker(name, repo, Some(t), body.as_deref()),
-                );
+            let brief = assignment.as_ref().map_or_else(
+                || brief::worker(name, repo, None, None),
+                |(t, body, _)| brief::worker(name, repo, Some(t), body.as_deref()),
+            );
             brief::command(&brief)
         }
     };
 
-    let spawned = agent::start(&tmux, &db, name, repo, &command, agent::Naming::Unique)?;
+    let naming = if chief {
+        // One chief. Restarting it must replace the row rather than leave a
+        // chief-2 behind that nothing dispatches through.
+        agent::Naming::Exact
+    } else {
+        agent::Naming::Unique
+    };
+    let spawned = agent::start(&tmux, &db, name, repo, &command, naming)?;
+    if chief {
+        // The board has to agree, or the rail draws it as a worker and the
+        // TUI starts a second chief alongside it.
+        db.upsert_agent(&spawned.name, Some("chief"), None, None, None, None)?;
+    }
     if let Some(key) = task {
         // The agent has been told; the board has to agree, or the chief
         // dispatches the same task twice.
