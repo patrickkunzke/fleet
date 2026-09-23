@@ -226,6 +226,15 @@ impl Pane {
     /// Scroll the mirrored screen. Ignored on a transcript, which has its own.
     /// Scroll the mirrored pane. The selection goes: it is anchored to cells
     /// on the screen, and everything under it has just moved.
+    /// Scroll fleet's own view of a plain pane — a shell, a log — which has
+    /// real scrollback and never asked for the mouse.
+    pub fn scroll_local(&mut self, lines: isize) {
+        self.selection = None;
+        if let Some(m) = self.mirror.as_mut() {
+            m.scroll_by(lines);
+        }
+    }
+
     /// A wheel notch over the live pane.
     ///
     /// Where the program inside asks for mouse events, it gets them: it is

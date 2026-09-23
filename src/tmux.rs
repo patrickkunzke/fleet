@@ -341,6 +341,13 @@ impl Tmux {
         Ok(())
     }
 
+    /// One key, pressed `times` times, in a single tmux call.
+    pub fn send_repeated(&self, pane: &Pane, key: &str, times: usize) -> Result<()> {
+        let n = times.to_string();
+        self.run(&["send-keys", "-t", &pane.id, "-N", &n, key])?;
+        Ok(())
+    }
+
     pub fn send_key(&self, pane: &Pane, key: &str) -> Result<()> {
         self.run(&["send-keys", "-t", &pane.id, key])?;
         Ok(())

@@ -19,6 +19,7 @@ pub mod picker;
 pub mod mirror;
 pub mod preview;
 pub mod selection;
+pub mod sender;
 pub mod session;
 pub mod theme;
 
@@ -30,7 +31,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    self, DisableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::prelude::*;
@@ -55,6 +56,8 @@ enum Msg {
     /// A paste, whole. Only arrives because bracketed paste is on: without
     /// it the terminal types the text out, a keystroke at a time.
     Paste(String),
+    /// Word back from the thread that sends into panes.
+    Sent(sender::Reply),
     Mouse(MouseEvent),
     Registry,
     Tick,
@@ -100,6 +103,10 @@ pub struct App {
     /// Whether the terminal speaks the kitty keyboard protocol, and so
     /// whether it was asked to. Remembered so it can be given back.
     enhanced: bool,
+    /// Where keystrokes, pastes and the wheel go, off this thread. None
+    /// until the loop starts: a frame drawn for a test or a preview sends
+    /// nothing anywhere.
+    sender: Option<sender::Sender>,
     /// True between the prefix and the key it modifies.
     armed: bool,
     /// The repository picker, while it is open. An overlay rather than a
@@ -156,6 +163,7 @@ impl App {
             centre_at: Rect::ZERO,
             mouse: true,
             enhanced: false,
+            sender: None,
             armed: false,
             picker: None,
             tasks: Vec::new(),
@@ -308,9 +316,12 @@ impl App {
         let Some(tmux) = self.tmux.clone() else { return };
         self.centre.mirror_to_live();
         self.centre.clear_selection();
-        match self.centre.paste(&tmux, text) {
-            Ok(()) => self.echo(),
-            Err(e) => self.status = Some(e.to_string()),
+        if let (Some(sender), Some(pane)) = (&self.sender, self.centre.tmux_pane()) {
+            sender.send(pane, sender::Job::Paste(text.to_string()));
+            return;
+        }
+        if let Err(e) = self.centre.paste(&tmux, text) {
+            self.status = Some(e.to_string());
         }
     }
 
@@ -324,9 +335,19 @@ impl App {
         // a selection was drawn over, so the selection goes with it.
         self.centre.mirror_to_live();
         self.centre.clear_selection();
-        match self.centre.send(&tmux, &translated) {
-            Ok(()) => self.echo(),
-            Err(e) => self.status = Some(e.to_string()),
+        // Queued, not sent here: a send is a tmux process, and waiting on
+        // one per keystroke is what made typing lag. The pane's echo arrives
+        // through the mirror's own poll, not by sleeping for it.
+        if let (Some(sender), Some(pane)) = (&self.sender, self.centre.tmux_pane()) {
+            let job = match translated {
+                keys::Key::Literal(text) => sender::Job::Text(text),
+                keys::Key::Named(name) => sender::Job::Key(name),
+            };
+            sender.send(pane, job);
+            return;
+        }
+        if let Err(e) = self.centre.send(&tmux, &translated) {
+            self.status = Some(e.to_string());
         }
     }
 
@@ -366,8 +387,12 @@ impl App {
 
     /// Clicks and the wheel. The reason there is a prefix at all: a mouse
     /// needs no mode.
-    fn on_mouse(&mut self, ev: MouseEvent) {
+    /// Returns whether anything changed, so a stray event costs no frame.
+    fn on_mouse(&mut self, ev: MouseEvent) -> bool {
         let at = (ev.column, ev.row);
+        if matches!(ev.kind, MouseEventKind::Moved) {
+            return false;
+        }
         match ev.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if inside(self.rail_at, at) {
@@ -400,20 +425,13 @@ impl App {
             }
             // The live pane and the transcript each keep their own history,
             // so the wheel means the same thing over either.
-            MouseEventKind::ScrollUp if inside(self.centre_at, at) => {
-                if !self.centre.scroll_mirror(3) {
-                    self.centre.scroll_by(1, 3);
-                }
-            }
-            MouseEventKind::ScrollDown if inside(self.centre_at, at) => {
-                if !self.centre.scroll_mirror(-3) {
-                    self.centre.scroll_by(-1, 3);
-                }
-            }
+            MouseEventKind::ScrollUp if inside(self.centre_at, at) => self.wheel(1),
+            MouseEventKind::ScrollDown if inside(self.centre_at, at) => self.wheel(-1),
             MouseEventKind::ScrollUp => self.rail_key(KeyEvent::from(KeyCode::Up)),
             MouseEventKind::ScrollDown => self.rail_key(KeyEvent::from(KeyCode::Down)),
             _ => {}
         }
+        true
     }
 
     fn rail_key(&mut self, key: KeyEvent) {
@@ -548,7 +566,7 @@ impl App {
     fn take_mouse(&mut self, take: bool) {
         use std::io::stdout;
         let done = if take {
-            crossterm::execute!(stdout(), EnableMouseCapture)
+            crossterm::execute!(stdout(), CaptureMouse)
         } else {
             crossterm::execute!(stdout(), DisableMouseCapture)
         };
@@ -635,12 +653,27 @@ impl App {
     /// Without this a keystroke is invisible until the next poll, up to
     /// 400ms later, which reads as a dropped key. Bounded tightly: an agent
     /// that is busy will not echo at all, and the loop must not stall for it.
-    fn echo(&mut self) {
-        for _ in 0..4 {
-            std::thread::sleep(Duration::from_millis(15));
-            if self.centre.poll() {
-                return;
+    /// A wheel notch over the centre pane.
+    fn wheel(&mut self, notches: isize) {
+        self.centre.clear_selection();
+        match (&self.sender, self.centre.tmux_pane()) {
+            // Where the notch goes depends on what the program in the pane
+            // asked for, which only a tmux call can say — so it is decided
+            // on the sender's thread, not this one.
+            (Some(sender), Some(pane)) => sender.send(pane, sender::Job::Wheel(notches)),
+            _ => {
+                if !self.centre.scroll_mirror(notches * 3) {
+                    self.centre.scroll_by(notches, 3);
+                }
             }
+        }
+    }
+
+    /// What the sender reported back.
+    fn on_sent(&mut self, reply: sender::Reply) {
+        match reply {
+            sender::Reply::Failed(e) => self.status = Some(e),
+            sender::Reply::ScrollLocal(lines) => self.centre.scroll_local(lines),
         }
     }
 
@@ -932,6 +965,12 @@ pub fn run(db: Db, db_path: PathBuf, root: Option<PathBuf>) -> Result<()> {
     spawn_input(tx.clone(), paused.clone());
     spawn_registry(tx.clone());
     spawn_transcript_poll(tx.clone());
+    if let Some(tmux) = app.tmux.clone() {
+        let back = tx.clone();
+        app.sender = Some(sender::Sender::start(tmux, move |reply| {
+            let _ = back.send(Msg::Sent(reply));
+        }));
+    }
     spawn_ticker(tx);
 
     let mut term = ratatui::init();
@@ -941,28 +980,55 @@ pub fn run(db: Db, db_path: PathBuf, root: Option<PathBuf>) -> Result<()> {
     enter_modes(app.mouse, app.enhanced);
     let result = (|| -> Result<()> {
         term.draw(|f| app.draw(f))?;
-        while let Ok(msg) = rx.recv() {
-            match msg {
-                Msg::Key(key) => app.on_key(key),
-                Msg::Paste(text) => app.on_paste(&text),
-                Msg::Mouse(ev) => app.on_mouse(ev),
-                Msg::Registry | Msg::Tick => app.refresh(),
-                Msg::Transcript => {
-                    // Nothing new is the common case; redrawing anyway would
-                    // burn a frame twice a second for no visible change.
-                    if !app.centre.poll() {
-                        continue;
+        while let Ok(first) = rx.recv() {
+            // Everything already waiting, then one frame. One frame per
+            // message meant a wheel flick or a burst of output redrew the
+            // screen dozens of times to show the last of them.
+            let mut dirty = false;
+            let mut refresh = false;
+            let mut poll = false;
+            for msg in std::iter::once(first).chain(rx.try_iter()) {
+                match msg {
+                    Msg::Key(key) => {
+                        app.on_key(key);
+                        dirty = true;
                     }
+                    Msg::Paste(text) => {
+                        app.on_paste(&text);
+                        dirty = true;
+                    }
+                    Msg::Mouse(ev) => dirty |= app.on_mouse(ev),
+                    Msg::Sent(reply) => {
+                        app.on_sent(reply);
+                        dirty = true;
+                    }
+                    // Several of these in one batch are one re-read.
+                    Msg::Registry | Msg::Tick => refresh = true,
+                    Msg::Transcript => poll = true,
+                }
+                if app.quit || app.wants_attach {
+                    break;
                 }
             }
             if app.quit {
                 break;
             }
+            if refresh {
+                app.refresh();
+                dirty = true;
+            }
+            // Nothing new is the common case, and then there is no frame.
+            if poll && app.centre.poll() {
+                dirty = true;
+            }
             if app.wants_attach {
                 app.wants_attach = false;
                 attach(&mut term, &mut app, &paused)?;
+                dirty = true;
             }
-            term.draw(|f| app.draw(f))?;
+            if dirty {
+                term.draw(|f| app.draw(f))?;
+            }
         }
         Ok(())
     })();
@@ -1088,6 +1154,25 @@ pub fn keys() -> Result<()> {
     Ok(())
 }
 
+/// Clicks, drags and the wheel — and not every movement of the pointer.
+///
+/// crossterm's EnableMouseCapture also turns on any-motion tracking, mode
+/// 1003, which reports the pointer every time it crosses a cell. Fleet uses
+/// none of those reports, and each one was a message and a redrawn frame.
+/// 1002 still reports movement while a button is held, which is what a drag
+/// to select needs.
+struct CaptureMouse;
+
+impl crossterm::Command for CaptureMouse {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        f.write_str(concat!(
+            "\x1b[?1000h", // presses and releases, and the wheel
+            "\x1b[?1002h", // movement, but only with a button down
+            "\x1b[?1006h", // SGR coordinates, with no 223-column limit
+        ))
+    }
+}
+
 /// Ask the terminal fleet runs in for what it needs, all in one place.
 ///
 /// Three modes, each for a reason the pane would otherwise feel wrong for.
@@ -1100,7 +1185,7 @@ fn enter_modes(mouse: bool, enhanced: bool) {
     use crossterm::event::{EnableBracketedPaste, KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
     let mut out = std::io::stdout();
     if mouse {
-        let _ = crossterm::execute!(out, EnableMouseCapture);
+        let _ = crossterm::execute!(out, CaptureMouse);
     }
     let _ = crossterm::execute!(out, EnableBracketedPaste);
     if enhanced {
@@ -1480,6 +1565,18 @@ mod tests {
         let Some(home) = home else { return };
         assert_eq!(shorten(&home.join("Code/fleet"), 40), "~/Code/fleet");
         assert_eq!(shorten(&home, 40), "~");
+    }
+
+    #[test]
+    fn the_mouse_is_asked_for_clicks_and_drags_but_not_every_movement() {
+        // Any-motion tracking reported the pointer every time it crossed a
+        // cell, and each report was a message and a frame. Fleet uses none.
+        let mut ansi = String::new();
+        crossterm::Command::write_ansi(&CaptureMouse, &mut ansi).unwrap();
+        assert!(ansi.contains("?1000h"), "presses and the wheel");
+        assert!(ansi.contains("?1002h"), "drags, for selecting");
+        assert!(ansi.contains("?1006h"), "coordinates past column 223");
+        assert!(!ansi.contains("?1003h"), "every pointer movement: {ansi:?}");
     }
 
     #[test]

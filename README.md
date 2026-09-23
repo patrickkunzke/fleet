@@ -25,6 +25,7 @@ already runs on the machine.
 | `n` to spawn from the rail | done |
 | `src/ui/flow.rs` — graph and log views | done, 18 tests |
 | `src/ui/mirror.rs` — the live tmux pane | done, 8 tests |
+| `src/ui/sender.rs` — input to panes, off the UI thread | done, 8 tests |
 | `src/ui/selection.rs` — drag to copy from a pane | done, 6 tests |
 | `src/ui/clipboard.rs` — pbcopy and OSC 52 | done, 3 tests |
 | `src/ui/preview.rs` — the fixture fleet, for layout work | done, 4 tests |
@@ -85,6 +86,19 @@ that.
 **Typing goes to the agent.** Click a pane to point the keyboard at it, and
 everything you type reaches that session — arrows, Escape, Ctrl-C, its own
 line editor. The wheel scrolls it. There is no mode to enter first.
+
+**Nothing the UI thread does waits on tmux.** A tmux call is a process, about
+11ms to start and hear back, and fleet used to make one per keystroke and four
+per wheel notch on the thread that draws — then sleep up to 60ms after each key
+waiting for the echo. A trackpad flick queued work faster than it drained; the
+pane froze, then kept scrolling after the hand had stopped. Keystrokes, pastes
+and the wheel now go to one sender thread, in order, which takes everything
+waiting at once and merges what it can: a run of typed characters is one
+`send-keys`, a flick is one call carrying every notch. The main loop drains
+everything queued before drawing a single frame, and the mouse is asked for
+clicks and drags only, not every movement of the pointer. Measured against a
+real pane: fifty notches leave the UI thread in 0.2ms and arrive in 80ms;
+forty-three keystrokes in 2.4ms and 48ms, in order.
 
 **Keys keep their modifiers, and a paste stays a paste.** Every keystroke is
 passed to tmux by name with every modifier on it — Option+Left is `M-Left`,
