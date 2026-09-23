@@ -65,6 +65,9 @@ enum Command {
         #[arg(long)]
         plain: bool,
     },
+    /// Show what each key arrives as, and what fleet sends on to an agent.
+    /// For when a key does not do in fleet what it does in the terminal.
+    Keys,
     /// Live sessions and what they are doing.
     Sessions {
         /// Follow the registry and report each change.
@@ -346,6 +349,7 @@ fn main() -> Result<()> {
             let (w, h) = parse_size(&size)?;
             ui::preview::run(w, h, view.as_deref(), plain)
         }
+        Command::Keys => ui::keys(),
         Command::Sessions { watch } => sessions(watch),
         Command::Session { name, watch, lines } => session(&name, watch, lines),
         Command::Board { cmd, db } => board(cmd, db),

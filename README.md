@@ -17,7 +17,7 @@ already runs on the machine.
 | `src/transcript.rs` — transcript reading and tailing | done, 8 tests |
 | `src/db.rs` — fleet.db reads and writes | done, 19 tests |
 | `fleet board` — the whole board, in the binary | done, 13 tests |
-| `src/tmux.rs` — spawning and pane control | done, 8 tests |
+| `src/tmux.rs` — spawning and pane control | done, 17 tests |
 | `src/ui/` — frame, fleet rail, session pane, board rail | done, 57 tests |
 | `src/agent.rs` — starting an agent, repo discovery | done, 4 tests |
 | `src/brief.rs` — what an agent is told when it starts | done, 13 tests |
@@ -85,6 +85,21 @@ that.
 **Typing goes to the agent.** Click a pane to point the keyboard at it, and
 everything you type reaches that session — arrows, Escape, Ctrl-C, its own
 line editor. The wheel scrolls it. There is no mode to enter first.
+
+**Keys keep their modifiers, and a paste stays a paste.** Every keystroke is
+passed to tmux by name with every modifier on it — Option+Left is `M-Left`,
+which tmux delivers as the same `ESC [1;3D` a terminal would — and Shift+Enter
+goes as `M-Enter`, the `ESC CR` that Claude Code reads as a newline, because
+tmux cannot hand a shifted Enter to a program that did not ask it for extended
+keys. A paste arrives whole, over bracketed paste from the terminal and
+`paste-buffer -p` into the pane, so its newlines stay newlines and Claude Code
+shows it as a paste. Where the terminal speaks the kitty keyboard protocol,
+fleet asks for it, which is the only way to tell Shift+Enter from Enter at all.
+
+When a key does something in the terminal that it does not do in fleet,
+`fleet keys` shows what the terminal sent for it and what fleet passes on.
+The answer differs between terminals and between their settings, so it is
+the first thing to run.
 
 **The wheel goes where the program inside expects it.** Claude Code runs on
 the alternate screen and captures the mouse itself, so there is no scrollback

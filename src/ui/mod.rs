@@ -52,6 +52,9 @@ const TICK: Duration = Duration::from_secs(2);
 
 enum Msg {
     Key(KeyEvent),
+    /// A paste, whole. Only arrives because bracketed paste is on: without
+    /// it the terminal types the text out, a keystroke at a time.
+    Paste(String),
     Mouse(MouseEvent),
     Registry,
     Tick,
@@ -73,7 +76,7 @@ enum Focus {
 /// Typing belongs to the agent, so fleet cannot also own the alphabet. Ctrl-A
 /// rather than tmux's Ctrl-B, because `↵` hands you to tmux and the two must
 /// not be the same key. Ctrl-A twice sends a literal one through.
-const PREFIX: char = 'a';
+pub(crate) const PREFIX: char = 'a';
 
 pub struct App {
     registry: Registry,
@@ -94,6 +97,9 @@ pub struct App {
     /// Whether fleet is taking the mouse. While it does, the terminal
     /// cannot select text, so this is something you can give back.
     mouse: bool,
+    /// Whether the terminal speaks the kitty keyboard protocol, and so
+    /// whether it was asked to. Remembered so it can be given back.
+    enhanced: bool,
     /// True between the prefix and the key it modifies.
     armed: bool,
     /// The repository picker, while it is open. An overlay rather than a
@@ -149,6 +155,7 @@ impl App {
             rail_at: Rect::ZERO,
             centre_at: Rect::ZERO,
             mouse: true,
+            enhanced: false,
             armed: false,
             picker: None,
             tasks: Vec::new(),
@@ -286,6 +293,27 @@ impl App {
     }
 
     /// Hand a keystroke to the agent.
+    /// A paste goes to the agent the keyboard is pointed at, in one piece.
+    fn on_paste(&mut self, text: &str) {
+        // The prefix was pressed and then a paste arrived instead of a
+        // command: the paste wins, because nothing in fleet takes text.
+        self.armed = false;
+        let typing = self.focus == Focus::Session
+            && self.centre_view.is_none()
+            && self.centre.is_live();
+        if !typing {
+            self.status = Some("a paste goes to an agent — click its pane first".into());
+            return;
+        }
+        let Some(tmux) = self.tmux.clone() else { return };
+        self.centre.mirror_to_live();
+        self.centre.clear_selection();
+        match self.centre.paste(&tmux, text) {
+            Ok(()) => self.echo(),
+            Err(e) => self.status = Some(e.to_string()),
+        }
+    }
+
     fn forward(&mut self, key: KeyEvent) {
         let Some(translated) = keys::translate(key) else {
             return;
@@ -907,14 +935,16 @@ pub fn run(db: Db, db_path: PathBuf, root: Option<PathBuf>) -> Result<()> {
     spawn_ticker(tx);
 
     let mut term = ratatui::init();
-    // Clicking a pane and scrolling it is the point; without capture the
-    // terminal keeps the mouse to itself.
-    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+    // Asked once. The answer is the terminal's, and it does not change
+    // between an attach and the return from one.
+    app.enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    enter_modes(app.mouse, app.enhanced);
     let result = (|| -> Result<()> {
         term.draw(|f| app.draw(f))?;
         while let Ok(msg) = rx.recv() {
             match msg {
                 Msg::Key(key) => app.on_key(key),
+                Msg::Paste(text) => app.on_paste(&text),
                 Msg::Mouse(ev) => app.on_mouse(ev),
                 Msg::Registry | Msg::Tick => app.refresh(),
                 Msg::Transcript => {
@@ -936,7 +966,7 @@ pub fn run(db: Db, db_path: PathBuf, root: Option<PathBuf>) -> Result<()> {
         }
         Ok(())
     })();
-    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    leave_modes(app.enhanced);
     ratatui::restore();
     result
 }
@@ -973,6 +1003,127 @@ fn shorten(path: &Path, width: usize) -> String {
     parts.last().unwrap_or(&"").to_string()
 }
 
+/// Show what the terminal sends for each key, and what fleet would pass on.
+///
+/// "The keys don't work" is unanswerable without this: a terminal decides
+/// what Option+Left or Cmd+Left produces, the answer differs between Warp,
+/// iTerm and Ghostty, and it differs again with each one's settings. Run it
+/// in the terminal fleet is used in and the question answers itself.
+pub fn keys() -> Result<()> {
+    use std::io::Write;
+    crossterm::terminal::enable_raw_mode()?;
+    let enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    enter_modes(false, enhanced);
+
+    let mut out = std::io::stdout();
+    let say = |out: &mut std::io::Stdout, line: &str| {
+        let _ = write!(out, "{line}\r\n");
+        let _ = out.flush();
+    };
+    say(&mut out, "fleet keys — press keys to see what arrives and what fleet sends on.");
+    say(&mut out, "Ctrl-C twice to stop.\r\n");
+    say(
+        &mut out,
+        &format!(
+            "kitty keyboard protocol: {}    bracketed paste: on\r\n",
+            if enhanced { "on — Shift+Enter can be told from Enter" } else { "not supported — Shift+Enter is the same byte as Enter" }
+        ),
+    );
+
+    let mut last_ctrl_c = false;
+    loop {
+        match event::read()? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                let sent = match keys::translate(key) {
+                    Some(keys::Key::Literal(t)) => format!("types {t:?}"),
+                    Some(keys::Key::Named(n)) => format!("sends {n}"),
+                    None => "sends nothing".into(),
+                };
+                // Spelled the way a keyboard labels them, not the way the
+                // bitflags debug-print.
+                let mut mods = String::new();
+                for (flag, label) in [
+                    (KeyModifiers::CONTROL, "Ctrl"),
+                    (KeyModifiers::ALT, "Alt"),
+                    (KeyModifiers::SHIFT, "Shift"),
+                    (KeyModifiers::SUPER, "Cmd"),
+                ] {
+                    if key.modifiers.contains(flag) {
+                        mods.push_str(label);
+                        mods.push('+');
+                    }
+                }
+                let note = if key.code == KeyCode::Char(PREFIX)
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    "   ← fleet's prefix: an agent never sees this key"
+                } else {
+                    ""
+                };
+                say(&mut out, &format!("{:<24} {sent}{note}", format!("{mods}{:?}", key.code)));
+
+                let ctrl_c = key.code == KeyCode::Char('c')
+                    && key.modifiers.contains(KeyModifiers::CONTROL);
+                if ctrl_c && last_ctrl_c {
+                    break;
+                }
+                last_ctrl_c = ctrl_c;
+            }
+            Event::Paste(text) => {
+                let lines = text.lines().count().max(1);
+                say(
+                    &mut out,
+                    &format!(
+                        "{:<24} pasted whole, bracketed — its newlines will not send",
+                        format!("paste ({} chars, {lines} lines)", text.chars().count())
+                    ),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    leave_modes(enhanced);
+    crossterm::terminal::disable_raw_mode()?;
+    Ok(())
+}
+
+/// Ask the terminal fleet runs in for what it needs, all in one place.
+///
+/// Three modes, each for a reason the pane would otherwise feel wrong for.
+/// The mouse, so a pane can be clicked and scrolled. Bracketed paste, so a
+/// paste arrives whole instead of typed out a key at a time with every
+/// newline an Enter. And, where the terminal has it, the kitty keyboard
+/// protocol's disambiguation, which is the only way to tell Shift+Enter from
+/// Enter at all — without it the two are the same byte.
+fn enter_modes(mouse: bool, enhanced: bool) {
+    use crossterm::event::{EnableBracketedPaste, KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
+    let mut out = std::io::stdout();
+    if mouse {
+        let _ = crossterm::execute!(out, EnableMouseCapture);
+    }
+    let _ = crossterm::execute!(out, EnableBracketedPaste);
+    if enhanced {
+        let _ = crossterm::execute!(
+            out,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+    }
+}
+
+/// Everything `enter_modes` asked for, given back. Before tmux takes the
+/// terminal on attach, and before fleet exits: a shell left in bracketed
+/// paste or the kitty protocol misreads the next thing typed into it.
+fn leave_modes(enhanced: bool) {
+    use crossterm::event::{DisableBracketedPaste, PopKeyboardEnhancementFlags};
+    let mut out = std::io::stdout();
+    if enhanced {
+        let _ = crossterm::execute!(out, PopKeyboardEnhancementFlags);
+    }
+    let _ = crossterm::execute!(out, DisableBracketedPaste);
+    let _ = crossterm::execute!(out, DisableMouseCapture);
+}
+
 fn inside(area: Rect, (x, y): (u16, u16)) -> bool {
     area.width > 0
         && x >= area.x
@@ -997,16 +1148,14 @@ fn attach(
     paused.store(true, Ordering::SeqCst);
     std::thread::sleep(POLL * 2);
 
-    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    leave_modes(app.enhanced);
     ratatui::restore();
     let failed = app.centre.attach(&tmux);
     *term = ratatui::init();
-    // Whatever the user left it as. Handing the mouse back and then taking
-    // it again behind their back is the sort of thing that makes a program
-    // feel haunted.
-    if app.mouse {
-        let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
-    }
+    // The mouse as the user left it. Handing it back and then taking it
+    // again behind their back is the sort of thing that makes a program feel
+    // haunted.
+    enter_modes(app.mouse, app.enhanced);
 
     paused.store(false, Ordering::SeqCst);
     term.clear()?;
@@ -1043,6 +1192,11 @@ fn spawn_input(tx: Sender<Msg>, paused: Arc<AtomicBool>) {
                 }
                 Ok(Event::Mouse(ev)) => {
                     if tx.send(Msg::Mouse(ev)).is_err() {
+                        return;
+                    }
+                }
+                Ok(Event::Paste(text)) => {
+                    if tx.send(Msg::Paste(text)).is_err() {
                         return;
                     }
                 }

@@ -205,6 +205,14 @@ impl Pane {
     }
 
     /// Deliver one keystroke to the agent.
+    /// Paste into the agent's pane, as a paste.
+    pub fn paste(&self, tmux: &Tmux, text: &str) -> Result<()> {
+        let Some(pane) = self.tmux_pane() else {
+            bail!("this agent has no pane to paste into");
+        };
+        tmux.paste(pane, text)
+    }
+
     pub fn send(&self, tmux: &Tmux, key: &Key) -> Result<()> {
         let Some(pane) = self.tmux_pane() else {
             bail!("this agent has no pane to type into");

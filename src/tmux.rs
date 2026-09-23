@@ -91,12 +91,17 @@ impl Tmux {
         std::env::var_os("TMUX").is_some()
     }
 
-    fn run(&self, args: &[&str]) -> Result<String> {
+    fn command(&self) -> Command {
         let mut command = Command::new(&self.bin);
         if let Some(socket) = &self.socket {
             command.args(["-L", socket]);
         }
-        let out = command
+        command
+    }
+
+    fn run(&self, args: &[&str]) -> Result<String> {
+        let out = self
+            .command()
             .args(args)
             .output()
             .with_context(|| format!("running tmux {}", args.join(" ")))?;
@@ -261,6 +266,41 @@ impl Tmux {
     /// Separate from send_line because these are the things a line of text
     /// cannot express, and they are exactly what a permission prompt or a
     /// runaway turn needs.
+    /// Paste text into a pane as a paste, not as typing.
+    ///
+    /// Typed, a paste was one `send-keys` process per character — visibly
+    /// slow — and every newline in it was an Enter that sent the message
+    /// half-written. Pasted, it arrives in one piece, and `-p` wraps it in
+    /// bracketed-paste markers when the program asked for them, which is how
+    /// Claude Code knows to hold the newlines and show "[Pasted text]".
+    pub fn paste(&self, pane: &Pane, text: &str) -> Result<()> {
+        use std::io::Write;
+        use std::process::Stdio;
+
+        const BUFFER: &str = "fleet-paste";
+        // From stdin rather than as an argument: no length limit, and
+        // nothing in the text is ever read by tmux's own command parser.
+        let mut child = self
+            .command()
+            .args(["load-buffer", "-b", BUFFER, "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("running tmux load-buffer")?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(text.as_bytes())?;
+        }
+        let out = child.wait_with_output()?;
+        if !out.status.success() {
+            bail!("tmux load-buffer: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        // -d drops the buffer afterwards, so a paste into an agent does not
+        // turn up in the user's own tmux paste history.
+        self.run(&["paste-buffer", "-b", BUFFER, "-p", "-d", "-t", &pane.id])?;
+        Ok(())
+    }
+
     /// What the program in a pane has asked the terminal for.
     ///
     /// Asked of tmux rather than worked out from the byte stream. The modes
@@ -503,6 +543,90 @@ mod tests {
         fn drop(&mut self) {
             let _ = self.tmux.kill_server();
         }
+    }
+
+    /// A pane that reads its own tty raw into a file — as any program that
+    /// takes a paste or a keystroke must — optionally having asked for
+    /// bracketed paste first.
+    fn listener(s: &Scratch, tag: &str, bracketed: bool) -> (Pane, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("fleet-{tag}-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let got = dir.join("input");
+        let _ = std::fs::remove_file(&got);
+        let ask = if bracketed { "printf \"\\033[?2004h\"; " } else { "" };
+        let pane = s
+            .tmux
+            .spawn(
+                tag,
+                &dir,
+                &format!("sh -c 'stty raw -echo; {ask}cat > {}'", got.display()),
+            )
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        (pane, got)
+    }
+
+    fn read_when(path: &std::path::Path, done: impl Fn(&str) -> bool) -> String {
+        for _ in 0..40 {
+            let seen = std::fs::read_to_string(path).unwrap_or_default();
+            if done(&seen) {
+                return seen;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        std::fs::read_to_string(path).unwrap_or_default()
+    }
+
+    #[test]
+    fn a_paste_arrives_whole_and_bracketed_so_its_newlines_do_not_send() {
+        // Typed, every newline in a paste was an Enter, and the message went
+        // off half-written. Bracketed, the program knows it is a paste.
+        let Some(s) = Scratch::new("paste") else { return };
+        let (pane, got) = listener(&s, "paste", true);
+
+        let text = "first line\nsecond line\nthird";
+        s.tmux.paste(&pane, text).unwrap();
+        let seen = read_when(&got, |t| t.contains("\x1b[201~"));
+
+        assert!(seen.starts_with("\x1b[200~"), "not opened as a paste: {seen:?}");
+        assert!(seen.ends_with("\x1b[201~"), "not closed as one: {seen:?}");
+        let inside = &seen["\x1b[200~".len()..seen.len() - "\x1b[201~".len()];
+        // tmux separates pasted lines with CR, which is what a terminal sends
+        // for them; the markers are what stop that meaning "send".
+        assert_eq!(inside.replace('\r', "\n"), text);
+    }
+
+    #[test]
+    fn a_program_that_did_not_ask_for_bracketed_paste_gets_the_text_plain() {
+        // -p only brackets when the program asked; a shell reading lines
+        // should not find escape sequences in the middle of its input.
+        let Some(s) = Scratch::new("plainpaste") else { return };
+        let (pane, got) = listener(&s, "plainpaste", false);
+
+        s.tmux.paste(&pane, "just text").unwrap();
+        let seen = read_when(&got, |t| t.contains("just text"));
+        assert_eq!(seen, "just text");
+    }
+
+    #[test]
+    fn a_paste_does_not_linger_in_the_users_tmux_buffers() {
+        let Some(s) = Scratch::new("pastebuf") else { return };
+        let (pane, got) = listener(&s, "pastebuf", true);
+        s.tmux.paste(&pane, "gone afterwards").unwrap();
+        read_when(&got, |t| t.contains("gone"));
+        let buffers = s.tmux.run(&["list-buffers", "-F", "#{buffer_name}"]).unwrap_or_default();
+        assert!(!buffers.contains("fleet-paste"), "{buffers:?}");
+    }
+
+    #[test]
+    fn a_paste_with_quotes_and_dollars_is_not_read_as_a_command() {
+        // It goes in over stdin, never as an argument tmux parses.
+        let Some(s) = Scratch::new("pastequote") else { return };
+        let (pane, got) = listener(&s, "pastequote", false);
+        let text = "it's \"$HOME\" `date` ; {braces} #hash";
+        s.tmux.paste(&pane, text).unwrap();
+        let seen = read_when(&got, |t| t.contains("#hash"));
+        assert_eq!(seen, text);
     }
 
     #[test]
