@@ -20,7 +20,7 @@ already runs on the machine.
 | `src/tmux.rs` — spawning and pane control | done, 17 tests |
 | `src/ui/` — frame, fleet rail, session pane, board rail | done, 57 tests |
 | `src/agent.rs` — starting an agent, repo discovery | done, 4 tests |
-| `src/brief.rs` — what an agent is told when it starts | done, 13 tests |
+| `src/brief.rs` — what an agent is told when it starts | done, 18 tests |
 | `src/msg.rs` — delivering a message to its recipient | done, 6 tests |
 | `n` to spawn from the rail | done |
 | `src/ui/flow.rs` — graph and log views | done, 18 tests |
