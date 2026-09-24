@@ -327,9 +327,21 @@ pub struct Watcher {
 
 impl Watcher {
     pub fn new(dir: &Path) -> Result<Watcher> {
+        Watcher::only(dir, |_| true)
+    }
+
+    /// Watch a directory, but wake only for files `keep` accepts.
+    ///
+    /// For the board, whose directory holds files fleet itself touches just
+    /// by reading: SQLite readers write to `-shm`, so a watcher woken by it
+    /// would refresh, read, touch `-shm`, and wake itself again for ever.
+    pub fn only(dir: &Path, keep: impl Fn(&Path) -> bool + Send + 'static) -> Result<Watcher> {
         let (tx, rx) = channel();
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             if let Ok(event) = res {
+                if !event.paths.iter().any(|p| keep(p)) {
+                    return;
+                }
                 match event.kind {
                     EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
                         // A full mailbox means a refresh is already pending;

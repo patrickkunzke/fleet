@@ -23,7 +23,8 @@ already runs on the machine.
 | `src/brief.rs` — what an agent is told when it starts | done, 18 tests |
 | `src/msg.rs` — delivering a message to its recipient | done, 6 tests |
 | `n` to spawn from the rail | done |
-| `src/ui/flow.rs` — graph and log views | done, 18 tests |
+| `src/ui/flow.rs` — the flow pane and its log view | done, 10 tests |
+| `src/ui/graph.rs` — the flow as a live graph | done, 16 tests |
 | `src/ui/mirror.rs` — the live tmux pane | done, 8 tests |
 | `src/ui/sender.rs` — input to panes, off the UI thread | done, 8 tests |
 | `src/ui/selection.rs` — drag to copy from a pane | done, 6 tests |
@@ -177,6 +178,19 @@ pane opens. `--role chief` starts a chief instead — the other brief, the deny
 list, and a row the rail draws as one. `--command` overrides the whole thing
 and skips the briefing, which is how the plumbing is tested without starting a
 real agent.
+
+**The graph is the fleet as it is shaped:** the chief's card over a row of
+agent cards, a line from it into each one. A line is heavy where the most has
+gone along it and dashed where nothing has, and coloured by what the agent at
+its end is doing — amber working, teal waiting — which is zoetrope's rule that
+liveness should read on the structure itself. A message is drawn travelling
+along its line as it is sent, and the line stays lit for a few seconds after.
+Two agents that talk directly are joined under their cards. When the cards do
+not fit one row they wrap, and the line from the chief runs down the left edge
+to each row, as an org chart's does, instead of through the cards above; a
+direct line between rows is written out rather than drawn across them. `←→`
+moves between cards and `↵` opens one. The board is watched, so a message
+appears as it is written rather than on the next tick.
 
 The flow views read the `events` table, which every state change and every
 `fleet board msg` writes. **A message sent with `SendMessage` and never logged

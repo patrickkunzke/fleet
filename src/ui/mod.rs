@@ -14,6 +14,7 @@ pub mod board;
 pub mod clipboard;
 pub mod fleet;
 pub mod flow;
+pub mod graph;
 pub mod keys;
 pub mod picker;
 pub mod mirror;
@@ -103,6 +104,11 @@ pub struct App {
     /// Whether the terminal speaks the kitty keyboard protocol, and so
     /// whether it was asked to. Remembered so it can be given back.
     enhanced: bool,
+    /// When fleet first saw each event, in seconds since the epoch. The graph
+    /// shows a message travelling from the moment it appears here, which can
+    /// be a beat after it was written: a pulse timed from the write alone
+    /// would already be over by the time anyone could see it.
+    first_seen: std::collections::HashMap<String, f64>,
     /// Where keystrokes, pastes and the wheel go, off this thread. None
     /// until the loop starts: a frame drawn for a test or a preview sends
     /// nothing anywhere.
@@ -164,6 +170,7 @@ impl App {
             mouse: true,
             enhanced: false,
             sender: None,
+            first_seen: std::collections::HashMap::new(),
             armed: false,
             picker: None,
             tasks: Vec::new(),
@@ -211,6 +218,13 @@ impl App {
         }
         if let Ok(events) = self.db.events(200) {
             self.events = events;
+            let now = unix_now();
+            let keys: std::collections::HashSet<String> = self.events.iter().map(event_key).collect();
+            for key in &keys {
+                self.first_seen.entry(key.clone()).or_insert(now);
+            }
+            // Forget what has fallen off the end of the log.
+            self.first_seen.retain(|k, _| keys.contains(k));
         }
         self.event_selected = self
             .event_selected
@@ -267,6 +281,18 @@ impl App {
         match (key.code, key.modifiers) {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Char('q'), _) => {
                 self.quit = true
+            }
+            // Over the graph the cards are what the keys move between, and
+            // ↵ opens the one selected — the design's "zoom into session".
+            (KeyCode::Right | KeyCode::Tab, _) if self.centre_view == Some(View::Graph) => {
+                self.move_by(1)
+            }
+            (KeyCode::Left | KeyCode::BackTab, _) if self.centre_view == Some(View::Graph) => {
+                self.move_by(-1)
+            }
+            (KeyCode::Enter, _) if self.centre_view == Some(View::Graph) => {
+                self.centre_view = None;
+                self.focus = Focus::Session;
             }
             (KeyCode::Tab, _) => {
                 self.focus = match self.focus {
@@ -669,6 +695,35 @@ impl App {
         }
     }
 
+    /// How old each event is, as the graph should see it.
+    ///
+    /// From its timestamp — unless fleet first saw it only moments after it
+    /// was written, and then from that moment, so it is still seen in flight.
+    /// An event already old when fleet started is old, not new: it must not
+    /// set the whole graph pulsing on launch.
+    fn ages(&self) -> Vec<f64> {
+        let now = unix_now();
+        self.events
+            .iter()
+            .map(|e| {
+                let written = graph::epoch(&e.ts).unwrap_or(0.0);
+                let seen = self.first_seen.get(&event_key(e)).copied().unwrap_or(written);
+                let start = if seen - written < 10.0 { seen.max(written) } else { written };
+                (now - start).max(0.0)
+            })
+            .collect()
+    }
+
+    /// Whether the graph has something moving on it, and so wants frames.
+    fn animating(&self) -> bool {
+        self.centre_view == Some(View::Graph)
+            && self
+                .ages()
+                .iter()
+                .zip(&self.events)
+                .any(|(&age, e)| e.kind == "message" && age < graph::PULSE_SECS + 0.2)
+    }
+
     /// What the sender reported back.
     fn on_sent(&mut self, reply: sender::Reply) {
         match reply {
@@ -744,15 +799,21 @@ impl App {
             fleet::render(frame, rail, &self.rows, self.selected);
         }
         match self.centre_view {
-            Some(view) => flow::render(
-                frame,
-                centre,
-                view,
-                &self.events,
-                &self.rows,
-                self.event_selected,
-                !self.wide,
-            ),
+            Some(view) => {
+                let ages = self.ages();
+                let agent = self.rows.get(self.selected).map(|r| r.name.clone());
+                flow::render(
+                    frame,
+                    centre,
+                    view,
+                    &self.events,
+                    &ages,
+                    &self.rows,
+                    self.event_selected,
+                    agent.as_deref(),
+                    !self.wide,
+                )
+            }
             None => {
                 let row = self.rows.get(self.selected).cloned();
                 let typing = self.focus == Focus::Session;
@@ -902,7 +963,13 @@ impl App {
                 ("l", "back"),
                 ("^a q", "quit"),
             ],
-            Some(View::Graph) => &[("g", "back"), ("l", "log"), ("^a q", "quit")],
+            Some(View::Graph) => &[
+                ("←→", "agent"),
+                ("↵", "open"),
+                ("g", "back"),
+                ("l", "log"),
+                ("^a q", "quit"),
+            ],
             None => &[
                 ("↑↓", "agent"),
                 ("n", "new agent"),
@@ -964,6 +1031,7 @@ pub fn run(db: Db, db_path: PathBuf, root: Option<PathBuf>) -> Result<()> {
     let paused = Arc::new(AtomicBool::new(false));
     spawn_input(tx.clone(), paused.clone());
     spawn_registry(tx.clone());
+    spawn_board_watch(tx.clone(), &app.db_path);
     spawn_transcript_poll(tx.clone());
     if let Some(tmux) = app.tmux.clone() {
         let back = tx.clone();
@@ -1017,8 +1085,10 @@ pub fn run(db: Db, db_path: PathBuf, root: Option<PathBuf>) -> Result<()> {
                 app.refresh();
                 dirty = true;
             }
-            // Nothing new is the common case, and then there is no frame.
-            if poll && app.centre.poll() {
+            // Nothing new is the common case, and then there is no frame —
+            // unless a message is travelling across the graph, which needs
+            // one every tick for as long as it is.
+            if poll && (app.centre.poll() | app.animating()) {
                 dirty = true;
             }
             if app.wants_attach {
@@ -1209,6 +1279,24 @@ fn leave_modes(enhanced: bool) {
     let _ = crossterm::execute!(out, DisableMouseCapture);
 }
 
+fn unix_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64())
+}
+
+/// An event's identity, for remembering when it was first seen. The log has
+/// no id column to read, and these four together do not repeat.
+fn event_key(e: &db::Event) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        e.ts,
+        e.from_agent.as_deref().unwrap_or(""),
+        e.to_agent.as_deref().unwrap_or(""),
+        e.summary
+    )
+}
+
 fn inside(area: Rect, (x, y): (u16, u16)) -> bool {
     area.width > 0
         && x >= area.x
@@ -1292,6 +1380,36 @@ fn spawn_input(tx: Sender<Msg>, paused: Arc<AtomicBool>) {
                     }
                 }
                 Err(_) => return,
+            }
+        }
+    });
+}
+
+/// Refresh the moment another process writes to the board.
+///
+/// The two-second tick was the only way a new task or message reached the
+/// screen, which is slow for a graph meant to show messages as they travel.
+/// Only the database and its write-ahead log wake it: SQLite readers write
+/// to `-shm`, and a watcher woken by that would refresh, read, and wake
+/// itself again for ever.
+fn spawn_board_watch(tx: Sender<Msg>, db: &Path) {
+    let Some(dir) = db.parent().map(Path::to_path_buf) else {
+        return;
+    };
+    let name = db.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    std::thread::spawn(move || {
+        let wal = format!("{name}-wal");
+        let watched = name.clone();
+        let Ok(watcher) = Watcher::only(&dir, move |p| {
+            p.file_name()
+                .map(|f| f.to_string_lossy())
+                .is_some_and(|f| f == watched || f == wal)
+        }) else {
+            return;
+        };
+        loop {
+            if watcher.wait(Duration::from_secs(30)) && tx.send(Msg::Registry).is_err() {
+                return;
             }
         }
     });

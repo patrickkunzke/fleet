@@ -11,14 +11,12 @@
 //! appear here — the board is the record, and an agent that does not report
 //! is invisible to it by construction.
 
-use std::collections::BTreeMap;
-
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::db::Event;
-use crate::ui::fleet::{Presence, Role, Row};
-use crate::ui::theme;
+use crate::ui::fleet::Row;
+use crate::ui::{graph, theme};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
@@ -26,44 +24,16 @@ pub enum View {
     Log,
 }
 
-/// One direction of traffic between two agents.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Edge {
-    pub from: String,
-    pub to: String,
-    pub count: usize,
-}
-
-/// Count who sent what to whom.
-///
-/// Only messages: a task moving to done is an event, but it is not one agent
-/// telling another anything, and counting it as traffic would make the busiest
-/// agent look like the most talkative one.
-pub fn edges(events: &[Event]) -> Vec<Edge> {
-    let mut tally: BTreeMap<(String, String), usize> = BTreeMap::new();
-    for e in events.iter().filter(|e| e.kind == "message") {
-        if let (Some(from), Some(to)) = (&e.from_agent, &e.to_agent)
-            && !from.is_empty()
-            && !to.is_empty()
-        {
-            *tally.entry((from.clone(), to.clone())).or_default() += 1;
-        }
-    }
-    let mut edges: Vec<Edge> = tally
-        .into_iter()
-        .map(|((from, to), count)| Edge { from, to, count })
-        .collect();
-    edges.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.to.cmp(&b.to)));
-    edges
-}
-
+#[allow(clippy::too_many_arguments)]
 pub fn render(
     frame: &mut Frame,
     area: Rect,
     view: View,
     events: &[Event],
+    ages: &[f64],
     rows: &[Row],
     selected: usize,
+    agent: Option<&str>,
     bordered: bool,
 ) {
     let block = Block::default()
@@ -109,177 +79,9 @@ pub fn render(
     theme::rule(frame, head_rule);
 
     match view {
-        View::Graph => graph(frame, theme::pad(body), events, rows),
+        View::Graph => graph::render(frame.buffer_mut(), theme::pad(body), rows, events, ages, agent),
         View::Log => log(frame, body, events, selected),
     }
-}
-
-fn graph(frame: &mut Frame, area: Rect, events: &[Event], rows: &[Row]) {
-    let edges = edges(events);
-    if edges.is_empty() {
-        frame.render_widget(
-            Paragraph::new(
-                [
-                    "no messages logged yet".to_string(),
-                    String::new(),
-                ]
-                .into_iter()
-                .chain(wrap(
-                    "agents send them with: fleet board msg <from> <to> …",
-                    area.width,
-                ))
-                .map(|l| Line::from(Span::styled(l, theme::faint())))
-                .collect::<Vec<_>>(),
-            ),
-            area,
-        );
-        return;
-    }
-
-    let chief = rows
-        .iter()
-        .find(|r| r.role == Role::Chief)
-        .map(|r| r.name.clone())
-        .unwrap_or_else(|| "chief".into());
-
-    // Spokes off the chief, then anything that bypassed it. A hub drawn as a
-    // column fits a narrow pane; boxes side by side do not.
-    let mut spokes: BTreeMap<String, (usize, usize)> = BTreeMap::new();
-    let mut peers: Vec<&Edge> = Vec::new();
-    for edge in &edges {
-        if edge.from == chief {
-            spokes.entry(edge.to.clone()).or_default().0 += edge.count;
-        } else if edge.to == chief {
-            spokes.entry(edge.from.clone()).or_default().1 += edge.count;
-        } else {
-            peers.push(edge);
-        }
-    }
-
-    let fit = |spans: Vec<Span<'static>>| theme::fit(spans, area.width);
-
-    let mut lines = vec![
-        fit(vec![
-            Span::styled(" ◆ ", theme::accent()),
-            Span::styled(
-                chief.clone(),
-                Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("  the one you brief", theme::faint()),
-        ]),
-        Line::from(Span::styled(" │", Style::default().fg(theme::BORDER))),
-    ];
-
-    let busiest = spokes.values().map(|(a, b)| a + b).max().unwrap_or(1).max(1);
-    let last = spokes.len().saturating_sub(1);
-
-    // Everything but the name is fixed furniture: the elbow, the bar, the
-    // traffic counts and the presence glyph. Measured across every row so
-    // the columns line up, then dropped in order of what a narrow pane can
-    // do without — the bar first, since it is the counts drawn again.
-    let counts = |sent: &usize, received: &usize| format!("{sent}▸ {received}◂");
-    let counts_width = spokes
-        .values()
-        .map(|(s, r)| counts(s, r).chars().count())
-        .max()
-        .unwrap_or(5);
-    const ELBOW: usize = 6;
-    const GLYPH: usize = 3;
-    const BAR: usize = 5;
-    // A space the name column cannot spend, so that a name ending in an
-    // ellipsis does not run into whatever comes after it.
-    const GAP: usize = 1;
-    const NAME_MIN: usize = 6;
-    const NAME_MAX: usize = 16;
-
-    let avail = area.width as usize;
-    let floor = ELBOW + NAME_MIN + GAP + GLYPH;
-    let show_counts = avail >= floor + counts_width;
-    let show_bar = show_counts && avail >= floor + BAR + counts_width;
-    let fixed = ELBOW
-        + GAP
-        + GLYPH
-        + if show_bar { BAR } else { 0 }
-        + if show_counts { counts_width } else { 0 };
-    let name_width = avail.saturating_sub(fixed).clamp(3, NAME_MAX);
-
-    for (i, (name, (sent, received))) in spokes.iter().enumerate() {
-        let elbow = if i == last { " └──▶ " } else { " ├──▶ " };
-        let state = rows.iter().find(|r| &r.name == name);
-        let (glyph, colour) = match state.map(|r| r.presence) {
-            Some(Presence::Working) => ("●", theme::BUSY),
-            Some(Presence::Waiting) => ("○", theme::OK),
-            Some(Presence::Gone) => ("×", theme::FAINT),
-            _ => ("·", theme::FAINT),
-        };
-        let mut spans = vec![
-            Span::styled(elbow, Style::default().fg(theme::BORDER)),
-            Span::styled(
-                format!("{:<name_width$} ", clip(name, name_width as u16)),
-                Style::default().fg(theme::TEXT),
-            ),
-        ];
-        if show_bar {
-            spans.push(Span::styled(bar(sent + received, busiest), theme::accent()));
-            spans.push(Span::raw(" "));
-        }
-        if show_counts {
-            spans.push(Span::styled(
-                format!("{:<counts_width$}", counts(sent, received)),
-                theme::dim(),
-            ));
-        }
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(glyph, Style::default().fg(colour)));
-        lines.push(fit(spans));
-    }
-
-    // Two names on one line, so they halve what is left between them rather
-    // than the second one running off the edge. Below about sixteen columns
-    // there is no pair of names worth printing, so the section goes instead
-    // of being printed as two ellipses.
-    let widest = peers
-        .iter()
-        .map(|e| e.count.to_string().chars().count())
-        .max()
-        .unwrap_or(1);
-    let each = (avail.saturating_sub(1 + 5 + 2 + widest)) / 2;
-    if !peers.is_empty() && each >= 4 {
-        let each = each.min(NAME_MAX);
-        lines.push(Line::raw(""));
-        lines.push(fit(vec![Span::styled("bypassing the chief", theme::label())]));
-        for edge in peers {
-            lines.push(fit(vec![
-                Span::raw(" "),
-                Span::styled(
-                    format!("{:>each$}", clip(&edge.from, each as u16)),
-                    theme::dim(),
-                ),
-                Span::styled(" ──▶ ", Style::default().fg(theme::BORDER)),
-                Span::styled(
-                    format!("{:<each$}", clip(&edge.to, each as u16)),
-                    theme::dim(),
-                ),
-                Span::raw("  "),
-                Span::styled(edge.count.to_string(), theme::faint()),
-            ]));
-        }
-    }
-
-    lines.push(Line::raw(""));
-    lines.push(fit(vec![Span::styled(
-        " ▸ sent   ◂ received",
-        theme::faint(),
-    )]));
-
-    frame.render_widget(Paragraph::new(lines), area);
-}
-
-/// A width-4 bar, so volume is visible without reading the numbers.
-fn bar(count: usize, busiest: usize) -> String {
-    let filled = ((count * 4) as f64 / busiest as f64).round().clamp(0.0, 4.0) as usize;
-    let filled = if count > 0 { filled.max(1) } else { 0 };
-    format!("{}{}", "▇".repeat(filled), " ".repeat(4 - filled))
 }
 
 fn log(frame: &mut Frame, area: Rect, events: &[Event], selected: usize) {
@@ -458,6 +260,7 @@ fn wrap(text: &str, width: u16) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::fleet::{Presence, Role};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -496,60 +299,10 @@ mod tests {
     fn drawn(view: View, events: &[Event], selected: usize, w: u16, h: u16) -> String {
         let rows = rows();
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-        term.draw(|f| render(f, f.area(), view, events, &rows, selected, true))
+        let ages = vec![f64::MAX; events.len()];
+        term.draw(|f| render(f, f.area(), view, events, &ages, &rows, selected, None, true))
             .unwrap();
         format!("{}", term.backend())
-    }
-
-    /// Every line the graph draws, with the trailing blanks removed.
-    fn graph_lines(events: &[Event], w: u16) -> Vec<String> {
-        drawn(View::Graph, events, 0, w, 16)
-            .lines()
-            .map(|l| l.trim_end_matches(['"', ' ']).trim_start_matches('"').to_string())
-            .collect()
-    }
-
-    #[test]
-    fn the_graph_ends_its_lines_with_an_ellipsis_rather_than_at_the_wall() {
-        let events = [event("message", "chief", "accounts-service", "go")];
-        for w in [20, 25, 30, 36, 44, 60] {
-            for line in graph_lines(&events, w) {
-                assert!(
-                    line.chars().count() <= w as usize,
-                    "at {w} columns this overflows: {line:?}"
-                );
-            }
-        }
-        // The name is what gives way, and it says that it did.
-        let narrow = graph_lines(&events, 30).join("\n");
-        assert!(narrow.contains('…'), "nothing was marked as cut: {narrow}");
-    }
-
-    #[test]
-    fn the_graph_drops_the_bar_before_the_counts_and_the_counts_before_the_name() {
-        let events = [event("message", "chief", "accounts-service", "go")];
-        let at = |w| graph_lines(&events, w).join("\n");
-
-        let wide = at(60);
-        assert!(wide.contains('▇'), "the bar fits: {wide}");
-        assert!(wide.contains("1▸ 0◂"), "so do the counts: {wide}");
-
-        let middle = at(30);
-        assert!(!middle.contains('▇'), "the bar is the first to go: {middle}");
-        assert!(middle.contains("1▸ 0◂"), "the counts are not: {middle}");
-
-        let narrow = at(25);
-        assert!(!narrow.contains("1▸ 0◂"), "the counts go next: {narrow}");
-        assert!(narrow.contains("setting"), "the name is what is left: {narrow}");
-    }
-
-    #[test]
-    fn a_pane_too_narrow_for_two_names_drops_the_section_rather_than_print_two_ellipses() {
-        // Both halves of "a ──▶ b" cut to nothing says less than the heading
-        // it sits under.
-        let events = [event("message", "accounts-service", "billing-service", "yours")];
-        let narrow = graph_lines(&events, 20).join("\n");
-        assert!(!narrow.contains("bypassing"), "{narrow}");
     }
 
     #[test]
@@ -601,54 +354,6 @@ mod tests {
         e.from_agent = Some("  ".into());
         e.to_agent = Some(String::new());
         assert_eq!(principals(&e), (None, None));
-    }
-
-    #[test]
-    fn only_messages_count_as_traffic() {
-        let events = [
-            event("message", "chief", "billing-svc", "start -2"),
-            event("message", "billing-svc", "chief", "blocked"),
-            event("task", "billing-svc", "", "done"),
-            event("bg", "billing-svc", "", "started: gradlew"),
-        ];
-        let edges = edges(&events);
-        assert_eq!(edges.len(), 2, "a task moving is not one agent telling another: {edges:?}");
-        assert!(edges.iter().all(|e| e.count == 1));
-    }
-
-    #[test]
-    fn the_graph_separates_spokes_from_traffic_that_bypassed_the_chief() {
-        let events = [
-            event("message", "chief", "billing-svc", "start"),
-            event("message", "chief", "billing-svc", "again"),
-            event("message", "billing-svc", "chief", "blocked"),
-            event("message", "accounts-svc", "billing-svc", "!412 is in"),
-        ];
-        let out = drawn(View::Graph, &events, 0, 60, 18);
-
-        assert!(out.contains("◆ chief"), "{out}");
-        assert!(out.contains("2▸ 1◂"), "sent and received are separate: {out}");
-        assert!(out.contains("bypassing the chief"), "{out}");
-        assert!(out.contains("accounts-svc ──▶"), "{out}");
-    }
-
-    #[test]
-    fn an_empty_graph_says_how_messages_get_recorded() {
-        let out = drawn(View::Graph, &[], 0, 60, 14);
-        assert!(out.contains("no messages logged yet"), "{out}");
-        assert!(out.contains("fleet board msg"), "{out}");
-    }
-
-    #[test]
-    fn the_bar_scales_to_the_busiest_and_never_hides_a_single_message() {
-        assert_eq!(bar(0, 8), "    ");
-        assert_eq!(bar(8, 8), "▇▇▇▇");
-        assert_eq!(bar(4, 8), "▇▇  ");
-        assert_eq!(
-            bar(1, 100),
-            "▇   ",
-            "one message must still show, or a quiet edge looks like none"
-        );
     }
 
     #[test]
