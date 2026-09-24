@@ -153,6 +153,28 @@ pub fn command(brief: &Brief) -> String {
     out
 }
 
+/// The command line that brings an agent back into its own conversation.
+///
+/// The role again, and the chief's deny list again, because neither is kept
+/// with the conversation. No opening turn: the conversation already has one,
+/// and a new first prompt would be sent the moment the agent came up.
+///
+/// `program` is `claude` except in a test: a pane's command goes through the
+/// user's shell, whose startup can rebuild PATH, so a stand-in has to be named
+/// by its full path.
+pub fn resume_command_for(program: &str, brief: &Brief, session: &str) -> String {
+    let mut out = format!(
+        "{program} --resume {} --append-system-prompt {}",
+        quote(session),
+        quote(&brief.role)
+    );
+    if !brief.deny.is_empty() {
+        out.push_str(" --disallowed-tools ");
+        out.push_str(&brief.deny.join(" "));
+    }
+    out
+}
+
 /// Single quotes, because a brief is prose with apostrophes, backticks and
 /// newlines in it, and a shell would otherwise read some of it as commands.
 fn quote(text: &str) -> String {
@@ -316,6 +338,25 @@ mod tests {
         assert!(delivered.starts_with("[fleet · chief · "), "{delivered}");
         let b = worker("c", Path::new("/w"), None, None);
         assert!(b.role.contains("`[fleet · chief · …]`"), "{}", b.role);
+    }
+
+    #[test]
+    fn a_resumed_agent_is_given_back_its_role_and_not_a_new_first_prompt() {
+        // The conversation has its opening already; a new one would be sent
+        // the moment the agent came back up.
+        let b = worker("billing-svc", Path::new("/w"), None, None);
+        let cmd = resume_command_for("claude", &b, "sess-123");
+        assert!(cmd.starts_with("claude --resume 'sess-123' --append-system-prompt '"), "{cmd}");
+        assert!(!cmd.contains(&b.opening), "no opening turn: {cmd}");
+        assert!(!cmd.contains("--disallowed-tools"), "a worker keeps its tools: {cmd}");
+    }
+
+    #[test]
+    fn a_resumed_chief_still_cannot_edit() {
+        // The deny list is set at launch and not kept with the conversation:
+        // a resume that dropped it would be a chief that could write code.
+        let cmd = resume_command_for("claude", &chief(Path::new("/w")), "sess-1");
+        assert!(cmd.ends_with("--disallowed-tools Edit Write NotebookEdit"), "{cmd}");
     }
 
     #[test]

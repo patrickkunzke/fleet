@@ -76,6 +76,40 @@ pub struct Task {
     pub waiting_on: Vec<String>,
 }
 
+/// One agent as it was in a run: enough to bring it back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RunAgent {
+    pub name: String,
+    pub role: String,
+    pub repo: String,
+    pub session_id: Option<String>,
+    pub retired: bool,
+}
+
+/// A stretch of work in one workspace, and the crew that did it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Run {
+    pub id: i64,
+    pub root: String,
+    pub started_at: String,
+    /// The last message or state change any of its agents made, or when it
+    /// started if they made none.
+    pub last_active: String,
+    pub agents: Vec<RunAgent>,
+    /// Tasks its agents touched, newest first, for telling runs apart.
+    pub tasks: Vec<String>,
+}
+
+impl Run {
+    /// The agents that would come back: not taken off on purpose, and with
+    /// a conversation to resume.
+    pub fn resumable(&self) -> impl Iterator<Item = &RunAgent> {
+        self.agents
+            .iter()
+            .filter(|a| !a.retired && a.session_id.is_some())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Agent {
     pub name: String,
@@ -697,6 +731,218 @@ impl Db {
     }
 }
 
+impl Db {
+    /// Begin a run in `root`, and return it.
+    pub fn start_run(&self, root: &str) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "INSERT INTO runs (root) VALUES (?1) RETURNING id",
+            params![root],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The most recent run in `root`.
+    pub fn latest_run(&self, root: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id FROM runs WHERE root = ?1 ORDER BY id DESC LIMIT 1",
+                params![root],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// The run an agent started in `repo` belongs to, when nothing said so:
+    /// the latest whose workspace holds the repo, or failing that the
+    /// latest of all.
+    pub fn run_for_repo(&self, repo: &str) -> Result<Option<i64>> {
+        let within: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM runs
+                 WHERE ?1 = root OR ?1 LIKE root || '/%'
+                 ORDER BY id DESC LIMIT 1",
+                params![repo],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if within.is_some() {
+            return Ok(within);
+        }
+        Ok(self
+            .conn
+            .query_row("SELECT id FROM runs ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// Put an agent in a run. Joining again brings a retired one back in,
+    /// and keeps whatever session it already had.
+    pub fn join_run(&self, run: i64, name: &str, role: &str, repo: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO run_agents (run_id, name, role, repo) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(run_id, name) DO UPDATE SET
+               role = excluded.role, repo = excluded.repo, retired = 0",
+            params![run, name, role, repo],
+        )?;
+        Ok(())
+    }
+
+    /// Record which conversation an agent in a run turned out to be.
+    pub fn set_run_session(&self, run: i64, name: &str, session_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE run_agents SET session_id = ?3 WHERE run_id = ?1 AND name = ?2",
+            params![run, name, session_id],
+        )?;
+        Ok(())
+    }
+
+    /// Taken off on purpose: not brought back when the run is resumed.
+    pub fn retire_in_run(&self, run: i64, name: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE run_agents SET retired = 1 WHERE run_id = ?1 AND name = ?2",
+            params![run, name],
+        )?;
+        Ok(())
+    }
+
+    /// Off the rail because its process is gone — not because anybody
+    /// retired it. The run keeps it, so it can be resumed.
+    pub fn end_agent(&self, name: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE agents SET ended_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+             WHERE name = ?1 AND ended_at IS NULL",
+            params![name],
+        )?;
+        Ok(())
+    }
+
+    /// Runs in `root` that have anyone in them, newest first.
+    pub fn runs(&self, root: &str) -> Result<Vec<Run>> {
+        let ids: Vec<i64> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT r.id FROM runs r
+                 WHERE r.root = ?1 AND EXISTS (SELECT 1 FROM run_agents a WHERE a.run_id = r.id)
+                 ORDER BY r.id DESC",
+            )?;
+            stmt.query_map(params![root], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        ids.into_iter()
+            .filter_map(|id| self.run(id).transpose())
+            .collect()
+    }
+
+    pub fn run(&self, id: i64) -> Result<Option<Run>> {
+        let Some((root, started_at)): Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT root, started_at FROM runs WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+
+        let agents: Vec<RunAgent> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT name, role, repo, session_id, retired FROM run_agents
+                 WHERE run_id = ?1 ORDER BY role = 'chief' DESC, joined_at, name",
+            )?;
+            stmt.query_map(params![id], |r| {
+                Ok(RunAgent {
+                    name: r.get(0)?,
+                    role: r.get(1)?,
+                    repo: r.get(2)?,
+                    session_id: r.get(3)?,
+                    retired: r.get::<_, i64>(4)? != 0,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?
+        };
+
+        // What its agents did, from when it started until the next run in
+        // the same workspace began: a name reused in a later run is that
+        // run's, not this one's.
+        let window = "e.ts >= r.started_at
+             AND e.ts < COALESCE(
+                 (SELECT MIN(n.started_at) FROM runs n WHERE n.root = r.root AND n.id > r.id),
+                 '9999')
+             AND (e.from_agent IN (SELECT name FROM run_agents WHERE run_id = r.id)
+               OR e.to_agent IN (SELECT name FROM run_agents WHERE run_id = r.id))";
+        let last_active: String = self.conn.query_row(
+            &format!(
+                "SELECT COALESCE(MAX(e.ts), r.started_at) FROM runs r
+                 LEFT JOIN events e ON {window}
+                 WHERE r.id = ?1 GROUP BY r.id"
+            ),
+            params![id],
+            |r| r.get(0),
+        )?;
+        let tasks: Vec<String> = {
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT e.task_key FROM runs r JOIN events e ON {window}
+                 WHERE r.id = ?1 AND e.task_key IS NOT NULL
+                 GROUP BY e.task_key ORDER BY MAX(e.ts) DESC LIMIT 4"
+            ))?;
+            stmt.query_map(params![id], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+
+        Ok(Some(Run {
+            id,
+            root,
+            started_at,
+            last_active,
+            agents,
+            tasks,
+        }))
+    }
+
+    /// Give a board from before runs existed one run to resume from.
+    ///
+    /// The agents table has always kept each name's latest session, which
+    /// is the crew from the last fleet anyone ran — worth resuming, and
+    /// otherwise lost the moment a new chief overwrote its row. Done once:
+    /// with any run on the board there is nothing to adopt.
+    pub fn adopt_legacy_run(&self, root: &str) -> Result<Option<i64>> {
+        let any: i64 = self.conn.query_row("SELECT count(*) FROM runs", [], |r| r.get(0))?;
+        if any > 0 {
+            return Ok(None);
+        }
+        let agents: Vec<(String, String, Option<String>, String)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT name, role, repo, session_id FROM agents
+                 WHERE session_id IS NOT NULL",
+            )?;
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        if agents.is_empty() {
+            return Ok(None);
+        }
+        let run = self.start_run(root)?;
+        // Dated from the earliest of them, not from now: the run is the work
+        // they already did, and a window that opened at adoption would hold
+        // none of it — no tasks, and "just now" for a crew from last week.
+        self.conn.execute(
+            "UPDATE runs SET started_at = COALESCE(
+                 (SELECT MIN(spawned_at) FROM agents WHERE session_id IS NOT NULL),
+                 started_at)
+             WHERE id = ?1",
+            params![run],
+        )?;
+        for (name, role, repo, session) in agents {
+            let repo = repo.unwrap_or_else(|| root.to_string());
+            self.join_run(run, &name, &role, &repo)?;
+            self.set_run_session(run, &name, &session)?;
+        }
+        Ok(Some(run))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1004,6 +1250,160 @@ mod tests {
         chain(&db, &["A", "B"]);
         db.add_dep("B", "A").unwrap();
         db.add_dep("B", "A").unwrap();
+    }
+
+    #[test]
+    fn a_run_keeps_the_session_a_later_chief_overwrites() {
+        // The agents table keeps one row per name: today's chief repoints
+        // it, and last week's conversation would be lost with it.
+        let db = Db::open_in_memory().unwrap();
+        let old = db.start_run("/w").unwrap();
+        db.join_run(old, "chief", "chief", "/w").unwrap();
+        db.set_run_session(old, "chief", "sess-last-week").unwrap();
+        db.upsert_agent("chief", Some("chief"), Some("/w"), Some("sess-last-week"), None, None)
+            .unwrap();
+
+        let new = db.start_run("/w").unwrap();
+        db.join_run(new, "chief", "chief", "/w").unwrap();
+        db.upsert_agent("chief", None, None, Some("sess-today"), None, None).unwrap();
+        db.set_run_session(new, "chief", "sess-today").unwrap();
+
+        let then = db.run(old).unwrap().unwrap();
+        assert_eq!(then.agents[0].session_id.as_deref(), Some("sess-last-week"));
+    }
+
+    #[test]
+    fn an_agent_that_died_comes_back_and_one_retired_on_purpose_does_not() {
+        let db = Db::open_in_memory().unwrap();
+        let run = db.start_run("/w").unwrap();
+        for (name, sid) in [("chief", "s1"), ("billing-svc", "s2"), ("storefront", "s3")] {
+            db.join_run(run, name, if name == "chief" { "chief" } else { "worker" }, "/w").unwrap();
+            db.set_run_session(run, name, sid).unwrap();
+        }
+        db.retire_in_run(run, "storefront").unwrap();
+
+        let r = db.run(run).unwrap().unwrap();
+        let back: Vec<&str> = r.resumable().map(|a| a.name.as_str()).collect();
+        assert_eq!(back, vec!["chief", "billing-svc"]);
+    }
+
+    #[test]
+    fn an_agent_that_never_reported_a_session_cannot_be_resumed() {
+        let db = Db::open_in_memory().unwrap();
+        let run = db.start_run("/w").unwrap();
+        db.join_run(run, "never-adopted", "worker", "/w").unwrap();
+        assert_eq!(db.run(run).unwrap().unwrap().resumable().count(), 0);
+    }
+
+    #[test]
+    fn the_chief_is_listed_first() {
+        let db = Db::open_in_memory().unwrap();
+        let run = db.start_run("/w").unwrap();
+        db.join_run(run, "alpha", "worker", "/w").unwrap();
+        db.join_run(run, "chief", "chief", "/w").unwrap();
+        let names: Vec<String> = db.run(run).unwrap().unwrap().agents.into_iter().map(|a| a.name).collect();
+        assert_eq!(names, vec!["chief", "alpha"]);
+    }
+
+    #[test]
+    fn runs_are_listed_per_workspace_newest_first_and_empty_ones_are_not() {
+        let db = Db::open_in_memory().unwrap();
+        let a = db.start_run("/w").unwrap();
+        db.join_run(a, "chief", "chief", "/w").unwrap();
+        let _elsewhere = db.start_run("/other").unwrap();
+        let _empty = db.start_run("/w").unwrap();
+        let b = db.start_run("/w").unwrap();
+        db.join_run(b, "chief", "chief", "/w").unwrap();
+
+        let ids: Vec<i64> = db.runs("/w").unwrap().into_iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![b, a]);
+    }
+
+    #[test]
+    fn what_a_run_did_is_what_its_agents_did_before_the_next_run_began() {
+        // A name reused in a later run is that run's: its tasks must not be
+        // credited to the one before.
+        let db = Db::open_in_memory().unwrap();
+        let first = db.start_run("/w").unwrap();
+        db.join_run(first, "chief", "chief", "/w").unwrap();
+        db.conn
+            .execute("UPDATE runs SET started_at = '2026-09-01T09:00:00Z' WHERE id = ?1", params![first])
+            .unwrap();
+        db.log_event("message", Some("chief"), Some("x"), Some("ENG-1-1"), "go", None, None).unwrap();
+        db.conn
+            .execute("UPDATE events SET ts = '2026-09-01T10:00:00.000Z' WHERE task_key = 'ENG-1-1'", [])
+            .unwrap();
+
+        let second = db.start_run("/w").unwrap();
+        db.join_run(second, "chief", "chief", "/w").unwrap();
+        db.conn
+            .execute("UPDATE runs SET started_at = '2026-09-02T09:00:00Z' WHERE id = ?1", params![second])
+            .unwrap();
+        db.log_event("message", Some("chief"), Some("y"), Some("ENG-2-1"), "go", None, None).unwrap();
+
+        let r1 = db.run(first).unwrap().unwrap();
+        assert_eq!(r1.tasks, vec!["ENG-1-1"]);
+        assert_eq!(r1.last_active, "2026-09-01T10:00:00.000Z");
+        let r2 = db.run(second).unwrap().unwrap();
+        assert_eq!(r2.tasks, vec!["ENG-2-1"]);
+    }
+
+    #[test]
+    fn a_board_from_before_runs_existed_is_given_one_to_resume_from_once() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_agent("chief", Some("chief"), Some("/w"), Some("s-chief"), None, None).unwrap();
+        db.upsert_agent("eng-2155", None, Some("/w/storefront"), Some("s-jet"), None, None).unwrap();
+        db.upsert_agent("never-ran", None, Some("/w/x"), None, None, None).unwrap();
+
+        let run = db.adopt_legacy_run("/w").unwrap().expect("a run to resume");
+        let r = db.run(run).unwrap().unwrap();
+        let back: Vec<(&str, Option<&str>)> =
+            r.resumable().map(|a| (a.name.as_str(), a.session_id.as_deref())).collect();
+        assert_eq!(back, vec![("chief", Some("s-chief")), ("eng-2155", Some("s-jet"))]);
+        assert_eq!(db.adopt_legacy_run("/w").unwrap(), None, "and only once");
+    }
+
+    #[test]
+    fn an_adopted_run_is_dated_from_its_agents_so_their_work_is_in_it() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_agent("chief", Some("chief"), Some("/w"), Some("s"), None, None).unwrap();
+        db.conn
+            .execute("UPDATE agents SET spawned_at = '2026-09-20T09:00:00Z'", [])
+            .unwrap();
+        db.log_event("message", Some("chief"), Some("x"), Some("ENG-2155-1"), "go", None, None).unwrap();
+        db.conn
+            .execute("UPDATE events SET ts = '2026-09-20T10:00:00.000Z'", [])
+            .unwrap();
+
+        let run = db.adopt_legacy_run("/w").unwrap().unwrap();
+        let r = db.run(run).unwrap().unwrap();
+        assert_eq!(r.started_at, "2026-09-20T09:00:00Z");
+        assert_eq!(r.tasks, vec!["ENG-2155-1"], "its work, not an empty window from now");
+    }
+
+    #[test]
+    fn a_spawn_with_no_run_named_joins_the_workspace_it_is_in() {
+        let db = Db::open_in_memory().unwrap();
+        let w = db.start_run("/w").unwrap();
+        let other = db.start_run("/elsewhere").unwrap();
+        assert_eq!(db.run_for_repo("/w/service/billing-service").unwrap(), Some(w));
+        assert_eq!(db.run_for_repo("/w").unwrap(), Some(w));
+        // "/w2" is not inside "/w", whatever the strings share.
+        assert_eq!(db.run_for_repo("/w2/thing").unwrap(), Some(other), "falls back to the latest");
+    }
+
+    #[test]
+    fn an_agent_that_died_leaves_the_rail_without_being_retired() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_agent("billing-svc", None, Some("/w"), Some("s"), None, None).unwrap();
+        db.end_agent("billing-svc").unwrap();
+        assert!(db.agents().unwrap().iter().all(|a| a.name != "billing-svc"), "off the rail");
+        let retired = db
+            .events(10)
+            .unwrap()
+            .iter()
+            .any(|e| e.summary.contains("retired"));
+        assert!(!retired, "and not recorded as something anybody chose");
     }
 
     #[test]

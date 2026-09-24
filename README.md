@@ -15,12 +15,13 @@ already runs on the machine.
 | `skills/board` — the `/board` skill | done |
 | `src/registry.rs` — session discovery and watching | done, 6 tests |
 | `src/transcript.rs` — transcript reading and tailing | done, 8 tests |
-| `src/db.rs` — fleet.db reads and writes | done, 19 tests |
+| `src/db.rs` — fleet.db reads and writes, and runs | done, 29 tests |
 | `fleet board` — the whole board, in the binary | done, 13 tests |
 | `src/tmux.rs` — spawning and pane control | done, 17 tests |
 | `src/ui/` — frame, fleet rail, session pane, board rail | done, 57 tests |
-| `src/agent.rs` — starting an agent, repo discovery | done, 4 tests |
-| `src/brief.rs` — what an agent is told when it starts | done, 18 tests |
+| `src/agent.rs` — starting, resuming, repo discovery | done, 7 tests |
+| `src/brief.rs` — what an agent is told when it starts | done, 19 tests |
+| `src/ui/resume.rs` — picking a run to bring back | done, 5 tests |
 | `src/msg.rs` — delivering a message to its recipient | done, 6 tests |
 | `n` to spawn from the rail | done |
 | `src/ui/flow.rs` — the flow pane and its log view | done, 10 tests |
@@ -140,7 +141,8 @@ the terminal entirely; clicking and scrolling stop until you press it again,
 and the key bar says so while it is off.
 
 Fleet's own keys live behind **`Ctrl-A`**, the way a multiplexer's do: `^a n`
-new agent, `^a x` take one off the rail, `^a m` give the mouse back, `^a z`
+new agent, `^a x` take one off the rail, `^a r` bring back an earlier run,
+`^a m` give the mouse back, `^a z`
 fold the rails away, `^a g` graph, `^a l` log, `^a tab` move the keyboard,
 `^a q` quit. `↵` hands you the real terminal until you
 detach. `^a ^a` sends a literal Ctrl-A through. Where nothing is live to type
@@ -213,6 +215,46 @@ yours`. A body is folded onto the same line, because `send-keys` types what it
 is given and a newline would submit half a message; past ~1500 characters it
 is a document and the delivery says so rather than pasting a page into
 somebody's prompt.
+
+## Picking up where you left off
+
+A reboot, a closed terminal, `tmux kill-server`: the agents' processes go, and
+their conversations do not. Claude Code keeps each one, and `claude --resume`
+continues it under the same id. What was missing was a record of which
+conversations belonged together.
+
+That record is a **run**: one stretch of work in one workspace — the chief and
+every agent it started, each with the session it had. Every agent joins the run
+it was started in; the chief's own environment carries `FLEET_RUN`, so an agent
+it starts with `fleet spawn` lands in its run rather than whichever is newest.
+
+Start fleet in a workspace with nothing running and a run to come back to, and
+it asks before starting a fresh chief:
+
+```
+ pick up where you left off
+
+ ▌ 28m ago · the chief + 2 agents
+ ▌   ENG-2155-fixes, ENG-2155-review, ENG-2155, staging-fix
+ ▌   chief, eng-2155, eng-2155-review
+   start fresh — a new chief, nothing brought back
+```
+
+Choosing one relaunches each of its agents with `claude --resume` in its own
+repository, back on the rail as itself. The role goes back into the system
+prompt and the chief's editing tools stay withheld, because both are set at
+launch and not kept with the conversation. `^a r` opens the same list at any
+time; from a shell, `fleet resume` lists the runs and `fleet resume <id>`
+brings one back.
+
+Two things are deliberately left out of a resume. An agent taken off the rail
+with `^a x` stays off — that was a choice, where a process dying is not, and
+the two are recorded differently now. And an agent whose conversation is gone
+from disk is named rather than resumed, since `--resume` on a missing
+conversation opens an empty one that looks, at a glance, like the old agent.
+
+A board from before runs existed has one made for it, once, from the sessions
+the agents table still held — which is the last crew anyone ran.
 
 ## Working on the layout
 

@@ -13,9 +13,10 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
-use crate::db::Db;
+use crate::brief;
+use crate::db::{Db, RunAgent};
 use crate::registry::{self, Registry, Session};
 use crate::tmux::{self, Pane, Tmux};
 
@@ -45,6 +46,11 @@ pub enum Naming {
 }
 
 /// Open a pane and put the agent on the board, without waiting for it.
+///
+/// `run` is the run it joins. Its id also goes into the agent's environment
+/// as `FLEET_RUN`, so that an agent the chief starts with `fleet spawn`
+/// lands in the chief's run rather than in whichever one is newest.
+#[allow(clippy::too_many_arguments)]
 pub fn start(
     tmux: &Tmux,
     db: &Db,
@@ -52,6 +58,8 @@ pub fn start(
     repo: &Path,
     command: &str,
     naming: Naming,
+    role: &str,
+    run: Option<i64>,
 ) -> Result<Spawned> {
     let repo = repo
         .canonicalize()
@@ -60,7 +68,14 @@ pub fn start(
         Naming::Unique => unique_name(db, name)?,
         Naming::Exact => name.to_string(),
     };
-    let pane = tmux.spawn(&name, &repo, command)?;
+    let command = match run {
+        Some(id) => format!("FLEET_RUN={id} {command}"),
+        None => command.to_string(),
+    };
+    let pane = tmux.spawn(&name, &repo, &command)?;
+    if let Some(id) = run {
+        db.join_run(id, &name, role, &repo.to_string_lossy())?;
+    }
     let target = format!("{}:{}", pane.session, pane.window_name);
 
     // The row goes in before the session exists. An agent that never reports
@@ -116,9 +131,79 @@ pub fn adopt(pane_pid: i32, timeout: Duration) -> Option<Session> {
     None
 }
 
-/// Record which session an agent turned out to be.
-pub fn link(db: &Db, name: &str, session_id: &str) -> Result<()> {
-    db.upsert_agent(name, None, None, Some(session_id), None, None)
+/// Record which session an agent turned out to be — on the board, and in
+/// its run, which is what a later resume reads.
+pub fn link(db: &Db, name: &str, session_id: &str, run: Option<i64>) -> Result<()> {
+    db.upsert_agent(name, None, None, Some(session_id), None, None)?;
+    if let Some(id) = run {
+        db.set_run_session(id, name, session_id)?;
+    }
+    Ok(())
+}
+
+/// Bring an agent from an earlier run back, into its own conversation.
+///
+/// `claude --resume` continues a session under the same id, so the agent
+/// comes back as itself: its history, its context, the work it was halfway
+/// through. The role goes back into the system prompt, and the chief's
+/// editing tools stay withheld — both are set at launch, not kept with the
+/// conversation, so a resume that skipped them would be a chief that could
+/// write code again.
+pub fn resume(tmux: &Tmux, db: &Db, run: i64, member: &RunAgent) -> Result<Spawned> {
+    resume_from(tmux, db, run, member, &registry::default_projects_dir(), "claude")
+}
+
+/// `resume`, with Claude Code's projects directory and program given rather
+/// than found — for a test, which must not start the real thing.
+pub fn resume_from(
+    tmux: &Tmux,
+    db: &Db,
+    run: i64,
+    member: &RunAgent,
+    projects: &Path,
+    program: &str,
+) -> Result<Spawned> {
+    let session = member
+        .session_id
+        .as_deref()
+        .with_context(|| format!("{} never reported a session to resume", member.name))?;
+    let repo = Path::new(&member.repo);
+    if !conversation_in(projects, repo, session) {
+        bail!("{}'s conversation is no longer on disk", member.name);
+    }
+    let brief = if member.role == "chief" {
+        brief::chief(repo)
+    } else {
+        brief::worker(&member.name, repo, None, None)
+    };
+    let command = brief::resume_command_for(program, &brief, session);
+    let spawned = start(
+        tmux,
+        db,
+        &member.name,
+        repo,
+        &command,
+        Naming::Exact,
+        &member.role,
+        Some(run),
+    )?;
+    db.upsert_agent(&member.name, Some(&member.role), None, Some(session), None, None)?;
+    db.set_run_session(run, &member.name, session)?;
+    db.log_event("note", Some(&member.name), None, None, "resumed", None, None)?;
+    Ok(spawned)
+}
+
+/// Whether Claude Code still has the conversation. `--resume` on one that is
+/// gone opens an empty session that looks, at a glance, like the old one.
+pub fn conversation_exists(repo: &Path, session: &str) -> bool {
+    conversation_in(&registry::default_projects_dir(), repo, session)
+}
+
+fn conversation_in(projects: &Path, repo: &Path, session: &str) -> bool {
+    projects
+        .join(registry::project_slug(repo))
+        .join(format!("{session}.jsonl"))
+        .is_file()
 }
 
 /// Repositories under `root` that an agent could be started in.
@@ -233,6 +318,111 @@ mod tests {
         let taken: Vec<_> = found.iter().filter(|c| c.taken).map(|c| &c.name).collect();
         assert_eq!(taken, vec!["billing-service"]);
         assert_eq!(found.len(), 2, "a second agent in one repo is allowed");
+    }
+
+    fn member(name: &str, role: &str, repo: &Path, session: Option<&str>) -> RunAgent {
+        RunAgent {
+            name: name.into(),
+            role: role.into(),
+            repo: repo.to_string_lossy().to_string(),
+            session_id: session.map(str::to_string),
+            retired: false,
+        }
+    }
+
+    #[test]
+    fn an_agent_that_never_reported_a_session_is_not_resumed() {
+        let db = Db::open_in_memory().unwrap();
+        let run = db.start_run("/w").unwrap();
+        let Ok(tmux) = Tmux::detect(Some("unused")) else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let err = resume_from(&tmux, &db, run, &member("x", "worker", dir.path(), None), dir.path(), "false")
+            .err()
+            .expect("refused");
+        assert!(err.to_string().contains("never reported a session"), "{err}");
+    }
+
+    #[test]
+    fn an_agent_whose_conversation_is_gone_is_not_resumed_into_an_empty_one() {
+        // `claude --resume` on a missing conversation does not come back as
+        // the old agent, and a pane that looks like it did is worse.
+        let db = Db::open_in_memory().unwrap();
+        let run = db.start_run("/w").unwrap();
+        let Ok(tmux) = Tmux::detect(Some("unused")) else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let err = resume_from(&tmux, &db, run, &member("x", "worker", dir.path(), Some("s")), dir.path(), "false")
+            .err()
+            .expect("refused");
+        assert!(err.to_string().contains("no longer on disk"), "{err}");
+    }
+
+    #[test]
+    fn a_resumed_agent_comes_back_into_its_own_conversation_and_its_run() {
+        use std::time::Duration;
+
+        let socket = format!("fleet-resume-{}", std::process::id());
+        let Ok(tmux) = Tmux::detect(Some(&socket)) else { return };
+        let tmux = tmux.on_socket(&socket);
+        if tmux.ensure_session().is_err() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("billing-service");
+        std::fs::create_dir_all(&repo).unwrap();
+        let repo = repo.canonicalize().unwrap();
+
+        // The conversation, where Claude Code keeps it.
+        let projects = dir.path().join("projects");
+        let slug = projects.join(registry::project_slug(&repo));
+        std::fs::create_dir_all(&slug).unwrap();
+        std::fs::write(slug.join("sess-abc.jsonl"), "{}\n").unwrap();
+
+        // A stand-in for Claude Code that records what it was started with.
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let argv = dir.path().join("argv");
+        let env = dir.path().join("env");
+        std::fs::write(
+            bin.join("claude"),
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\000' \"$a\"; done > {}\nprintf %s \"$FLEET_RUN\" > {}\n",
+                argv.display(),
+                env.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(bin.join("claude"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let db = Db::open_in_memory().unwrap();
+        let run = db.start_run("/w").unwrap();
+        let who = member("billing-svc", "worker", &repo, Some("sess-abc"));
+        let program = bin.join("claude").to_string_lossy().to_string();
+        let spawned = resume_from(&tmux, &db, run, &who, &projects, &program);
+        for _ in 0..40 {
+            if env.is_file() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let got = std::fs::read_to_string(&argv).unwrap_or_default();
+        let fleet_run = std::fs::read_to_string(&env).unwrap_or_default();
+        let _ = tmux.kill_server();
+
+        assert!(spawned.is_ok(), "{:?}", spawned.err());
+        let args: Vec<&str> = got.split('\0').filter(|a| !a.is_empty()).collect();
+        assert_eq!(args.get(..2), Some(&["--resume", "sess-abc"][..]), "its own conversation: {args:?}");
+        assert!(args.contains(&"--append-system-prompt"), "with its role: {args:?}");
+        assert_eq!(fleet_run, run.to_string(), "and knows which run it is in");
+
+        // Back on the rail, as itself.
+        let a = db.agents().unwrap().into_iter().find(|a| a.name == "billing-svc").unwrap();
+        assert_eq!(a.session_id.as_deref(), Some("sess-abc"));
+        let r = db.run(run).unwrap().unwrap();
+        assert_eq!(r.agents[0].session_id.as_deref(), Some("sess-abc"));
     }
 
     #[test]

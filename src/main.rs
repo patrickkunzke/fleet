@@ -65,6 +65,17 @@ enum Command {
         #[arg(long)]
         plain: bool,
     },
+    /// Bring back an earlier run: the chief and every agent it started, each
+    /// into its own conversation. Without an id, lists the runs there are.
+    Resume {
+        /// Which run, as the list prints it.
+        run: Option<i64>,
+        /// The workspace. Defaults to the directory you are standing in.
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long, env = "FLEET_DB")]
+        db: Option<PathBuf>,
+    },
     /// Show what each key arrives as, and what fleet sends on to an agent.
     /// For when a key does not do in fleet what it does in the terminal.
     Keys,
@@ -267,6 +278,76 @@ enum BgCmd {
     Ls,
 }
 
+fn resume(run: Option<i64>, root: Option<PathBuf>, db_path: Option<PathBuf>) -> Result<()> {
+    let db = Db::open(db_path.unwrap_or_else(db::default_path))?;
+    let root = match root {
+        Some(r) => r,
+        None => std::env::current_dir()?,
+    };
+    let root = root.canonicalize().unwrap_or(root);
+    let workspace = root.to_string_lossy().to_string();
+    let _ = db.adopt_legacy_run(&workspace);
+
+    let Some(id) = run else {
+        let offers: Vec<ui::resume::Offer> = db
+            .runs(&workspace)?
+            .into_iter()
+            .filter_map(ui::resume::Offer::of)
+            .collect();
+        if offers.is_empty() {
+            println!("no earlier run in {workspace} to bring back");
+            return Ok(());
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0.0, |d| d.as_secs_f64());
+        for o in &offers {
+            println!(
+                "{:>4}  {:<11} {}",
+                o.run.id,
+                ui::resume::ago(now, &o.run.last_active),
+                o.run.tasks.join(", ")
+            );
+            let mut who = o.back.join(", ");
+            if !o.lost.is_empty() {
+                who.push_str(&format!("  — {} gone from disk", o.lost.join(", ")));
+            }
+            println!("                  {who}");
+        }
+        println!("\nfleet resume <id> brings one back");
+        return Ok(());
+    };
+
+    let run = db
+        .run(id)?
+        .with_context(|| format!("no run {id} on the board"))?;
+    let tmux = Tmux::detect(None)?;
+    let live: Vec<String> = db
+        .agents()?
+        .into_iter()
+        .filter(|a| a.tmux_target.as_deref().is_some_and(|t| tmux.find(t).ok().flatten().is_some()))
+        .map(|a| a.name)
+        .collect();
+    let mut any = false;
+    for member in run.resumable() {
+        if live.contains(&member.name) {
+            println!("{:<18} already running", member.name);
+            continue;
+        }
+        match agent::resume(&tmux, &db, run.id, member) {
+            Ok(s) => {
+                any = true;
+                println!("{:<18} resumed in {}:{}", s.name, s.pane.session, s.pane.window_name);
+            }
+            Err(e) => println!("{:<18} not resumed: {e}", member.name),
+        }
+    }
+    if any && !Tmux::inside() {
+        println!("\nfleet, or tmux attach -t {}, to see them", tmux.session());
+    }
+    Ok(())
+}
+
 /// Knock at the recipient's door, and say whether anyone was in.
 ///
 /// Every outcome is reported rather than returned as an error: the message
@@ -350,6 +431,7 @@ fn main() -> Result<()> {
             ui::preview::run(w, h, view.as_deref(), plain)
         }
         Command::Keys => ui::keys(),
+        Command::Resume { run, root, db } => resume(run, root, db),
         Command::Sessions { watch } => sessions(watch),
         Command::Session { name, watch, lines } => session(&name, watch, lines),
         Command::Board { cmd, db } => board(cmd, db),
@@ -425,7 +507,18 @@ fn spawn(
     } else {
         agent::Naming::Unique
     };
-    let spawned = agent::start(&tmux, &db, name, repo, &command, naming)?;
+    // The chief's run, when the chief is the one running this: it put
+    // FLEET_RUN in its own environment for exactly this. Otherwise the run of
+    // whichever workspace the repository sits in.
+    let within = repo
+        .canonicalize()
+        .with_context(|| format!("no such repository: {}", repo.display()))?;
+    let run = match std::env::var("FLEET_RUN").ok().and_then(|v| v.parse::<i64>().ok()) {
+        Some(id) => Some(id),
+        None => db.run_for_repo(&within.to_string_lossy())?,
+    };
+    let role_name = if chief { "chief" } else { "worker" };
+    let spawned = agent::start(&tmux, &db, name, repo, &command, naming, role_name, run)?;
     if chief {
         // The board has to agree, or the rail draws it as a worker and the
         // TUI starts a second chief alongside it.
@@ -443,7 +536,7 @@ fn spawn(
 
     match agent::adopt(spawned.pane.pid, Duration::from_secs(timeout)) {
         Some(found) => {
-            agent::link(&db, &spawned.name, &found.session_id)?;
+            agent::link(&db, &spawned.name, &found.session_id, run)?;
             println!("      adopted session {} (pid {})", found.session_id, found.pid);
         }
         None => println!(

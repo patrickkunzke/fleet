@@ -115,6 +115,39 @@ CREATE TABLE IF NOT EXISTS task_deps (
 CREATE INDEX IF NOT EXISTS idx_deps_reverse ON task_deps(depends_on);
 
 
+-- ------------------------------------------------------------------ runs ---
+-- One stretch of work in one workspace: a chief and the agents it started,
+-- running together. What `fleet resume` brings back.
+--
+-- Separate from agents because that table keeps one row per name and repoints
+-- its session_id on every respawn: the chief started today overwrites the one
+-- from last week. This keeps which sessions belonged together, so a whole crew
+-- can be resumed as it was.
+
+CREATE TABLE IF NOT EXISTS runs (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  root       TEXT NOT NULL,               -- the workspace fleet was started in
+  started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_runs_root ON runs(root, id);
+
+CREATE TABLE IF NOT EXISTS run_agents (
+  run_id     INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  name       TEXT NOT NULL,
+  role       TEXT NOT NULL DEFAULT 'worker' CHECK (role IN ('chief', 'worker')),
+  repo       TEXT NOT NULL,
+  session_id TEXT,                        -- what `claude --resume` is given
+  -- Taken off the rail on purpose, and so not brought back. An agent whose
+  -- process merely died is still part of the run.
+  retired    INTEGER NOT NULL DEFAULT 0,
+  joined_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+  PRIMARY KEY (run_id, name)
+);
+
+INSERT OR IGNORE INTO schema_version (version) VALUES (2);
+
+
 -- ---------------------------------------------------------------- events ---
 -- The flow log: SEMANTIC events only — who told whom what, and task
 -- transitions. Tool calls and file edits are NOT written here; they are in the

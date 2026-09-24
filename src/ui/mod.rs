@@ -19,6 +19,7 @@ pub mod keys;
 pub mod picker;
 pub mod mirror;
 pub mod preview;
+pub mod resume;
 pub mod selection;
 pub mod sender;
 pub mod session;
@@ -115,6 +116,11 @@ pub struct App {
     sender: Option<sender::Sender>,
     /// True between the prefix and the key it modifies.
     armed: bool,
+    /// The run new agents join: the crew in this workspace that a later
+    /// resume brings back together.
+    run: Option<i64>,
+    /// The list of earlier runs to bring back, while it is open.
+    resume_picker: Option<resume::ResumePicker>,
     /// The repository picker, while it is open. An overlay rather than a
     /// mode: everything underneath keeps updating behind it.
     picker: Option<Picker>,
@@ -173,6 +179,8 @@ impl App {
             first_seen: std::collections::HashMap::new(),
             armed: false,
             picker: None,
+            run: None,
+            resume_picker: None,
             tasks: Vec::new(),
             background: Vec::new(),
             events: Vec::new(),
@@ -245,6 +253,10 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return;
         }
+        if self.resume_picker.is_some() {
+            self.resume_key(key);
+            return;
+        }
         if self.picker.is_some() {
             self.picker_key(key);
             return;
@@ -300,7 +312,9 @@ impl App {
                     Focus::Session => Focus::Rail,
                 }
             }
-            (KeyCode::Char('r'), _) => self.refresh(),
+            // Refresh used to live here; the board and the registry are
+            // watched now, and bringing a run back is worth the key more.
+            (KeyCode::Char('r'), _) => self.open_resume(),
             (KeyCode::Char('z'), _) => {
                 self.wide = !self.wide;
                 self.focus = Focus::Session;
@@ -542,6 +556,7 @@ impl App {
             &chosen.name,
             &chosen.path.clone(),
             agent::Naming::Unique,
+            "worker",
             &brief,
         );
     }
@@ -553,6 +568,9 @@ impl App {
     /// surprising thing for a list to do.
     fn retire_selected(&mut self) {
         let Some(row) = self.selected().cloned() else { return };
+        if let Some(run) = self.run {
+            let _ = self.db.retire_in_run(run, &row.name);
+        }
         match self.db.retire_agent(&row.name) {
             Ok(()) => {
                 self.status = Some(format!("{} is off the rail; its pane is untouched", row.name));
@@ -576,7 +594,10 @@ impl App {
             .map(|r| r.name.clone())
             .collect();
         for name in dead {
-            let _ = self.db.retire_agent(&name);
+            // Off the rail, but not retired: its run keeps it, so it can be
+            // resumed. Retiring it here, as this used to, is how a reboot
+            // lost the whole crew.
+            let _ = self.db.end_agent(&name);
         }
         self.refresh();
     }
@@ -623,6 +644,7 @@ impl App {
             "chief",
             &root,
             agent::Naming::Exact,
+            "chief",
             &brief::chief(&root),
         );
         if let Err(e) = self.db.upsert_agent("chief", Some("chief"), None, None, None, None) {
@@ -636,13 +658,21 @@ impl App {
     /// Waiting here for Claude Code to register itself would freeze the UI
     /// for several seconds on every spawn, which is how a key stops being
     /// worth pressing.
-    fn launch(&mut self, name: &str, repo: &Path, naming: agent::Naming, brief: &brief::Brief) {
+    fn launch(
+        &mut self,
+        name: &str,
+        repo: &Path,
+        naming: agent::Naming,
+        role: &str,
+        brief: &brief::Brief,
+    ) {
         let Some(tmux) = self.tmux.clone() else {
             self.status = Some("no tmux — agents are started in tmux panes".into());
             return;
         };
         let command = brief::command(brief);
-        let spawned = match agent::start(&tmux, &self.db, name, repo, &command, naming) {
+        let run = self.ensure_run();
+        let spawned = match agent::start(&tmux, &self.db, name, repo, &command, naming, role, run) {
             Ok(s) => s,
             Err(e) => {
                 self.status = Some(format!("cannot start {name}: {e}"));
@@ -658,8 +688,16 @@ impl App {
             self.retarget();
         }
 
+        self.adopt_later(spawned);
+    }
+
+    /// Wait, off this thread, for the session that appears in a new pane,
+    /// and record it — on the board and in the run, which is what a resume
+    /// reads later.
+    fn adopt_later(&self, spawned: agent::Spawned) {
         let db_path = self.db_path.clone();
         let tx = self.tx.clone();
+        let run = self.run;
         std::thread::spawn(move || {
             let Some(found) = agent::adopt(spawned.pane.pid, Duration::from_secs(30)) else {
                 return;
@@ -667,10 +705,132 @@ impl App {
             // A separate connection: this thread cannot borrow the one the UI
             // is using, and SQLite in WAL mode is happy with both.
             if let Ok(db) = Db::open(&db_path) {
-                let _ = agent::link(&db, &spawned.name, &found.session_id);
+                let _ = agent::link(&db, &spawned.name, &found.session_id, run);
             }
             let _ = tx.send(Msg::Registry);
         });
+    }
+
+    /// The workspace, as runs record it: canonical, so that /tmp and
+    /// /private/tmp are one workspace and not two.
+    fn workspace(&self) -> Option<String> {
+        let root = self.root.as_ref()?;
+        let root = root.canonicalize().unwrap_or_else(|_| root.clone());
+        Some(root.to_string_lossy().to_string())
+    }
+
+    /// The run new agents join, beginning one if there is none yet.
+    fn ensure_run(&mut self) -> Option<i64> {
+        if self.run.is_none() {
+            let root = self.workspace()?;
+            match self.db.start_run(&root) {
+                Ok(id) => self.run = Some(id),
+                Err(e) => self.status = Some(format!("cannot record the run: {e}")),
+            }
+        }
+        self.run
+    }
+
+    /// Earlier runs in this workspace that have someone to bring back.
+    fn offers(&self) -> Vec<resume::Offer> {
+        let Some(root) = self.workspace() else {
+            return Vec::new();
+        };
+        self.db
+            .runs(&root)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(resume::Offer::of)
+            .collect()
+    }
+
+    fn open_resume(&mut self) {
+        let offers = self.offers();
+        if offers.is_empty() {
+            self.status = Some("no earlier run in this workspace to bring back".into());
+            return;
+        }
+        self.resume_picker = Some(resume::ResumePicker::new(offers, self.run));
+    }
+
+    fn resume_key(&mut self, key: KeyEvent) {
+        let Some(picker) = self.resume_picker.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.resume_picker = None,
+            KeyCode::Up => picker.move_by(-1),
+            KeyCode::Down => picker.move_by(1),
+            KeyCode::Enter => {
+                let Some(picker) = self.resume_picker.take() else { return };
+                match picker.choice() {
+                    resume::Choice::Run(i) => {
+                        let offer = picker.offers.into_iter().nth(i).expect("chosen from the list");
+                        self.resume_run(offer.run);
+                    }
+                    resume::Choice::Fresh => {
+                        // A new run, not a continuation of the one before:
+                        // what is started now belongs together, apart.
+                        self.run = None;
+                        self.ensure_chief();
+                        self.select_chief();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Bring a run's crew back, each into its own conversation.
+    fn resume_run(&mut self, run: db::Run) {
+        let Some(tmux) = self.tmux.clone() else {
+            self.status = Some("no tmux — agents are resumed into tmux panes".into());
+            return;
+        };
+        self.run = Some(run.id);
+        let live: std::collections::HashSet<String> = self
+            .rows
+            .iter()
+            .filter(|r| matches!(r.presence, fleet::Presence::Working | fleet::Presence::Waiting))
+            .map(|r| r.name.clone())
+            .collect();
+
+        let mut back = Vec::new();
+        let mut failed = Vec::new();
+        for member in run.resumable() {
+            // Still running from before: resuming it again would open a
+            // second copy of the same conversation.
+            if live.contains(&member.name) {
+                continue;
+            }
+            match agent::resume(&tmux, &self.db, run.id, member) {
+                Ok(spawned) => {
+                    back.push(spawned.name.clone());
+                    self.adopt_later(spawned);
+                }
+                Err(e) => failed.push(e.to_string()),
+            }
+        }
+        let chief_back = run.resumable().any(|m| m.role == "chief");
+
+        self.status = Some(match (back.is_empty(), failed.is_empty()) {
+            (true, true) => "everyone in that run is already running".into(),
+            (false, true) => format!("resumed {}", back.join(", ")),
+            (_, false) => format!("resumed {} — {}", back.join(", "), failed.join("; ")),
+        });
+        self.refresh();
+        // A run with no chief to resume still wants one to brief.
+        if !chief_back {
+            self.ensure_chief();
+        }
+        self.select_chief();
+    }
+
+    fn select_chief(&mut self) {
+        if let Some(at) = self.rows.iter().position(|r| r.role == fleet::Role::Chief) {
+            self.selected = at;
+            self.retarget();
+        }
     }
 
     /// Select the agent an event came from, and go back to watching it.
@@ -846,6 +1006,9 @@ impl App {
         if let Some(picker) = &self.picker {
             picker.render(frame, area);
         }
+        if let Some(picker) = &self.resume_picker {
+            picker.render(frame, area, unix_now());
+        }
     }
 
     fn draw_top(&self, frame: &mut Frame, area: Rect) {
@@ -938,7 +1101,7 @@ impl App {
                 Paragraph::new(Line::from(vec![
                     Span::styled(" ^a ", theme::accent().add_modifier(Modifier::REVERSED)),
                     Span::styled(
-                        "  n new  x retire  m mouse  z wide  g graph  l log  tab focus  q quit",
+                        "  n new  x retire  r resume  m mouse  z wide  g graph  l log  tab focus  q quit",
                         theme::dim(),
                     ),
                 ])),
@@ -1019,11 +1182,32 @@ pub fn run(db: Db, db_path: PathBuf, root: Option<PathBuf>) -> Result<()> {
     app.refresh();
     // Only here, never in snapshot: drawing a frame must not start a
     // Claude Code session as a side effect.
+    if let Some(root) = app.workspace() {
+        // A board from before runs existed still holds the last crew that
+        // ran; give it a run, once, so it can be brought back.
+        let _ = app.db.adopt_legacy_run(&root);
+    }
+    let live = app
+        .rows
+        .iter()
+        .any(|r| matches!(r.presence, fleet::Presence::Working | fleet::Presence::Waiting));
     app.prune_dead();
-    app.ensure_chief();
-    if let Some(at) = app.rows.iter().position(|r| r.role == fleet::Role::Chief) {
-        app.selected = at;
-        app.retarget();
+    if live {
+        // A fleet still running from before fleet was last closed: carry on
+        // with it, and new agents join its run.
+        app.run = app.workspace().and_then(|w| app.db.latest_run(&w).ok().flatten());
+        app.ensure_chief();
+        app.select_chief();
+    } else {
+        // Nothing running. If there is a crew to come back to, ask before
+        // starting a new chief — that was the moment the old one was lost.
+        let offers = app.offers();
+        if offers.is_empty() {
+            app.ensure_chief();
+            app.select_chief();
+        } else {
+            app.resume_picker = Some(resume::ResumePicker::new(offers, None));
+        }
     }
 
     let rx = app.rx.take().expect("the app owns its channel until run takes it");
