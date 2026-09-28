@@ -4,7 +4,8 @@
 #
 # herdr draws every agent's terminal. fleet opens the tabs, briefs what runs
 # in them, carries messages between them, and brings a crew back after a
-# restart. Actions only: nothing runs until you ask for it.
+# restart. Nothing runs until you ask for it: an action, or a workspace opened
+# at a directory you listed in ~/.claude-fleet/auto-open.
 
 id = "fleet"
 name = "fleet"
@@ -20,9 +21,16 @@ command = ["cargo", "build", "--release", "--locked"]
 [[actions]]
 id = "open"
 title = "fleet: open"
-description = "Focus this workspace's fleet tab, or open one at the workspace's directory. The first time, it starts the chief; after a restart, it offers the crew to bring back."
+description = "Focus this workspace's fleet view, or open one at the workspace's directory. The first time, it starts the chief beside it; after a restart, it offers the crew to bring back."
 contexts = ["workspace", "pane"]
 command = ["target/release/fleet", "herdr", "open"]
+
+[[actions]]
+id = "new"
+title = "fleet: new workspace in fleet mode"
+description = "A new workspace at the focused pane's directory, with the fleet view in it and the chief beside it."
+contexts = ["workspace", "pane"]
+command = ["target/release/fleet", "herdr", "new"]
 
 [[actions]]
 id = "doctor"
@@ -30,3 +38,9 @@ title = "fleet: check the setup"
 description = "What fleet needs from herdr and Claude Code, and what to change if something is off. Prints to the plugin log."
 contexts = ["workspace", "pane"]
 command = ["target/release/fleet", "herdr", "doctor"]
+
+# Fleet mode for a new workspace at a directory listed in
+# ~/.claude-fleet/auto-open. Any other workspace is left alone.
+[[events]]
+on = "workspace.created"
+command = ["target/release/fleet", "herdr", "event"]

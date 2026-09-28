@@ -16,10 +16,14 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 
 use crate::brief::{self, Brief};
-use crate::herdr::Herdr;
+use crate::herdr::{Herdr, Pane};
 use crate::tmux::Tmux;
 
 const HERDR_PREFIX: &str = "herdr:";
+
+/// How much of the width the fleet view keeps with the chief beside it. Its
+/// three columns need about 130 cells; the chief is prose, and reads at 90.
+pub const VIEW_SHARE: f32 = 0.6;
 
 #[derive(Clone)]
 pub enum Host {
@@ -101,7 +105,10 @@ impl Host {
     }
 
     /// Open a terminal named `name` in `repo`, and run `command` in it.
-    pub fn open(&self, name: &str, repo: &Path, command: &str) -> Result<Placed> {
+    /// `beside_view` puts it next to the fleet view rather than in a tab of
+    /// its own, where the host can: the chief, who is talked to while the
+    /// board is watched.
+    pub fn open(&self, name: &str, repo: &Path, command: &str, beside_view: bool) -> Result<Placed> {
         match self {
             Host::Tmux(tmux) => {
                 let pane = tmux.spawn(name, repo, command)?;
@@ -112,7 +119,7 @@ impl Host {
                     pane: None,
                 })
             }
-            Host::Herdr(h) => h.open(name, repo, command),
+            Host::Herdr(h) => h.open(name, repo, command, beside_view),
         }
     }
 
@@ -196,18 +203,34 @@ impl Hosted {
 
     /// A tab of its own per agent, labelled with its name. A Claude Code
     /// session wants the width: split beside the others, each would be a
-    /// column too narrow to read a diff in.
-    fn open(&self, name: &str, repo: &Path, command: &str) -> Result<Placed> {
+    /// column too narrow to read a diff in. The one exception is the chief,
+    /// split beside the fleet view when it asks to be.
+    fn open(&self, name: &str, repo: &Path, command: &str, beside_view: bool) -> Result<Placed> {
         let cwd = repo.to_string_lossy();
-        // The agent's own tab, when it is still there: after herdr restarts,
-        // every tab comes back with a shell where the agent was, and a resume
-        // that opened a second one beside it would leave the crew doubled.
-        let (tab, pane, command) = match self.vacant_tab(name) {
-            Some((tab, pane)) => (tab, pane, format!("cd {} && {command}", brief::quote(&cwd))),
-            None => {
-                let created = self.herdr.tab_create(&self.workspace, &cwd, name, false)?;
-                (created.tab_id, created.pane_id, command.to_string())
-            }
+        // A terminal of the agent's own that is still there is used again:
+        // after herdr restarts, every pane comes back with a shell where the
+        // agent was, and a resume that opened a second one beside it would
+        // leave the crew doubled.
+        let cd_then = |c: &str| format!("cd {} && {c}", brief::quote(&cwd));
+        let view = if beside_view { self.view_pane() } else { None };
+        let (tab, pane, command) = match view {
+            Some(view) => match self.vacant_pane(&view.tab_id, name) {
+                Some(pane) => (view.tab_id, pane, cd_then(command)),
+                None => {
+                    let pane = self.herdr.pane_split(&view.pane_id, &cwd, VIEW_SHARE, true)?;
+                    // Labelled, so the shell herdr brings back here after a
+                    // restart is found again.
+                    self.herdr.pane_rename(&pane, name)?;
+                    (view.tab_id, pane, command.to_string())
+                }
+            },
+            None => match self.vacant_tab(name) {
+                Some((tab, pane)) => (tab, pane, cd_then(command)),
+                None => {
+                    let created = self.herdr.tab_create(&self.workspace, &cwd, name, false)?;
+                    (created.tab_id, created.pane_id, command.to_string())
+                }
+            },
         };
         let command = command.as_str();
         // A new pane is not a shell at its prompt for a moment, and a command
@@ -232,6 +255,22 @@ impl Hosted {
 }
 
 impl Hosted {
+    /// The pane the fleet view runs in, in this workspace.
+    pub fn view_pane(&self) -> Option<Pane> {
+        self.herdr.panes(&self.workspace).ok()?.into_iter().find(|p| p.label == crate::plugin::TAB)
+    }
+
+    /// A pane labelled `name` in `tab`, at its prompt with nothing running.
+    fn vacant_pane(&self, tab: &str, name: &str) -> Option<String> {
+        let taken: Vec<String> = self.herdr.agents().ok()?.into_iter().map(|a| a.pane_id).collect();
+        self.herdr
+            .panes(&self.workspace)
+            .ok()?
+            .into_iter()
+            .find(|p| p.tab_id == tab && p.label == name && !taken.contains(&p.pane_id) && self.herdr.pane_idle(&p.pane_id))
+            .map(|p| p.pane_id)
+    }
+
     /// A tab labelled `name` in this workspace with a shell in it at its
     /// prompt, and nothing else running there.
     fn vacant_tab(&self, name: &str) -> Option<(String, String)> {

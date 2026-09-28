@@ -73,7 +73,7 @@ pub fn start(
         Naming::Exact => wanted,
     };
     let command = format!("{}{}", environment(run), host.line(what, &name)?);
-    let placed = host.open(&name, &repo, &command)?;
+    let placed = host.open(&name, &repo, &command, role == "chief")?;
     if let Some(id) = run {
         db.join_run(id, &name, role, &repo.to_string_lossy())?;
     }

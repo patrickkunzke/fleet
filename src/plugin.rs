@@ -1,18 +1,24 @@
 //! fleet as a herdr plugin: what `herdr-plugin.toml` calls.
 //!
 //! Small on purpose. herdr runs an action with the workspace it was invoked
-//! from in its environment; fleet's part is to find or open the fleet tab in
+//! from in its environment; fleet's part is to find or open the fleet view in
 //! it, and to say plainly what in the setup would get in the way.
+//!
+//! Three ways in, one place they land: `open` in the workspace you are in,
+//! `new` in a workspace it makes for the purpose, and the `workspace.created`
+//! hook in any workspace opened at a directory listed in `auto-open`.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
 
 use crate::brief;
-use crate::herdr::{self, Herdr};
+use crate::herdr::{self, Created, Herdr};
+use crate::host::VIEW_SHARE;
 
-/// The label of the tab the fleet view runs in. How `open` finds it again.
+/// The label of the tab and the pane the fleet view runs in. How `open`
+/// finds it again.
 pub const TAB: &str = "fleet";
 
 /// What herdr hands an action about where it was invoked.
@@ -20,6 +26,8 @@ pub const TAB: &str = "fleet";
 struct Invoked {
     workspace: Option<String>,
     cwd: Option<String>,
+    /// The focused pane's own directory, which `cwd` puts second.
+    here: Option<String>,
 }
 
 fn context() -> Invoked {
@@ -38,56 +46,239 @@ fn context_from(json: &serde_json::Value, env_workspace: Option<String>) -> Invo
         // workspace opened at the landscape is the fleet's root, and the
         // pane in front may be one agent's repository inside it.
         cwd: text("workspace_cwd").or_else(|| text("focused_pane_cwd")),
+        here: text("focused_pane_cwd"),
     }
 }
 
-/// Focus the fleet tab in this workspace, opening it first if there is none.
+/// Focus the fleet view in this workspace, opening it first if there is none.
 pub fn open(root: Option<PathBuf>) -> Result<()> {
     let herdr = Herdr::from_env().context("not run by herdr: HERDR_SOCKET_PATH is not set")?;
     let ctx = context();
     let workspace = ctx
         .workspace
         .context("herdr did not say which workspace this was invoked in")?;
-
-    // By the pane, not the tab: a plugin such as herdr-sidebar puts a pane of
-    // its own in every tab, so a tab outlives the view that was in it.
     let root = match root.or(ctx.cwd.map(PathBuf::from)) {
         Some(r) => r,
         None => std::env::current_dir()?,
     };
+    open_in(&herdr, &workspace, &root, None, true)
+}
+
+/// A new workspace in fleet mode: the fleet view in its first tab, and the
+/// chief beside it once the view has started one. At the directory given,
+/// or the focused pane's: where you are, not the workspace you are in.
+pub fn new(root: Option<PathBuf>) -> Result<()> {
+    let herdr = Herdr::from_env().context("not run by herdr: HERDR_SOCKET_PATH is not set")?;
+    let ctx = context();
+    let root = match root.or(ctx.here.map(PathBuf::from)).or(ctx.cwd.map(PathBuf::from)) {
+        Some(r) => r,
+        None => std::env::current_dir()?,
+    };
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("no such directory: {}", root.display()))?;
+    let label = root
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| TAB.into());
+    let created = herdr.workspace_create(&root.to_string_lossy(), &label, true)?;
+    open_in(&herdr, &created.workspace_id, &root, Some(&created), true)
+}
+
+/// What the `workspace.created` hook runs: fleet mode, for a workspace
+/// opened at a directory listed in `auto-open`, and nothing for any other.
+/// Every workspace would be one Claude session too many.
+pub fn event() -> Result<()> {
+    let herdr = Herdr::from_env().context("not run by herdr: HERDR_SOCKET_PATH is not set")?;
+    let json = std::env::var("HERDR_PLUGIN_EVENT_JSON")
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let Some(workspace) = find_text(&json, "workspace_id")
+        .or_else(|| std::env::var("HERDR_WORKSPACE_ID").ok().filter(|w| !w.is_empty()))
+    else {
+        return Ok(());
+    };
+    // herdr's workspace has no directory of its own; its first pane does.
+    // The fleet pane's, when there is one: a workspace herdr restores comes
+    // back with it, and its other panes may be anywhere.
+    let panes = herdr.panes(&workspace)?;
+    let Some(first) = panes
+        .iter()
+        .find(|p| p.label == TAB)
+        .or_else(|| panes.iter().find(|p| p.label.is_empty()))
+    else {
+        return Ok(());
+    };
+    let root = PathBuf::from(&first.cwd);
+    if !auto_open_roots().iter().any(|r| same_dir(r, &root)) {
+        return Ok(());
+    }
+    // A workspace just made has one tab with a shell in it, and the view
+    // takes that shell rather than leaving it beside a tab of its own.
+    let fresh = (first.label.is_empty() && herdr.tabs(&workspace)?.len() == 1).then(|| Created {
+        workspace_id: workspace.clone(),
+        tab_id: first.tab_id.clone(),
+        pane_id: first.pane_id.clone(),
+    });
+    open_in(&herdr, &workspace, &root, fresh.as_ref(), false)
+}
+
+/// Find or start the fleet view in `workspace`. `fresh` is a workspace's
+/// first pane for the view to take over.
+fn open_in(herdr: &Herdr, workspace: &str, root: &Path, fresh: Option<&Created>, focus: bool) -> Result<()> {
+    // `new` makes a workspace, and the hook hears it made: without this,
+    // both would open a fleet in it.
+    let Some(_opening) = Opening::take(workspace) else { return Ok(()) };
     let exe = std::env::current_exe().context("cannot tell where fleet is installed")?;
-    if let Some(pane) = herdr.panes(&workspace)?.into_iter().find(|p| p.label == TAB) {
+
+    // By the pane, not the tab: a plugin such as herdr-sidebar puts a pane of
+    // its own in every tab, so a tab outlives the view that was in it.
+    if let Some(pane) = herdr.panes(workspace)?.into_iter().find(|p| p.label == TAB) {
         // After a herdr restart the pane is back, as a shell: the view that
         // was in it is not. Start it again where it was.
         if herdr.pane_idle(&pane.pane_id) {
-            herdr.pane_run(&pane.pane_id, &view_line(&exe, &root))?;
+            herdr.pane_run(&pane.pane_id, &view_line(&exe, root))?;
         }
-        herdr.tab_focus(&pane.tab_id)?;
+        if focus {
+            herdr.tab_focus(&pane.tab_id)?;
+        }
         return Ok(());
     }
 
-    let created = herdr.tab_create(&workspace, &root.to_string_lossy(), TAB, true)?;
+    let root_text = root.to_string_lossy();
+    let chief = herdr
+        .agents()?
+        .into_iter()
+        .find(|a| a.name == "chief" && a.workspace_id == workspace);
+    let pane = match (fresh, chief) {
+        (Some(created), _) => {
+            herdr.tab_rename(&created.tab_id, TAB)?;
+            created.pane_id.clone()
+        }
+        // The view was closed and the chief kept on: back beside it, on
+        // the left where it was.
+        (None, Some(chief)) => {
+            let pane = herdr.pane_split(&chief.pane_id, &root_text, VIEW_SHARE, focus)?;
+            herdr.pane_swap(&pane, &chief.pane_id)?;
+            pane
+        }
+        (None, None) => herdr.tab_create(workspace, &root_text, TAB, focus)?.pane_id,
+    };
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !herdr.pane_idle(&created.pane_id) {
+    while !herdr.pane_idle(&pane) {
         if Instant::now() >= deadline {
-            bail!("the fleet tab never came to a prompt");
+            bail!("the fleet pane never came to a prompt");
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    herdr.pane_rename(&created.pane_id, TAB)?;
-    herdr.pane_run(&created.pane_id, &view_line(&exe, &root))?;
+    herdr.pane_rename(&pane, TAB)?;
+    herdr.pane_run(&pane, &view_line(&exe, root))?;
     Ok(())
 }
 
+/// A claim on opening the view in one workspace, given up when dropped. A
+/// claim older than a minute is from an `open` that died holding it.
+struct Opening(PathBuf);
+
+impl Opening {
+    fn take(workspace: &str) -> Option<Opening> {
+        let dir = crate::db::default_path().parent()?.to_path_buf();
+        std::fs::create_dir_all(&dir).ok()?;
+        let path = dir.join(format!("opening-{}", workspace.replace(['/', ':'], "-")));
+        for _ in 0..2 {
+            match std::fs::File::create_new(&path) {
+                Ok(_) => return Some(Opening(path)),
+                Err(_) => {
+                    let age = std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| SystemTime::now().duration_since(t).ok());
+                    if age.is_some_and(|a| a < Duration::from_secs(60)) {
+                        return None;
+                    }
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+        None
+    }
+}
+
+impl Drop for Opening {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// The first string under `key` anywhere in `json`. herdr's event payloads
+/// nest the workspace differently from one event to the next.
+fn find_text(json: &serde_json::Value, key: &str) -> Option<String> {
+    match json {
+        serde_json::Value::Object(map) => map
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .or_else(|| map.values().find_map(|v| find_text(v, key))),
+        serde_json::Value::Array(all) => all.iter().find_map(|v| find_text(v, key)),
+        _ => None,
+    }
+}
+
+/// Where the list of directories that open in fleet mode lives.
+pub fn auto_open_path() -> PathBuf {
+    crate::db::default_path()
+        .parent()
+        .map(|p| p.join("auto-open"))
+        .unwrap_or_else(|| PathBuf::from("auto-open"))
+}
+
+fn auto_open_roots() -> Vec<PathBuf> {
+    let text = std::fs::read_to_string(auto_open_path()).unwrap_or_default();
+    roots_from(&text, &std::env::var("HOME").unwrap_or_default())
+}
+
+/// One directory a line; `#` starts a comment, and `~` is the home directory.
+fn roots_from(text: &str, home: &str) -> Vec<PathBuf> {
+    text.lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim())
+        .filter(|l| !l.is_empty())
+        .map(|l| match l.strip_prefix('~') {
+            Some(rest) if rest.is_empty() || rest.starts_with('/') => PathBuf::from(format!("{home}{rest}")),
+            _ => PathBuf::from(l),
+        })
+        .collect()
+}
+
+/// The same directory, however it was spelled: macOS's /tmp is /private/tmp,
+/// and herdr reports the resolved one.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
 /// When the view quits, the tab `open` made for it goes too — with whatever
-/// another plugin added to it — rather than staying behind empty. A view
-/// started by hand in a pane of the user's own leaves that pane alone.
+/// another plugin added to it — rather than staying behind empty. With the
+/// chief beside it, only the view's own pane goes: the chief is still
+/// working. A view started by hand in a pane of the user's own leaves that
+/// pane alone.
 pub fn close_own_tab() {
     if std::env::var_os(OWN_TAB).is_none() {
         return;
     }
-    if let (Some(herdr), Ok(tab)) = (Herdr::from_env(), std::env::var("HERDR_TAB_ID")) {
-        let _ = herdr.tab_close(&tab);
+    let Some(herdr) = Herdr::from_env() else { return };
+    let Ok(tab) = std::env::var("HERDR_TAB_ID") else { return };
+    let shared = herdr.agents().is_ok_and(|all| all.iter().any(|a| a.tab_id == tab));
+    match std::env::var("HERDR_PANE_ID") {
+        Ok(pane) if shared => {
+            let _ = herdr.pane_close(&pane);
+        }
+        _ => {
+            let _ = herdr.tab_close(&tab);
+        }
     }
 }
 
@@ -185,8 +376,26 @@ pub fn doctor() -> Result<()> {
         },
     );
 
+    // Directories whose new workspaces open in fleet mode by themselves.
+    let roots = auto_open_roots();
+    let missing: Vec<_> = roots.iter().filter(|r| !r.is_dir()).collect();
+    say(
+        missing.is_empty(),
+        "auto-open",
+        if roots.is_empty() {
+            format!("none: list a directory a line in {} to open its workspaces in fleet mode", auto_open_path().display())
+        } else if !missing.is_empty() {
+            format!(
+                "not a directory: {}",
+                missing.iter().map(|m| m.display().to_string()).collect::<Vec<_>>().join(", ")
+            )
+        } else {
+            roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>().join(", ")
+        },
+    );
+
     println!(
-        "\nTo open fleet with a key, add to {}:\n\n  [[keys.command]]\n  key = \"prefix+f\"\n  type = \"plugin_action\"\n  command = \"fleet.open\"\n  description = \"fleet\"",
+        "\nTo open fleet with a key, and a new workspace in fleet mode with another, add to {}:\n\n  [[keys.command]]\n  key = \"prefix+f\"\n  type = \"plugin_action\"\n  command = \"fleet.open\"\n  description = \"fleet\"\n\n  [[keys.command]]\n  key = \"prefix+shift+f\"\n  type = \"plugin_action\"\n  command = \"fleet.new\"\n  description = \"new workspace in fleet mode\"",
         herdr::config_path().display()
     );
     if problems > 0 {
@@ -214,7 +423,47 @@ mod tests {
     #[test]
     fn without_the_context_the_panes_own_workspace_is_used() {
         let c = context_from(&serde_json::Value::Null, Some("w1".into()));
-        assert_eq!(c, Invoked { workspace: Some("w1".into()), cwd: None });
+        assert_eq!(c, Invoked { workspace: Some("w1".into()), cwd: None, here: None });
+    }
+
+    #[test]
+    fn a_new_workspace_is_made_where_the_focused_pane_is() {
+        let json = serde_json::json!({ "workspace_cwd": "/w", "focused_pane_cwd": "/w/service" });
+        assert_eq!(context_from(&json, None).here.as_deref(), Some("/w/service"));
+    }
+
+    #[test]
+    fn the_workspace_is_found_wherever_the_event_puts_it() {
+        // As herdr 0.9 sends it on the stream.
+        let json = serde_json::json!({
+            "event": "workspace_created",
+            "data": { "type": "workspace_created", "workspace": { "label": "acme", "workspace_id": "w8" } },
+        });
+        assert_eq!(find_text(&json, "workspace_id").as_deref(), Some("w8"));
+        assert_eq!(find_text(&serde_json::json!({ "workspace_id": "" }), "workspace_id"), None);
+    }
+
+    #[test]
+    fn the_auto_open_list_takes_comments_and_the_home_directory() {
+        let text = "# fleet mode here\n~/Code/acme\n\n/srv/landscape  # the other one\n~other/x\n~\n";
+        assert_eq!(
+            roots_from(text, "/Users/me"),
+            vec![
+                PathBuf::from("/Users/me/Code/acme"),
+                PathBuf::from("/srv/landscape"),
+                PathBuf::from("~other/x"),
+                PathBuf::from("/Users/me"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_directory_is_the_same_however_it_is_spelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = dir.path().join("a");
+        std::fs::create_dir(&inner).unwrap();
+        assert!(same_dir(&inner, &dir.path().join("a/../a")));
+        assert!(!same_dir(&inner, dir.path()));
     }
 
     #[test]

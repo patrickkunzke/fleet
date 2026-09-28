@@ -162,6 +162,16 @@ enum HerdrCmd {
         #[arg(long)]
         root: Option<PathBuf>,
     },
+    /// Open a new workspace in fleet mode: the fleet view, with the chief
+    /// beside it. What the plugin's `fleet.new` action runs.
+    New {
+        /// Where. Defaults to the focused pane's directory.
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
+    /// What the plugin's `workspace.created` hook runs: fleet mode, for a
+    /// workspace at a directory listed in ~/.claude-fleet/auto-open.
+    Event,
     /// Check what fleet needs from herdr and from Claude Code.
     Doctor,
 }
@@ -474,6 +484,8 @@ fn main() -> Result<()> {
         Command::Keys => ui::keys(),
         Command::Herdr { cmd } => match cmd {
             HerdrCmd::Open { root } => plugin::open(root),
+            HerdrCmd::New { root } => plugin::new(root),
+            HerdrCmd::Event => plugin::event(),
             HerdrCmd::Doctor => plugin::doctor(),
         },
         Command::Resume { run, root, db } => resume(run, root, db),

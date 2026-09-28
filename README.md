@@ -33,7 +33,7 @@ already runs on the machine.
 | `src/ui/preview.rs` — the fixture fleet, for layout work | done, 4 tests |
 | `src/herdr.rs` — typed calls to the herdr CLI | done, 7 tests |
 | `src/host.rs` — tmux window or herdr tab, one interface | done, 2 tests |
-| `src/plugin.rs` + `herdr-plugin.toml` — fleet as a herdr plugin | done, 3 tests |
+| `src/plugin.rs` + `herdr-plugin.toml` — fleet as a herdr plugin, fleet mode | done, 7 tests |
 | `src/ui/hosting.rs` — herdr's events, sidebar labels, notifications | done, 6 tests |
 
 ## What it is built on
@@ -69,20 +69,22 @@ Builds the binary, links it to `~/.local/bin/fleet`, links `skills/board` into
 pasting, the mouse, reattaching after a reboot — which is everything fleet had
 to rebuild by hand around tmux and never got to feel native. Run inside herdr,
 fleet stops drawing terminals at all. herdr draws every agent in a tab of its
-own; fleet is the tab that shows the crew.
+own; fleet is the tab that shows the crew, with the chief beside it.
 
 ```
 herdr sidebar      tabs in the workspace
-─────────────      ───────────────────────────────────────────────
-▾ acme          fleet · chief · billing-service · storefront
+─────────────      ───────────────────────────────────────────────────
+▾ acme          fleet · billing-service · storefront
     ● chief
-    ○ content-…    ┌ fleet ─────────────────────────────────────┐
-    ● renaissa…    │ agents │ the graph, or the log │ the board │
-                   └────────────────────────────────────────────┘
+    ○ content-…    ┌ fleet ──────────────────────────────┬ chief ─────┐
+    ● renaissa…    │ agents │ graph, or log │ the board │ claude     │
+                   └─────────────────────────────────────┴────────────┘
 ```
 
-- **The fleet tab** has the rail, the graph and the board as before. `↵` on an
-  agent switches to its tab. `l` flips between the graph and the log, `n`
+- **The fleet tab** has the rail, the graph and the board as before, and the
+  chief in a split on the right, 40% of the width: it is the one you talk to,
+  and the board is what you watch while you do. `↵` on an agent switches to
+  its tab, or to the chief's pane. `l` flips between the graph and the log, `n`
   starts an agent, `r` brings a crew back, `x` retires one, `q` quits. None of
   them needs the `^a` prefix: no key in this tab belongs to an agent.
 - **Each agent is a herdr tab** named after it, in the repository it works
@@ -100,10 +102,17 @@ herdr sidebar      tabs in the workspace
   herdr's own (`[ui.toast] delivery`; herdr's default is off). Only new
   events: opening fleet does not replay yesterday's. An agent at a dialog is
   not announced twice — herdr signals that itself.
-- **The chief** starts in a tab called `chief` the first time. It is briefed
+- **The chief** starts beside the fleet view the first time. It is briefed
   exactly as before and still runs without the editing tools, and
   `fleet spawn` run by the chief opens the new agent's tab in the same
-  workspace.
+  workspace. Quitting the view with `q` closes only its own pane while the
+  chief is there; opening fleet again puts the view back on its left.
+- **Fleet mode** for a new workspace, two ways. `fleet.new` makes a workspace
+  at the focused pane's directory and opens fleet in it, chief and all. And a
+  workspace opened at a directory listed in `~/.claude-fleet/auto-open` gets
+  the same by itself; any other workspace is left alone, since every one
+  would be a Claude session started for nothing. Either way the view takes
+  the new workspace's first tab rather than leaving an empty shell beside it.
 - **Messages** from `fleet board msg` go in through `herdr agent prompt`,
   which takes the pane's bracketed paste into account. A message to an agent
   sitting at a permission dialog is refused before anything is typed, and is
@@ -133,11 +142,28 @@ key = "prefix+f"
 type = "plugin_action"
 command = "fleet.open"
 description = "fleet"
+
+[[keys.command]]
+key = "prefix+shift+f"
+type = "plugin_action"
+command = "fleet.new"
+description = "new workspace in fleet mode"
 ```
 
 `prefix+f` in a workspace opened at the landscape (`~/Code/acme`)
-opens its fleet tab, or brings it forward. Typing `fleet` in any herdr pane
-does the same in that pane.
+opens its fleet tab, or brings it forward. `prefix+shift+f` opens a new
+workspace in fleet mode where the focused pane is. Typing `fleet` in any herdr
+pane runs the view in that pane.
+
+To have a landscape's workspaces open in fleet mode by themselves, list it:
+
+```bash
+echo '~/Code/acme' >> ~/.claude-fleet/auto-open
+```
+
+One directory a line, `#` for comments. It matches the workspace's own
+directory exactly, so a workspace opened in one repository inside the
+landscape stays an ordinary one.
 
 Three things herdr taught, which is why the code looks the way it does:
 

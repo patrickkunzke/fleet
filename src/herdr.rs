@@ -103,6 +103,8 @@ pub struct Pane {
     /// (herdr-sidebar's is `Sidebar`).
     #[serde(default)]
     pub label: String,
+    #[serde(default)]
+    pub cwd: String,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
@@ -208,18 +210,46 @@ impl Herdr {
             &["tab", "create", "--workspace", workspace, "--cwd", cwd, "--label", label, focus],
             CALL_TIMEOUT,
         )?;
-        let pane = &result["root_pane"];
-        match (pane["workspace_id"].as_str(), pane["tab_id"].as_str(), pane["pane_id"].as_str()) {
-            (Some(w), Some(t), Some(p)) => Ok(Created {
-                workspace_id: w.into(),
-                tab_id: t.into(),
-                pane_id: p.into(),
-            }),
-            _ => Err(HerdrError {
-                code: "failed".into(),
-                message: "herdr's tab reply has no root_pane ids".into(),
-            }),
-        }
+        root_pane(&result, "tab")
+    }
+
+    /// A new workspace at `cwd`, with one tab and one shell pane in it.
+    pub fn workspace_create(&self, cwd: &str, label: &str, focus: bool) -> Result<Created, HerdrError> {
+        let focus = if focus { "--focus" } else { "--no-focus" };
+        let result = self.call(
+            &["workspace", "create", "--cwd", cwd, "--label", label, focus],
+            CALL_TIMEOUT,
+        )?;
+        root_pane(&result, "workspace")
+    }
+
+    /// A new shell pane to the right of `pane`, which keeps `ratio` of the
+    /// width. Returns the new pane's id.
+    pub fn pane_split(&self, pane: &str, cwd: &str, ratio: f32, focus: bool) -> Result<String, HerdrError> {
+        let focus = if focus { "--focus" } else { "--no-focus" };
+        let ratio = ratio.to_string();
+        let result = self.call(
+            &["pane", "split", pane, "--direction", "right", "--ratio", &ratio, "--cwd", cwd, focus],
+            CALL_TIMEOUT,
+        )?;
+        result["pane"]["pane_id"].as_str().map(String::from).ok_or_else(|| HerdrError {
+            code: "failed".into(),
+            message: "herdr's split reply has no pane id".into(),
+        })
+    }
+
+    /// Trade the places of two panes in their layout.
+    pub fn pane_swap(&self, source: &str, target: &str) -> Result<(), HerdrError> {
+        self.call(&["pane", "swap", "--source-pane", source, "--target-pane", target], CALL_TIMEOUT)
+            .map(|_| ())
+    }
+
+    pub fn pane_close(&self, pane: &str) -> Result<(), HerdrError> {
+        self.call(&["pane", "close", pane], CALL_TIMEOUT).map(|_| ())
+    }
+
+    pub fn tab_rename(&self, tab: &str, label: &str) -> Result<(), HerdrError> {
+        self.call(&["tab", "rename", tab, label], CALL_TIMEOUT).map(|_| ())
     }
 
     pub fn tabs(&self, workspace: &str) -> Result<Vec<Tab>, HerdrError> {
@@ -344,6 +374,22 @@ impl Herdr {
         None
     }
 
+}
+
+/// The first pane of a tab or workspace herdr has just created.
+fn root_pane(result: &serde_json::Value, what: &str) -> Result<Created, HerdrError> {
+    let pane = &result["root_pane"];
+    match (pane["workspace_id"].as_str(), pane["tab_id"].as_str(), pane["pane_id"].as_str()) {
+        (Some(w), Some(t), Some(p)) => Ok(Created {
+            workspace_id: w.into(),
+            tab_id: t.into(),
+            pane_id: p.into(),
+        }),
+        _ => Err(HerdrError {
+            code: "failed".into(),
+            message: format!("herdr's {what} reply has no root_pane ids"),
+        }),
+    }
 }
 
 /// Whether herdr brings agents back by itself after a restart, which it does
