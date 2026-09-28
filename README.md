@@ -69,22 +69,24 @@ Builds the binary, links it to `~/.local/bin/fleet`, links `skills/board` into
 pasting, the mouse, reattaching after a reboot — which is everything fleet had
 to rebuild by hand around tmux and never got to feel native. Run inside herdr,
 fleet stops drawing terminals at all. herdr draws every agent in a tab of its
-own; fleet is the tab that shows the crew, with the chief beside it.
+own; fleet is the tab that shows the crew, with the chief on its left.
 
 ```
 herdr sidebar      tabs in the workspace
 ─────────────      ───────────────────────────────────────────────────
 ▾ acme          fleet · billing-service · storefront
     ● chief
-    ○ content-…    ┌ fleet ──────────────────────────────┬ chief ─────┐
-    ● renaissa…    │ agents │ graph, or log │ the board │ claude     │
-                   └─────────────────────────────────────┴────────────┘
+    ○ content-…    ┌ chief ──────────┬ fleet ─────────────────────────┐
+    ● renaissa…    │ claude          │ graph, or log     │ the board  │
+                   └─────────────────┴────────────────────────────────┘
 ```
 
-- **The fleet tab** has the rail, the graph and the board as before, and the
-  chief in a split on the right, 40% of the width: it is the one you talk to,
-  and the board is what you watch while you do. `↵` on an agent switches to
-  its tab, or to the chief's pane. `l` flips between the graph and the log, `n`
+- **The fleet tab** has the chief on the left, half the width: it is the
+  one you talk to, and the board is what you watch while you do. The view on
+  the right has the graph and the board. It has no agent rail: herdr's
+  sidebar lists the live agents, and the graph's cards are every agent,
+  started or not. `←→` moves between cards, and `↵` switches to the agent's
+  tab, or to the chief's pane. `l` flips between the graph and the log, `n`
   starts an agent, `r` brings a crew back, `x` retires one, `q` quits. None of
   them needs the `^a` prefix: no key in this tab belongs to an agent.
 - **Each agent is a herdr tab** named after it, in the repository it works
@@ -95,18 +97,18 @@ herdr sidebar      tabs in the workspace
   glance: `3 open · 1 blocked · 1 in review`. The labels expire ten minutes
   after fleet stops, rather than going stale.
 - **State is herdr's.** The fleet tab follows herdr's event stream, so an
-  agent's state on the rail changes when herdr sees it change, and an agent
+  agent's state on its card changes when herdr sees it change, and an agent
   stopped at a question or permission dialog shows as `! needs you` — which
   the session registry alone could not tell.
 - **Notifications** when a task is blocked, ready for review, or done, through
   herdr's own (`[ui.toast] delivery`; herdr's default is off). Only new
   events: opening fleet does not replay yesterday's. An agent at a dialog is
   not announced twice — herdr signals that itself.
-- **The chief** starts beside the fleet view the first time. It is briefed
+- **The chief** starts on the fleet view's left the first time. It is briefed
   exactly as before and still runs without the editing tools, and
   `fleet spawn` run by the chief opens the new agent's tab in the same
   workspace. Quitting the view with `q` closes only its own pane while the
-  chief is there; opening fleet again puts the view back on its left.
+  chief is there; opening fleet again puts the view back on its right.
 - **Fleet mode** for a new workspace, two ways. `fleet.new` makes a workspace
   at the focused pane's directory and opens fleet in it, chief and all. And a
   workspace opened at a directory listed in `~/.claude-fleet/auto-open` gets

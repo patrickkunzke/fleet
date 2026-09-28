@@ -1115,6 +1115,13 @@ impl App {
         // terminal rather than one.
         let (rail, centre, side) = if self.wide {
             (Rect::ZERO, body, Rect::ZERO)
+        } else if self.hosted.is_some() {
+            // In herdr the rail says nothing the graph does not: its cards
+            // are the agents, selected with ←→ and opened with ↵, and herdr's
+            // own sidebar lists the live ones with what they are on. Its
+            // width goes to the graph.
+            let [centre, side] = Layout::horizontal([Constraint::Min(24), Constraint::Length(36)]).areas(body);
+            (Rect::ZERO, centre, side)
         } else {
             let [rail, centre, side] = Layout::horizontal([
                 Constraint::Length(28),
@@ -1131,7 +1138,7 @@ impl App {
             centre.width.saturating_sub(theme::GUTTER * 2 + 1),
             centre.height.saturating_sub(3),
         );
-        if !self.wide {
+        if !rail.is_empty() {
             fleet::render(frame, rail, &self.rows, self.selected);
         }
         match self.centre_view {
@@ -1164,7 +1171,11 @@ impl App {
         // After everything, so that every rule and divider is on the buffer
         // to be joined up.
         if !self.wide {
-            let columns = [rail.x + rail.width - 1, centre.x + centre.width - 1];
+            let columns: Vec<u16> = [rail, centre]
+                .iter()
+                .filter(|r| !r.is_empty())
+                .map(|r| r.x + r.width - 1)
+                .collect();
             // The flow views are ours to draw; a session's output is not.
             let theirs = match self.centre_view {
                 Some(_) => Rect::ZERO,

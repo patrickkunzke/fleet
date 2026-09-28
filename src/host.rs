@@ -21,9 +21,9 @@ use crate::tmux::Tmux;
 
 const HERDR_PREFIX: &str = "herdr:";
 
-/// How much of the width the fleet view keeps with the chief beside it. Its
-/// three columns need about 130 cells; the chief is prose, and reads at 90.
-pub const VIEW_SHARE: f32 = 0.6;
+/// How much of the width the chief takes, on the left of the fleet view:
+/// half. Without the rail, the view's graph and board fit in the other.
+pub const CHIEF_SHARE: f32 = 0.5;
 
 #[derive(Clone)]
 pub enum Host {
@@ -204,7 +204,7 @@ impl Hosted {
     /// A tab of its own per agent, labelled with its name. A Claude Code
     /// session wants the width: split beside the others, each would be a
     /// column too narrow to read a diff in. The one exception is the chief,
-    /// split beside the fleet view when it asks to be.
+    /// split on the fleet view's left when it asks to be.
     fn open(&self, name: &str, repo: &Path, command: &str, beside_view: bool) -> Result<Placed> {
         let cwd = repo.to_string_lossy();
         // A terminal of the agent's own that is still there is used again:
@@ -217,7 +217,11 @@ impl Hosted {
             Some(view) => match self.vacant_pane(&view.tab_id, name) {
                 Some(pane) => (view.tab_id, pane, cd_then(command)),
                 None => {
-                    let pane = self.herdr.pane_split(&view.pane_id, &cwd, VIEW_SHARE, true)?;
+                    // herdr splits only to the right, and a split's ratio is
+                    // the share of the pane on the left: split, then trade
+                    // places, and the chief is on the left at its share.
+                    let pane = self.herdr.pane_split(&view.pane_id, &cwd, CHIEF_SHARE, true)?;
+                    self.herdr.pane_swap(&pane, &view.pane_id)?;
                     // Labelled, so the shell herdr brings back here after a
                     // restart is found again.
                     self.herdr.pane_rename(&pane, name)?;

@@ -19,6 +19,20 @@ use crate::ui::theme;
 /// Lines one background entry takes: its command, then its detail.
 const BG_LINES: u16 = 2;
 
+/// The tasks of every epic that still has work in it. An epic whose tasks
+/// are all done or dropped is finished with, and last week's would otherwise
+/// fill the rail above this week's. It stays on the board itself, in
+/// `fleet board ls`.
+fn unfinished(tasks: &[Task]) -> Vec<Task> {
+    let finished = |key: Option<&str>| {
+        tasks
+            .iter()
+            .filter(|t| t.epic_key.as_deref() == key)
+            .all(|t| matches!(t.state, State::Done | State::Dropped))
+    };
+    tasks.iter().filter(|t| !finished(t.epic_key.as_deref())).cloned().collect()
+}
+
 pub fn render(
     frame: &mut Frame,
     area: Rect,
@@ -29,6 +43,8 @@ pub fn render(
     // is an agent's, `l` where none is.
     log_key: &str,
 ) {
+    let open = unfinished(tasks);
+    let tasks = open.as_slice();
     // Give the background half only what it needs, and never more than half
     // the rail: the plan is the thing you read, the processes are a glance.
     // The divider's own row counts, or the last line is always the one cut.
@@ -306,6 +322,20 @@ mod tests {
         term.draw(|f| render(f, f.area(), tasks, background, agent, "^a l"))
             .unwrap();
         format!("{}", term.backend())
+    }
+
+    #[test]
+    fn an_epic_with_nothing_left_to_do_leaves_the_rail() {
+        let tasks = vec![
+            task("ENG-1-1", "ENG-1", State::Done, None, "shipped"),
+            task("ENG-1-2", "ENG-1", State::Dropped, None, "not needed"),
+            task("ENG-2-1", "ENG-2", State::Done, None, "half of it"),
+            task("ENG-2-2", "ENG-2", State::Queued, None, "the other half"),
+        ];
+        let out = drawn(&tasks, &[], None, 40, 16);
+        assert!(!out.contains("ENG-1 "), "finished epic still shown:\n{out}");
+        assert!(out.contains("ENG-2"), "{out}");
+        assert!(out.contains("half of it"), "an open epic keeps its done tasks:\n{out}");
     }
 
     #[test]

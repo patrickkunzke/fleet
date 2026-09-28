@@ -15,7 +15,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::brief;
 use crate::herdr::{self, Created, Herdr};
-use crate::host::VIEW_SHARE;
+use crate::host::CHIEF_SHARE;
 
 /// The label of the tab and the pane the fleet view runs in. How `open`
 /// finds it again.
@@ -65,7 +65,7 @@ pub fn open(root: Option<PathBuf>) -> Result<()> {
 }
 
 /// A new workspace in fleet mode: the fleet view in its first tab, and the
-/// chief beside it once the view has started one. At the directory given,
+/// chief on its left once the view has started one. At the directory given,
 /// or the focused pane's: where you are, not the workspace you are in.
 pub fn new(root: Option<PathBuf>) -> Result<()> {
     let herdr = Herdr::from_env().context("not run by herdr: HERDR_SOCKET_PATH is not set")?;
@@ -102,7 +102,16 @@ pub fn event() -> Result<()> {
     // herdr's workspace has no directory of its own; its first pane does.
     // The fleet pane's, when there is one: a workspace herdr restores comes
     // back with it, and its other panes may be anywhere.
-    let panes = herdr.panes(&workspace)?;
+    // The hook runs as the workspace is born, before its first pane has
+    // been listed with a directory: wait for one rather than give up.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let panes = loop {
+        let panes = herdr.panes(&workspace)?;
+        if panes.iter().any(|p| !p.cwd.is_empty()) || Instant::now() >= deadline {
+            break panes;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
     let Some(first) = panes
         .iter()
         .find(|p| p.label == TAB)
@@ -157,12 +166,8 @@ fn open_in(herdr: &Herdr, workspace: &str, root: &Path, fresh: Option<&Created>,
             created.pane_id.clone()
         }
         // The view was closed and the chief kept on: back beside it, on
-        // the left where it was.
-        (None, Some(chief)) => {
-            let pane = herdr.pane_split(&chief.pane_id, &root_text, VIEW_SHARE, focus)?;
-            herdr.pane_swap(&pane, &chief.pane_id)?;
-            pane
-        }
+        // the right where it was. The chief keeps its share on the left.
+        (None, Some(chief)) => herdr.pane_split(&chief.pane_id, &root_text, CHIEF_SHARE, focus)?,
         (None, None) => herdr.tab_create(workspace, &root_text, TAB, focus)?.pane_id,
     };
     let deadline = Instant::now() + Duration::from_secs(10);
