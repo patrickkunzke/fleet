@@ -789,6 +789,19 @@ impl Db {
     }
 
     /// Record which conversation an agent in a run turned out to be.
+    /// Record a session in whichever run the agent joined without one — the
+    /// newest, when it joined several. For a session found later than the
+    /// launch that recorded the run, by someone who does not know the run.
+    pub fn set_session_in_latest_run(&self, name: &str, session_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE run_agents SET session_id = ?2
+              WHERE name = ?1 AND session_id IS NULL
+                AND run_id = (SELECT MAX(run_id) FROM run_agents WHERE name = ?1)",
+            params![name, session_id],
+        )?;
+        Ok(())
+    }
+
     pub fn set_run_session(&self, run: i64, name: &str, session_id: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE run_agents SET session_id = ?3 WHERE run_id = ?1 AND name = ?2",
@@ -1346,6 +1359,21 @@ mod tests {
         assert_eq!(r1.last_active, "2026-09-01T10:00:00.000Z");
         let r2 = db.run(second).unwrap().unwrap();
         assert_eq!(r2.tasks, vec!["ENG-2-1"]);
+    }
+
+    #[test]
+    fn a_session_found_late_lands_in_the_run_the_agent_joined() {
+        let db = Db::open_in_memory().unwrap();
+        let old = db.start_run("/w").unwrap();
+        db.join_run(old, "chief", "chief", "/w").unwrap();
+        db.set_run_session(old, "chief", "s-old").unwrap();
+        let new = db.start_run("/w").unwrap();
+        db.join_run(new, "chief", "chief", "/w").unwrap();
+
+        db.set_session_in_latest_run("chief", "s-new").unwrap();
+        let session = |run| db.run(run).unwrap().unwrap().agents[0].session_id.clone();
+        assert_eq!(session(new).as_deref(), Some("s-new"));
+        assert_eq!(session(old).as_deref(), Some("s-old"), "an earlier run keeps its own");
     }
 
     #[test]

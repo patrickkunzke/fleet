@@ -87,8 +87,9 @@ It prints whether it landed. `not delivered` is worth reading rather than
 scrolling past: the usual cause is a typo in the name, and the flow log will
 otherwise show you messaging an agent that does not exist.
 
-Starting an agent does the registering for you — it opens a tmux pane, writes
-the row, and links the session once Claude Code reports it:
+Starting an agent does the registering for you — it opens a tab of its own
+(in herdr, when you run there; a tmux window otherwise), writes the row, and
+links the session once Claude Code reports it:
 
 ```bash
 fleet spawn accounts-svc --repo ~/Code/acme/service/accounts-service --task ENG-2553-1

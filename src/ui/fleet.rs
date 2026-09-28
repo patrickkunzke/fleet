@@ -48,10 +48,17 @@ pub struct Row {
     pub branch: Option<String>,
     pub tmux_target: Option<String>,
     pub pid: Option<i32>,
+    /// Stopped at a question or permission dialog, as herdr sees it: waiting
+    /// on you in the strongest sense, since nothing moves until it is
+    /// answered. Only herdr can tell; in tmux this stays false.
+    pub asking: bool,
 }
 
 impl Row {
     fn glyph(&self) -> (&'static str, Color) {
+        if self.asking {
+            return ("!", theme::ACCENT);
+        }
         match (self.role, self.presence) {
             (Role::Chief, Presence::Working | Presence::Waiting) => ("◆", theme::ACCENT),
             (Role::Chief, _) => ("◇", theme::FAINT),
@@ -122,6 +129,7 @@ pub fn merge(agents: &[db::Agent], sessions: &[registry::Session]) -> Vec<Row> {
             branch: a.branch.clone(),
             tmux_target: a.tmux_target.clone(),
             pid: live.map(|s| s.pid),
+            asking: false,
         });
     }
 

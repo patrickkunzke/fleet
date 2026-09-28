@@ -15,6 +15,7 @@ pub mod clipboard;
 pub mod fleet;
 pub mod flow;
 pub mod graph;
+pub mod hosting;
 pub mod keys;
 pub mod picker;
 pub mod mirror;
@@ -42,6 +43,7 @@ use ratatui::widgets::{Block, Paragraph};
 use crate::agent;
 use crate::brief;
 use crate::db::{self, Db};
+use crate::host::{Host, Hosted, What};
 use crate::registry::{self, Registry, Watcher};
 use crate::tmux::Tmux;
 use crate::ui::fleet::Row;
@@ -62,6 +64,8 @@ enum Msg {
     Sent(sender::Reply),
     Mouse(MouseEvent),
     Registry,
+    /// herdr's agents, as they are now: after one of them changed.
+    Agents(Vec<crate::herdr::Agent>),
     Tick,
     /// The selected session may have written something. Far more frequent
     /// than the others and usually finds nothing, so it redraws only when
@@ -89,6 +93,23 @@ pub struct App {
     root: Option<PathBuf>,
     projects: PathBuf,
     tmux: Option<Tmux>,
+    /// herdr, when fleet runs in one of its panes. herdr then owns every
+    /// agent's terminal — drawing, typing, the mouse, the clipboard — and
+    /// fleet is the view of the crew: who is doing what, the board, the
+    /// graph. ↵ goes to the agent's own tab instead of drawing it here.
+    hosted: Option<Hosted>,
+    /// What herdr last said about its agents. Empty outside herdr, and until
+    /// the first answer.
+    herdr_agents: Vec<crate::herdr::Agent>,
+    /// Where sidebar labels and notifications are sent, off this thread.
+    /// None until the loop starts, and outside herdr.
+    jobs: Option<Sender<hosting::Job>>,
+    /// The labels last handed over, so an unchanged board sends nothing.
+    labels: Vec<(String, String)>,
+    /// Events already considered for a notification. None until the first
+    /// read, which marks everything already on the board as seen: starting
+    /// fleet must not replay yesterday's blockers as news.
+    noticed: Option<std::collections::HashSet<String>>,
     /// The centre column as last drawn, so a mirror can be attached at the
     /// right size before its first frame.
     centre_size: (u16, u16),
@@ -150,6 +171,13 @@ pub struct App {
 
 impl App {
     pub fn new(db: Db, db_path: PathBuf, root: Option<PathBuf>) -> App {
+        // A test must not become a herdr view because the terminal it was
+        // run from happens to be a herdr pane.
+        let hosted = if cfg!(test) { None } else { Hosted::from_env() };
+        App::within(db, db_path, root, hosted)
+    }
+
+    pub(crate) fn within(db: Db, db_path: PathBuf, root: Option<PathBuf>, hosted: Option<Hosted>) -> App {
         let (tx, rx) = channel();
         App {
             db_path,
@@ -163,7 +191,14 @@ impl App {
             projects: registry::default_projects_dir(),
             // No tmux is survivable: every agent then falls back to its
             // transcript, which is exactly the non-local case.
-            tmux: Tmux::detect(None).ok(),
+            tmux: if hosted.is_some() { None } else { Tmux::detect(None).ok() },
+            // With herdr drawing the agents, the middle column is the crew.
+            centre_view: hosted.is_some().then_some(View::Graph),
+            hosted,
+            herdr_agents: Vec::new(),
+            jobs: None,
+            labels: Vec::new(),
+            noticed: None,
             centre_size: (80, 24),
             rows: Vec::new(),
             selected: 0,
@@ -184,7 +219,6 @@ impl App {
             tasks: Vec::new(),
             background: Vec::new(),
             events: Vec::new(),
-            centre_view: None,
             event_selected: 0,
             status: None,
             status_is_db_error: false,
@@ -198,12 +232,14 @@ impl App {
     /// other processes are writing, and a locked moment should not take the
     /// UI down with it.
     pub fn refresh(&mut self) {
+        self.link_hosted();
         self.registry.refresh();
         let sessions: Vec<_> = self.registry.sessions().cloned().collect();
 
         match self.db.agents() {
             Ok(agents) => {
                 self.rows = fleet::merge(&agents, &sessions);
+                self.apply_herdr();
                 // Only clear what refresh itself reported. Anything else on
                 // screen was said by an action, and a refresh two ticks
                 // later must not swallow it — which is how "started X" had
@@ -240,10 +276,109 @@ impl App {
 
         self.selected = self.selected.min(self.rows.len().saturating_sub(1));
         self.retarget();
+        self.publish();
+    }
+
+    /// Record the conversation of every herdr agent the board has none for.
+    ///
+    /// A new agent registers its session only once its first dialog — the
+    /// folder trust prompt, in a repository it has not seen — is answered,
+    /// and that can be minutes after it was started. herdr knows the session
+    /// as soon as there is one, so it is asked on every refresh until then.
+    /// Without it the agent is on the rail but a later resume cannot find it.
+    fn link_hosted(&mut self) {
+        if self.herdr_agents.is_empty() {
+            return;
+        }
+        let Ok(agents) = self.db.agents() else { return };
+        for a in agents.iter().filter(|a| a.session_id.is_none()) {
+            let Some(sid) = self.herdr_agent(a.tmux_target.as_deref()).and_then(|h| h.session_id()) else {
+                continue;
+            };
+            let _ = agent::link(&self.db, &a.name, sid, self.run);
+        }
+    }
+
+    /// The herdr agent a board target names, if herdr has it.
+    fn herdr_agent(&self, target: Option<&str>) -> Option<&crate::herdr::Agent> {
+        let name = target?.strip_prefix("herdr:")?;
+        self.herdr_agents.iter().find(|h| h.name == name)
+    }
+
+    /// herdr's word on each agent's state, over the registry's.
+    ///
+    /// The registry says busy or not; herdr also says when an agent is
+    /// stopped at a dialog, and says it the moment it happens. Where herdr
+    /// has no opinion — an agent it has not recognised, or `unknown` — the
+    /// registry's stands.
+    fn apply_herdr(&mut self) {
+        let states: Vec<Option<String>> = self
+            .rows
+            .iter()
+            .map(|r| self.herdr_agent(r.tmux_target.as_deref()).map(|h| h.agent_status.clone()))
+            .collect();
+        for (row, state) in self.rows.iter_mut().zip(states) {
+            match state.as_deref() {
+                Some("working") => {
+                    row.presence = fleet::Presence::Working;
+                    row.asking = false;
+                }
+                Some("blocked") => {
+                    row.presence = fleet::Presence::Waiting;
+                    row.asking = true;
+                }
+                Some("idle" | "done") => {
+                    row.presence = fleet::Presence::Waiting;
+                    row.asking = false;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Hand herdr what changed: each agent's sidebar label, and a
+    /// notification for each new board event that needs someone.
+    fn publish(&mut self) {
+        let Some(jobs) = self.jobs.clone() else { return };
+
+        let labels: Vec<(String, String)> = self
+            .rows
+            .iter()
+            .filter_map(|r| {
+                let pane = self.herdr_agent(r.tmux_target.as_deref())?.pane_id.clone();
+                let text = match r.role {
+                    fleet::Role::Chief => hosting::chief_label(&self.tasks),
+                    fleet::Role::Worker => hosting::worker_label(&r.name, &self.tasks),
+                };
+                Some((pane, text))
+            })
+            .collect();
+        if labels != self.labels {
+            self.labels = labels.clone();
+            let _ = jobs.send(hosting::Job::Labels(labels));
+        }
+
+        let keys = self.events.iter().map(|e| (event_key(e), e));
+        match self.noticed.as_mut() {
+            None => self.noticed = Some(keys.map(|(k, _)| k).collect()),
+            Some(seen) => {
+                for (key, e) in keys {
+                    if seen.insert(key)
+                        && let Some((title, body)) = hosting::notice(e)
+                    {
+                        let _ = jobs.send(hosting::Job::Notify { title, body });
+                    }
+                }
+            }
+        }
     }
 
     /// Point the centre pane at the selection. Cheap when it has not changed.
     fn retarget(&mut self) {
+        // Nothing to follow: herdr has the agent's terminal.
+        if self.hosted.is_some() {
+            return;
+        }
         let row = self.selected().cloned();
         self.centre
             .follow(row.as_ref(), &self.projects, self.tmux.as_ref(), self.centre_size);
@@ -302,6 +437,9 @@ impl App {
             (KeyCode::Left | KeyCode::BackTab, _) if self.centre_view == Some(View::Graph) => {
                 self.move_by(-1)
             }
+            (KeyCode::Enter, _) if self.hosted.is_some() && self.centre_view == Some(View::Graph) => {
+                self.go_to_selected()
+            }
             (KeyCode::Enter, _) if self.centre_view == Some(View::Graph) => {
                 self.centre_view = None;
                 self.focus = Focus::Session;
@@ -318,6 +456,12 @@ impl App {
             (KeyCode::Char('z'), _) => {
                 self.wide = !self.wide;
                 self.focus = Focus::Session;
+            }
+            // In herdr there is no session to go back to: the two keys move
+            // between the graph and the log.
+            (KeyCode::Char('g'), _) if self.hosted.is_some() => self.centre_view = Some(View::Graph),
+            (KeyCode::Char('l'), _) if self.hosted.is_some() => {
+                self.centre_view = Some(if self.centre_view == Some(View::Log) { View::Graph } else { View::Log })
             }
             (KeyCode::Char('g'), _) => {
                 self.centre_view = (self.centre_view != Some(View::Graph)).then_some(View::Graph)
@@ -350,7 +494,11 @@ impl App {
             && self.centre_view.is_none()
             && self.centre.is_live();
         if !typing {
-            self.status = Some("a paste goes to an agent — click its pane first".into());
+            self.status = Some(if self.hosted.is_some() {
+                "a paste goes to an agent — ↵ opens its tab".into()
+            } else {
+                "a paste goes to an agent — click its pane first".into()
+            });
             return;
         }
         let Some(tmux) = self.tmux.clone() else { return };
@@ -501,6 +649,10 @@ impl App {
         };
         if let Some(at) = self.rows.iter().position(|r| r.name == who) {
             self.selected = at;
+            if self.hosted.is_some() {
+                self.go_to_selected();
+                return;
+            }
             self.centre_view = None;
             self.focus = Focus::Rail;
             self.retarget();
@@ -666,13 +818,14 @@ impl App {
         role: &str,
         brief: &brief::Brief,
     ) {
-        let Some(tmux) = self.tmux.clone() else {
+        let Some(host) = self.host() else {
             self.status = Some("no tmux — agents are started in tmux panes".into());
             return;
         };
-        let command = brief::command(brief);
+        let program = brief::claude_program();
+        let what = What::Brief { brief, program: &program };
         let run = self.ensure_run();
-        let spawned = match agent::start(&tmux, &self.db, name, repo, &command, naming, role, run) {
+        let spawned = match agent::start(&host, &self.db, name, repo, &what, naming, role, run) {
             Ok(s) => s,
             Err(e) => {
                 self.status = Some(format!("cannot start {name}: {e}"));
@@ -688,18 +841,41 @@ impl App {
             self.retarget();
         }
 
-        self.adopt_later(spawned);
+        self.adopt_later(host, spawned);
+    }
+
+    /// Where agents are started: herdr's tabs when fleet runs in herdr,
+    /// tmux windows otherwise.
+    fn host(&self) -> Option<Host> {
+        match &self.hosted {
+            Some(h) => Some(Host::Herdr(h.clone())),
+            None => self.tmux.clone().map(Host::Tmux),
+        }
+    }
+
+    /// Hand the selected agent to herdr: its tab comes to the front, and the
+    /// keyboard is its. This view stays where it is, a tab away.
+    fn go_to_selected(&mut self) {
+        let Some(row) = self.selected().cloned() else { return };
+        let (Some(host), Some(target)) = (self.host(), row.tmux_target.as_deref()) else {
+            self.status = Some(format!("{} has no terminal fleet knows of", row.name));
+            return;
+        };
+        if let Err(e) = host.focus(target) {
+            self.status = Some(format!("cannot open {}: {e}", row.name));
+        }
     }
 
     /// Wait, off this thread, for the session that appears in a new pane,
     /// and record it — on the board and in the run, which is what a resume
     /// reads later.
-    fn adopt_later(&self, spawned: agent::Spawned) {
+    fn adopt_later(&self, host: Host, spawned: agent::Spawned) {
         let db_path = self.db_path.clone();
         let tx = self.tx.clone();
         let run = self.run;
         std::thread::spawn(move || {
-            let Some(found) = agent::adopt(spawned.pane.pid, Duration::from_secs(30)) else {
+            host.settle(&spawned.placed, &spawned.name, Duration::from_secs(30));
+            let Some(found) = agent::adopt(spawned.placed.pid, Duration::from_secs(30)) else {
                 return;
             };
             // A separate connection: this thread cannot borrow the one the UI
@@ -783,7 +959,7 @@ impl App {
 
     /// Bring a run's crew back, each into its own conversation.
     fn resume_run(&mut self, run: db::Run) {
-        let Some(tmux) = self.tmux.clone() else {
+        let Some(host) = self.host() else {
             self.status = Some("no tmux — agents are resumed into tmux panes".into());
             return;
         };
@@ -803,10 +979,10 @@ impl App {
             if live.contains(&member.name) {
                 continue;
             }
-            match agent::resume(&tmux, &self.db, run.id, member) {
+            match agent::resume(&host, &self.db, run.id, member) {
                 Ok(spawned) => {
                     back.push(spawned.name.clone());
-                    self.adopt_later(spawned);
+                    self.adopt_later(host.clone(), spawned);
                 }
                 Err(e) => failed.push(e.to_string()),
             }
@@ -1069,6 +1245,7 @@ impl App {
             &self.tasks,
             &self.background,
             self.selected().map(|r| r.name.as_str()),
+            if self.hosted.is_some() { "l" } else { "^a l" },
         );
     }
 
@@ -1114,6 +1291,22 @@ impl App {
             && self.centre_view.is_none()
             && self.centre.is_live();
         let keys: &[(&str, &str)] = match self.centre_view {
+            Some(View::Log) if self.hosted.is_some() => &[
+                ("↑↓", "event"),
+                ("↵", "go to its agent"),
+                ("l", "graph"),
+                ("r", "resume"),
+                ("q", "quit"),
+            ],
+            _ if self.hosted.is_some() => &[
+                ("↑↓ ←→", "agent"),
+                ("↵", "go to it"),
+                ("n", "new agent"),
+                ("l", "log"),
+                ("r", "resume"),
+                ("x", "retire"),
+                ("q", "quit"),
+            ],
             _ if typing => &[
                 ("keys", "→ agent"),
                 ("^a", "fleet"),
@@ -1223,6 +1416,11 @@ pub fn run(db: Db, db_path: PathBuf, root: Option<PathBuf>) -> Result<()> {
             let _ = back.send(Msg::Sent(reply));
         }));
     }
+    if let Some(hosted) = app.hosted.clone() {
+        let back = tx.clone();
+        hosting::follow(hosted.herdr.clone(), move |agents| back.send(Msg::Agents(agents)).is_ok());
+        app.jobs = Some(hosting::worker(hosted.herdr));
+    }
     spawn_ticker(tx);
 
     let mut term = ratatui::init();
@@ -1256,6 +1454,10 @@ pub fn run(db: Db, db_path: PathBuf, root: Option<PathBuf>) -> Result<()> {
                     }
                     // Several of these in one batch are one re-read.
                     Msg::Registry | Msg::Tick => refresh = true,
+                    Msg::Agents(agents) => {
+                        app.herdr_agents = agents;
+                        refresh = true;
+                    }
                     Msg::Transcript => poll = true,
                 }
                 if app.quit || app.wants_attach {
@@ -1288,6 +1490,9 @@ pub fn run(db: Db, db_path: PathBuf, root: Option<PathBuf>) -> Result<()> {
     })();
     leave_modes(app.enhanced);
     ratatui::restore();
+    if app.hosted.is_some() {
+        crate::plugin::close_own_tab();
+    }
     result
 }
 
@@ -1716,6 +1921,168 @@ mod tests {
             out.contains("no session linked"),
             "an agent with no live session says so: {out}"
         );
+    }
+
+    /// The view as it runs in a herdr pane, with a herdr that records what
+    /// it was asked to do in `calls` beside it.
+    fn hosted_app(dir: &Path) -> App {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("herdr");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\necho '{{\"result\":{{}}}}'\n",
+                dir.join("calls").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_agent("chief", Some("chief"), None, None, Some("herdr:chief"), None).unwrap();
+        db.upsert_agent("billing-svc", None, Some("/repo/content"), None, Some("herdr:billing-svc"), None)
+            .unwrap();
+        let hosted = Hosted {
+            herdr: crate::herdr::Herdr::with(bin.to_string_lossy(), dir.join("sock")),
+            workspace: "w1".into(),
+        };
+        let mut app = App::within(db, PathBuf::from(":memory:"), Some(PathBuf::from("/nowhere")), Some(hosted));
+        app.refresh();
+        app
+    }
+
+    #[test]
+    fn in_herdr_the_centre_is_the_crew_and_never_a_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = hosted_app(dir.path());
+        assert_eq!(app.centre_view, Some(View::Graph), "herdr draws the agents; fleet draws the crew");
+        app.on_key(KeyEvent::from(KeyCode::Char('l')));
+        assert_eq!(app.centre_view, Some(View::Log));
+        app.on_key(KeyEvent::from(KeyCode::Char('l')));
+        assert_eq!(app.centre_view, Some(View::Graph), "and back, not to an empty session view");
+        app.on_key(KeyEvent::from(KeyCode::Char('g')));
+        assert_eq!(app.centre_view, Some(View::Graph));
+        let out = drawn(&mut app, 120, 30);
+        assert!(!out.contains("^a"), "no prefix where no key is an agent's:\n{out}");
+    }
+
+    #[test]
+    fn in_herdr_enter_takes_you_to_the_agents_own_tab() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = hosted_app(dir.path());
+        let at = app.rows.iter().position(|r| r.name == "billing-svc").unwrap();
+        app.selected = at;
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap_or_default();
+        assert!(calls.contains("agent focus billing-svc"), "{calls}");
+        assert_eq!(app.centre_view, Some(View::Graph), "fleet stays as it was, a tab away");
+    }
+
+    fn herdr_agent(name: &str, pane: &str, status: &str) -> crate::herdr::Agent {
+        crate::herdr::Agent {
+            pane_id: pane.into(),
+            name: name.into(),
+            agent: "claude".into(),
+            agent_status: status.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn herdr_saying_an_agent_is_at_a_dialog_puts_it_first_in_line_for_you() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = hosted_app(dir.path());
+        app.herdr_agents = vec![
+            herdr_agent("chief", "w1:p1", "working"),
+            herdr_agent("billing-svc", "w1:p2", "blocked"),
+        ];
+        app.refresh();
+        let row = |app: &App, n: &str| app.rows.iter().find(|r| r.name == n).cloned().unwrap();
+        assert!(row(&app, "billing-svc").asking);
+        assert_eq!(row(&app, "billing-svc").presence, fleet::Presence::Waiting);
+        assert_eq!(row(&app, "chief").presence, fleet::Presence::Working, "herdr's word over the registry's");
+        assert!(drawn(&mut app, 120, 30).contains("! needs you"), "and the graph says so");
+
+        app.herdr_agents[1].agent_status = "working".into();
+        app.refresh();
+        assert!(!row(&app, "billing-svc").asking, "answered, and moving again");
+    }
+
+    #[test]
+    fn a_session_herdr_knows_of_is_put_on_the_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = hosted_app(dir.path());
+        let mut a = herdr_agent("billing-svc", "w1:p2", "idle");
+        a.agent_session = Some(crate::herdr::AgentSession { value: "sid-9".into() });
+        app.herdr_agents = vec![a];
+        app.refresh();
+        let on_board = app.db.agents().unwrap().into_iter().find(|a| a.name == "billing-svc").unwrap();
+        assert_eq!(on_board.session_id.as_deref(), Some("sid-9"));
+    }
+
+    #[test]
+    fn the_sidebar_gets_each_agents_task_and_only_when_it_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = hosted_app(dir.path());
+        let (tx, rx) = channel();
+        app.jobs = Some(tx);
+        app.db.upsert_epic("ENG-2553", "shared flag").unwrap();
+        app.db
+            .add_task(&db::NewTask {
+                key: "ENG-2553-2",
+                title: "consume the parameter",
+                repo: "/repo/content",
+                epic: Some("ENG-2553"),
+                body: None,
+                deps: &[],
+                position: 0,
+            })
+            .unwrap();
+        app.db.claim("ENG-2553-2", "billing-svc").unwrap();
+        app.herdr_agents = vec![herdr_agent("chief", "w1:p1", "idle"), herdr_agent("billing-svc", "w1:p2", "working")];
+        app.refresh();
+
+        let labels: Vec<(String, String)> = rx
+            .try_iter()
+            .filter_map(|j| match j {
+                hosting::Job::Labels(l) => Some(l),
+                _ => None,
+            })
+            .last()
+            .expect("labels sent");
+        assert!(labels.contains(&("w1:p1".into(), "1 open".into())), "{labels:?}");
+        assert!(labels.iter().any(|(p, t)| p == "w1:p2" && t.starts_with("ENG-2553-2")), "{labels:?}");
+
+        app.refresh();
+        assert!(rx.try_iter().all(|j| !matches!(j, hosting::Job::Labels(_))), "nothing changed, nothing sent");
+    }
+
+    #[test]
+    fn a_new_blocker_is_announced_and_an_old_one_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = hosted_app(dir.path());
+        let (tx, rx) = channel();
+        app.db
+            .log_event("task", Some("billing-svc"), None, Some("ENG-1-1"), "blocked: from before", None, None)
+            .unwrap();
+        app.jobs = Some(tx);
+        app.refresh();
+        let notes = |rx: &Receiver<hosting::Job>| -> Vec<String> {
+            rx.try_iter()
+                .filter_map(|j| match j {
+                    hosting::Job::Notify { title, .. } => Some(title),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert!(notes(&rx).is_empty(), "what was already on the board is not news");
+
+        app.db
+            .log_event("task", Some("billing-svc"), None, Some("ENG-1-2"), "blocked: needs the flag", None, None)
+            .unwrap();
+        app.refresh();
+        assert_eq!(notes(&rx), ["fleet · ENG-1-2 is blocked"]);
+        app.refresh();
+        assert!(notes(&rx).is_empty(), "and once");
     }
 
     #[test]

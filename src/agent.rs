@@ -17,8 +17,9 @@ use anyhow::{Context, Result, bail};
 
 use crate::brief;
 use crate::db::{Db, RunAgent};
+use crate::host::{self, Host, Placed, What};
 use crate::registry::{self, Registry, Session};
-use crate::tmux::{self, Pane, Tmux};
+use crate::tmux;
 
 /// What a repository offers as an agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,7 +32,7 @@ pub struct Candidate {
 
 pub struct Spawned {
     pub name: String,
-    pub pane: Pane,
+    pub placed: Placed,
 }
 
 /// Whether a clashing name is worked around or reused.
@@ -52,11 +53,11 @@ pub enum Naming {
 /// lands in the chief's run rather than in whichever one is newest.
 #[allow(clippy::too_many_arguments)]
 pub fn start(
-    tmux: &Tmux,
+    host: &Host,
     db: &Db,
     name: &str,
     repo: &Path,
-    command: &str,
+    what: &What,
     naming: Naming,
     role: &str,
     run: Option<i64>,
@@ -64,19 +65,19 @@ pub fn start(
     let repo = repo
         .canonicalize()
         .with_context(|| format!("no such repository: {}", repo.display()))?;
+    // herdr takes a narrower set of names than tmux, and the board's name is
+    // the one a message is addressed to, so they have to be the same.
+    let wanted = if host.is_herdr() { host::herdr_safe(name) } else { name.to_string() };
     let name = match naming {
-        Naming::Unique => unique_name(db, name)?,
-        Naming::Exact => name.to_string(),
+        Naming::Unique => unique_name(db, &wanted)?,
+        Naming::Exact => wanted,
     };
-    let command = match run {
-        Some(id) => format!("FLEET_RUN={id} {command}"),
-        None => command.to_string(),
-    };
-    let pane = tmux.spawn(&name, &repo, &command)?;
+    let command = format!("{}{}", environment(run), host.line(what, &name)?);
+    let placed = host.open(&name, &repo, &command)?;
     if let Some(id) = run {
         db.join_run(id, &name, role, &repo.to_string_lossy())?;
     }
-    let target = format!("{}:{}", pane.session, pane.window_name);
+    let target = placed.target.clone();
 
     // The row goes in before the session exists. An agent that never reports
     // is still one somebody has to deal with, and a board that omits it is
@@ -91,7 +92,23 @@ pub fn start(
     )?;
     db.log_event("note", Some(&name), None, None, &format!("spawned in {target}"), None, None)?;
 
-    Ok(Spawned { name, pane })
+    Ok(Spawned { name, placed })
+}
+
+/// What the agent's shell is told before the command: the run it joins, and
+/// the board fleet itself is using. A new terminal gets its environment from
+/// the multiplexer's server, not from fleet, so a board set with `FLEET_DB`
+/// would otherwise be one the agent never sees — it would read and write the
+/// default board instead.
+fn environment(run: Option<i64>) -> String {
+    let mut out = String::new();
+    if let Some(id) = run {
+        out.push_str(&format!("FLEET_RUN={id} "));
+    }
+    if let Some(db) = std::env::var_os("FLEET_DB").filter(|v| !v.is_empty()) {
+        out.push_str(&format!("FLEET_DB={} ", brief::quote(&db.to_string_lossy())));
+    }
+    out
 }
 
 /// Two agents in one repo is ordinary here, so a name is made unique rather
@@ -135,8 +152,9 @@ pub fn adopt(pane_pid: i32, timeout: Duration) -> Option<Session> {
 /// its run, which is what a later resume reads.
 pub fn link(db: &Db, name: &str, session_id: &str, run: Option<i64>) -> Result<()> {
     db.upsert_agent(name, None, None, Some(session_id), None, None)?;
-    if let Some(id) = run {
-        db.set_run_session(id, name, session_id)?;
+    match run {
+        Some(id) => db.set_run_session(id, name, session_id)?,
+        None => db.set_session_in_latest_run(name, session_id)?,
     }
     Ok(())
 }
@@ -149,14 +167,16 @@ pub fn link(db: &Db, name: &str, session_id: &str, run: Option<i64>) -> Result<(
 /// editing tools stay withheld — both are set at launch, not kept with the
 /// conversation, so a resume that skipped them would be a chief that could
 /// write code again.
-pub fn resume(tmux: &Tmux, db: &Db, run: i64, member: &RunAgent) -> Result<Spawned> {
-    resume_from(tmux, db, run, member, &registry::default_projects_dir(), "claude")
+pub fn resume(host: &Host, db: &Db, run: i64, member: &RunAgent) -> Result<Spawned> {
+    // herdr's panes start claude by its full path; see `brief::claude_program`.
+    let program = if host.is_herdr() { brief::claude_program() } else { "claude".into() };
+    resume_from(host, db, run, member, &registry::default_projects_dir(), &program)
 }
 
 /// `resume`, with Claude Code's projects directory and program given rather
 /// than found — for a test, which must not start the real thing.
 pub fn resume_from(
-    tmux: &Tmux,
+    host: &Host,
     db: &Db,
     run: i64,
     member: &RunAgent,
@@ -176,13 +196,13 @@ pub fn resume_from(
     } else {
         brief::worker(&member.name, repo, None, None)
     };
-    let command = brief::resume_command_for(program, &brief, session);
+    let what = What::Resume { brief: &brief, session, program };
     let spawned = start(
-        tmux,
+        host,
         db,
         &member.name,
         repo,
-        &command,
+        &what,
         Naming::Exact,
         &member.role,
         Some(run),
@@ -334,9 +354,9 @@ mod tests {
     fn an_agent_that_never_reported_a_session_is_not_resumed() {
         let db = Db::open_in_memory().unwrap();
         let run = db.start_run("/w").unwrap();
-        let Ok(tmux) = Tmux::detect(Some("unused")) else { return };
+        let Ok(tmux) = crate::tmux::Tmux::detect(Some("unused")) else { return };
         let dir = tempfile::tempdir().unwrap();
-        let err = resume_from(&tmux, &db, run, &member("x", "worker", dir.path(), None), dir.path(), "false")
+        let err = resume_from(&Host::Tmux(tmux.clone()), &db, run, &member("x", "worker", dir.path(), None), dir.path(), "false")
             .err()
             .expect("refused");
         assert!(err.to_string().contains("never reported a session"), "{err}");
@@ -348,9 +368,9 @@ mod tests {
         // the old agent, and a pane that looks like it did is worse.
         let db = Db::open_in_memory().unwrap();
         let run = db.start_run("/w").unwrap();
-        let Ok(tmux) = Tmux::detect(Some("unused")) else { return };
+        let Ok(tmux) = crate::tmux::Tmux::detect(Some("unused")) else { return };
         let dir = tempfile::tempdir().unwrap();
-        let err = resume_from(&tmux, &db, run, &member("x", "worker", dir.path(), Some("s")), dir.path(), "false")
+        let err = resume_from(&Host::Tmux(tmux.clone()), &db, run, &member("x", "worker", dir.path(), Some("s")), dir.path(), "false")
             .err()
             .expect("refused");
         assert!(err.to_string().contains("no longer on disk"), "{err}");
@@ -361,7 +381,7 @@ mod tests {
         use std::time::Duration;
 
         let socket = format!("fleet-resume-{}", std::process::id());
-        let Ok(tmux) = Tmux::detect(Some(&socket)) else { return };
+        let Ok(tmux) = crate::tmux::Tmux::detect(Some(&socket)) else { return };
         let tmux = tmux.on_socket(&socket);
         if tmux.ensure_session().is_err() {
             return;
@@ -401,7 +421,7 @@ mod tests {
         let run = db.start_run("/w").unwrap();
         let who = member("billing-svc", "worker", &repo, Some("sess-abc"));
         let program = bin.join("claude").to_string_lossy().to_string();
-        let spawned = resume_from(&tmux, &db, run, &who, &projects, &program);
+        let spawned = resume_from(&Host::Tmux(tmux.clone()), &db, run, &who, &projects, &program);
         for _ in 0..40 {
             if env.is_file() {
                 break;

@@ -292,6 +292,7 @@ mod tests {
                 branch: None,
                 tmux_target: None,
                 pid: None,
+                asking: false,
             })
             .collect()
     }

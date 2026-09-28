@@ -1,0 +1,32 @@
+# fleet inside herdr: a chief of staff that plans and delegates, one Claude
+# Code agent per repository in a tab of its own, and a view of the crew — the
+# board, the graph, who is waiting on you.
+#
+# herdr draws every agent's terminal. fleet opens the tabs, briefs what runs
+# in them, carries messages between them, and brings a crew back after a
+# restart. Actions only: nothing runs until you ask for it.
+
+id = "fleet"
+name = "fleet"
+version = "0.1.0"
+description = "A chief of staff that delegates to Claude Code agents across repositories, with a task board and a live graph of the crew."
+# 0.9.0 is what this was built and checked against.
+min_herdr_version = "0.9.0"
+platforms = ["macos", "linux"]
+
+[[build]]
+command = ["cargo", "build", "--release", "--locked"]
+
+[[actions]]
+id = "open"
+title = "fleet: open"
+description = "Focus this workspace's fleet tab, or open one at the workspace's directory. The first time, it starts the chief; after a restart, it offers the crew to bring back."
+contexts = ["workspace", "pane"]
+command = ["target/release/fleet", "herdr", "open"]
+
+[[actions]]
+id = "doctor"
+title = "fleet: check the setup"
+description = "What fleet needs from herdr and Claude Code, and what to change if something is off. Prints to the plugin log."
+contexts = ["workspace", "pane"]
+command = ["target/release/fleet", "herdr", "doctor"]

@@ -25,6 +25,9 @@ pub fn render(
     tasks: &[Task],
     background: &[BgTask],
     selected_agent: Option<&str>,
+    // The key that opens the log from here: `^a l` where every other key
+    // is an agent's, `l` where none is.
+    log_key: &str,
 ) {
     // Give the background half only what it needs, and never more than half
     // the rail: the plan is the thing you read, the processes are a glance.
@@ -58,7 +61,7 @@ pub fn render(
     theme::rule(frame, foot_rule);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("^a l", theme::dim()),
+            Span::styled(log_key.to_string(), theme::dim()),
             Span::styled(" the flow log", theme::faint()),
         ])),
         theme::pad(foot),
@@ -300,7 +303,7 @@ mod tests {
 
     fn drawn(tasks: &[Task], background: &[BgTask], agent: Option<&str>, w: u16, h: u16) -> String {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-        term.draw(|f| render(f, f.area(), tasks, background, agent))
+        term.draw(|f| render(f, f.area(), tasks, background, agent, "^a l"))
             .unwrap();
         format!("{}", term.backend())
     }

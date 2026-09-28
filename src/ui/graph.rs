@@ -745,6 +745,9 @@ fn draw_legend(canvas: &mut Canvas, l: &Layout) {
 
 fn state_of(r: &Row) -> (&'static str, Color) {
     // Short, because a card is narrow and the line under it already says why.
+    if r.asking {
+        return ("! needs you", theme::ACCENT);
+    }
     match (r.role, r.presence) {
         (_, Presence::Working) => ("● working", theme::BUSY),
         (Role::Chief, Presence::Waiting) => ("○ waiting on you", theme::OK),
@@ -946,6 +949,7 @@ mod tests {
             branch: None,
             tmux_target: None,
             pid: None,
+            asking: false,
         }
     }
 

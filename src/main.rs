@@ -9,7 +9,10 @@
 mod agent;
 mod brief;
 mod db;
+mod herdr;
+mod host;
 mod msg;
+mod plugin;
 mod registry;
 mod tmux;
 mod transcript;
@@ -22,8 +25,8 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use crate::db::Db;
+use crate::host::{Host, What};
 use crate::registry::{Change, Registry, Watcher};
-use crate::tmux::Tmux;
 use crate::transcript::{BACKFILL_BYTES, Entry, Outcome, Transcript};
 
 #[derive(Parser)]
@@ -64,6 +67,9 @@ enum Command {
         /// Text instead of colour, for a diff or a pipe.
         #[arg(long)]
         plain: bool,
+        /// The view as it is inside herdr: no terminal of its own.
+        #[arg(long)]
+        herdr: bool,
     },
     /// Bring back an earlier run: the chief and every agent it started, each
     /// into its own conversation. Without an id, lists the runs there are.
@@ -75,6 +81,12 @@ enum Command {
         root: Option<PathBuf>,
         #[arg(long, env = "FLEET_DB")]
         db: Option<PathBuf>,
+    },
+    /// fleet inside herdr: what the plugin's actions run, and a check of the
+    /// setup it needs.
+    Herdr {
+        #[command(subcommand)]
+        cmd: HerdrCmd,
     },
     /// Show what each key arrives as, and what fleet sends on to an agent.
     /// For when a key does not do in fleet what it does in the terminal.
@@ -138,6 +150,20 @@ enum Command {
         #[arg(long, env = "FLEET_DB")]
         db: Option<PathBuf>,
     },
+}
+
+#[derive(Subcommand)]
+enum HerdrCmd {
+    /// Focus this workspace's fleet tab, opening it if there is none. What
+    /// the plugin's `fleet.open` action runs.
+    Open {
+        /// The workspace fleet covers. Defaults to the herdr workspace's
+        /// own directory.
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
+    /// Check what fleet needs from herdr and from Claude Code.
+    Doctor,
 }
 
 #[derive(Subcommand)]
@@ -321,11 +347,16 @@ fn resume(run: Option<i64>, root: Option<PathBuf>, db_path: Option<PathBuf>) -> 
     let run = db
         .run(id)?
         .with_context(|| format!("no run {id} on the board"))?;
-    let tmux = Tmux::detect(None)?;
+    let host = Host::detect(None)?;
     let live: Vec<String> = db
         .agents()?
         .into_iter()
-        .filter(|a| a.tmux_target.as_deref().is_some_and(|t| tmux.find(t).ok().flatten().is_some()))
+        .filter(|a| {
+            a.tmux_target
+                .as_deref()
+                .and_then(|t| Some((t, Host::for_target(t)?)))
+                .is_some_and(|(t, h)| h.is_live(t))
+        })
         .map(|a| a.name)
         .collect();
     let mut any = false;
@@ -334,15 +365,21 @@ fn resume(run: Option<i64>, root: Option<PathBuf>, db_path: Option<PathBuf>) -> 
             println!("{:<18} already running", member.name);
             continue;
         }
-        match agent::resume(&tmux, &db, run.id, member) {
+        match agent::resume(&host, &db, run.id, member) {
             Ok(s) => {
                 any = true;
-                println!("{:<18} resumed in {}:{}", s.name, s.pane.session, s.pane.window_name);
+                println!("{:<18} resumed in {}", s.name, s.placed.place);
+                if !host.settle(&s.placed, &s.name, Duration::from_secs(30)) {
+                    println!("{:<18} herdr has not recognised it yet; it keeps its tab name", "");
+                }
             }
             Err(e) => println!("{:<18} not resumed: {e}", member.name),
         }
     }
-    if any && !Tmux::inside() {
+    if let Host::Tmux(tmux) = &host
+        && any
+        && !tmux::Tmux::inside()
+    {
         println!("\nfleet, or tmux attach -t {}, to see them", tmux.session());
     }
     Ok(())
@@ -375,11 +412,15 @@ fn knock(
     let Some(target) = agent.tmux_target.as_deref() else {
         return format!("not delivered: {to} has no pane fleet can reach");
     };
-    let Ok(tmux) = Tmux::detect(None) else {
-        return "not delivered: no tmux".into();
+    let Some(host) = Host::for_target(target) else {
+        return if host::is_herdr(target) {
+            format!("not delivered: {to} is in herdr, and this is not")
+        } else {
+            "not delivered: no tmux".into()
+        };
     };
     let text = msg::line(from, task, summary, body);
-    match msg::deliver(&tmux, target, &text) {
+    match host.deliver(target, &text) {
         Ok(true) => format!("delivered to {to} in {target}"),
         Ok(false) => format!("not delivered: nothing running in {target}"),
         Err(e) => format!("not delivered: {e}"),
@@ -426,11 +467,15 @@ fn main() -> Result<()> {
                 None => ui::run(db, path, root),
             }
         }
-        Command::Preview { size, view, plain } => {
+        Command::Preview { size, view, plain, herdr } => {
             let (w, h) = parse_size(&size)?;
-            ui::preview::run(w, h, view.as_deref(), plain)
+            ui::preview::run(w, h, view.as_deref(), plain, herdr)
         }
         Command::Keys => ui::keys(),
+        Command::Herdr { cmd } => match cmd {
+            HerdrCmd::Open { root } => plugin::open(root),
+            HerdrCmd::Doctor => plugin::doctor(),
+        },
         Command::Resume { run, root, db } => resume(run, root, db),
         Command::Sessions { watch } => sessions(watch),
         Command::Session { name, watch, lines } => session(&name, watch, lines),
@@ -481,23 +526,25 @@ fn spawn(
     timeout: u64,
     db_path: Option<PathBuf>,
 ) -> Result<()> {
-    let tmux = Tmux::detect(session)?;
+    let host = Host::detect(session)?;
     let db = Db::open(db_path.unwrap_or_else(db::default_path))?;
 
     // Read the task before the pane exists: a key that is not on the board
     // is a typo worth refusing, not an agent to start and then correct.
     let assignment = task.map(|key| db.show(key)).transpose()?;
     let chief = role == "chief";
-    let command = match command {
-        Some(given) => given.to_string(),
-        None if chief => brief::command(&brief::chief(repo)),
-        None => {
-            let brief = assignment.as_ref().map_or_else(
-                || brief::worker(name, repo, None, None),
-                |(t, body, _)| brief::worker(name, repo, Some(t), body.as_deref()),
-            );
-            brief::command(&brief)
-        }
+    let brief = if chief {
+        brief::chief(repo)
+    } else {
+        assignment.as_ref().map_or_else(
+            || brief::worker(name, repo, None, None),
+            |(t, body, _)| brief::worker(name, repo, Some(t), body.as_deref()),
+        )
+    };
+    let program = brief::claude_program();
+    let what = match command {
+        Some(given) => What::Command(given),
+        None => What::Brief { brief: &brief, program: &program },
     };
 
     let naming = if chief {
@@ -518,7 +565,7 @@ fn spawn(
         None => db.run_for_repo(&within.to_string_lossy())?,
     };
     let role_name = if chief { "chief" } else { "worker" };
-    let spawned = agent::start(&tmux, &db, name, repo, &command, naming, role_name, run)?;
+    let spawned = agent::start(&host, &db, name, repo, &what, naming, role_name, run)?;
     if chief {
         // The board has to agree, or the rail draws it as a worker and the
         // TUI starts a second chief alongside it.
@@ -529,16 +576,25 @@ fn spawn(
         // dispatches the same task twice.
         db.claim(key, &spawned.name)?;
     }
-    println!(
-        "{}  pane {} in session {}",
-        spawned.name, spawned.pane.id, spawned.pane.session
-    );
+    println!("{}  {}", spawned.name, spawned.placed.place);
 
-    match agent::adopt(spawned.pane.pid, Duration::from_secs(timeout)) {
+    if !host.settle(&spawned.placed, &spawned.name, Duration::from_secs(timeout)) {
+        println!("      herdr has not recognised an agent in it yet");
+    }
+    if let Some(sid) = host.session_at(&spawned.placed.target) {
+        agent::link(&db, &spawned.name, &sid, run)?;
+        println!("      adopted session {sid}");
+        return Ok(());
+    }
+    match agent::adopt(spawned.placed.pid, Duration::from_secs(timeout)) {
         Some(found) => {
             agent::link(&db, &spawned.name, &found.session_id, run)?;
             println!("      adopted session {} (pid {})", found.session_id, found.pid);
         }
+        None if host.is_herdr() => println!(
+            "      no session yet — it may be waiting at a dialog in its tab; \
+             the fleet tab links it once it has one"
+        ),
         None => println!(
             "      no session registered within {timeout}s — the pane is up, \
              the board row is unlinked"

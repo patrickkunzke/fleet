@@ -15,12 +15,12 @@ already runs on the machine.
 | `skills/board` — the `/board` skill | done |
 | `src/registry.rs` — session discovery and watching | done, 6 tests |
 | `src/transcript.rs` — transcript reading and tailing | done, 8 tests |
-| `src/db.rs` — fleet.db reads and writes, and runs | done, 29 tests |
+| `src/db.rs` — fleet.db reads and writes, and runs | done, 30 tests |
 | `fleet board` — the whole board, in the binary | done, 13 tests |
 | `src/tmux.rs` — spawning and pane control | done, 17 tests |
 | `src/ui/` — frame, fleet rail, session pane, board rail | done, 57 tests |
 | `src/agent.rs` — starting, resuming, repo discovery | done, 7 tests |
-| `src/brief.rs` — what an agent is told when it starts | done, 19 tests |
+| `src/brief.rs` — what an agent is told when it starts | done, 23 tests |
 | `src/ui/resume.rs` — picking a run to bring back | done, 5 tests |
 | `src/msg.rs` — delivering a message to its recipient | done, 6 tests |
 | `n` to spawn from the rail | done |
@@ -31,6 +31,10 @@ already runs on the machine.
 | `src/ui/selection.rs` — drag to copy from a pane | done, 6 tests |
 | `src/ui/clipboard.rs` — pbcopy and OSC 52 | done, 3 tests |
 | `src/ui/preview.rs` — the fixture fleet, for layout work | done, 4 tests |
+| `src/herdr.rs` — typed calls to the herdr CLI | done, 7 tests |
+| `src/host.rs` — tmux window or herdr tab, one interface | done, 2 tests |
+| `src/plugin.rs` + `herdr-plugin.toml` — fleet as a herdr plugin | done, 3 tests |
+| `src/ui/hosting.rs` — herdr's events, sidebar labels, notifications | done, 6 tests |
 
 ## What it is built on
 
@@ -58,6 +62,106 @@ fleet.db; anything worth remembering next month goes to claude-mem.
 
 Builds the binary, links it to `~/.local/bin/fleet`, links `skills/board` into
 `~/.claude/skills/`, and creates the database.
+
+## Inside herdr
+
+[herdr](https://herdr.dev) owns terminals properly — scrolling, selecting,
+pasting, the mouse, reattaching after a reboot — which is everything fleet had
+to rebuild by hand around tmux and never got to feel native. Run inside herdr,
+fleet stops drawing terminals at all. herdr draws every agent in a tab of its
+own; fleet is the tab that shows the crew.
+
+```
+herdr sidebar      tabs in the workspace
+─────────────      ───────────────────────────────────────────────
+▾ acme          fleet · chief · billing-service · storefront
+    ● chief
+    ○ content-…    ┌ fleet ─────────────────────────────────────┐
+    ● renaissa…    │ agents │ the graph, or the log │ the board │
+                   └────────────────────────────────────────────┘
+```
+
+- **The fleet tab** has the rail, the graph and the board as before. `↵` on an
+  agent switches to its tab. `l` flips between the graph and the log, `n`
+  starts an agent, `r` brings a crew back, `x` retires one, `q` quits. None of
+  them needs the `^a` prefix: no key in this tab belongs to an agent.
+- **Each agent is a herdr tab** named after it, in the repository it works
+  in. herdr's sidebar shows which ones are working and which are waiting on
+  you — and, on each agent's second line where herdr would say `claude`, what
+  it is on: `ENG-2553-2 · waits on ENG-2553-1`, `ENG-2553-2 · blocked: needs
+  the flag`, `ENG-2553-2 · review`. The chief's line is the board at a
+  glance: `3 open · 1 blocked · 1 in review`. The labels expire ten minutes
+  after fleet stops, rather than going stale.
+- **State is herdr's.** The fleet tab follows herdr's event stream, so an
+  agent's state on the rail changes when herdr sees it change, and an agent
+  stopped at a question or permission dialog shows as `! needs you` — which
+  the session registry alone could not tell.
+- **Notifications** when a task is blocked, ready for review, or done, through
+  herdr's own (`[ui.toast] delivery`; herdr's default is off). Only new
+  events: opening fleet does not replay yesterday's. An agent at a dialog is
+  not announced twice — herdr signals that itself.
+- **The chief** starts in a tab called `chief` the first time. It is briefed
+  exactly as before and still runs without the editing tools, and
+  `fleet spawn` run by the chief opens the new agent's tab in the same
+  workspace.
+- **Messages** from `fleet board msg` go in through `herdr agent prompt`,
+  which takes the pane's bracketed paste into account. A message to an agent
+  sitting at a permission dialog is refused before anything is typed, and is
+  on the board for when the dialog is answered.
+- **Resuming**: after herdr restarts, the tabs come back as shells. Open
+  fleet and it offers the run; choosing it starts each agent again in its own
+  tab, back in its own conversation, with its role and (for the chief) the
+  missing tools as before.
+
+### Setting it up
+
+```bash
+herdr plugin link ~/Code/side-projects/fleet
+fleet herdr doctor
+```
+
+Then, in `~/.config/herdr/config.toml`:
+
+```toml
+[session]
+# herdr would resume agents itself, as plain `claude --resume <id>`: no role,
+# and a chief with its editing tools back. fleet does it instead.
+resume_agents_on_restore = false
+
+[[keys.command]]
+key = "prefix+f"
+type = "plugin_action"
+command = "fleet.open"
+description = "fleet"
+```
+
+`prefix+f` in a workspace opened at the landscape (`~/Code/acme`)
+opens its fleet tab, or brings it forward. Typing `fleet` in any herdr pane
+does the same in that pane.
+
+Three things herdr taught, which is why the code looks the way it does:
+
+- **`claude` is started by its full path** (`~/.local/bin/claude`, or
+  `FLEET_CLAUDE`). A new pane's shell rebuilds PATH, and with a Node version
+  manager in `.zshrc` an old npm install of Claude Code comes first — on this
+  machine 2.0.76, which rejects the current settings file and sits at a
+  dialog. herdr's own `agent start` runs whichever `claude` the shell finds,
+  so fleet types the command itself and names the agent once herdr sees it.
+- **The brief is read from files** (`~/.claude-fleet/briefs/`) by the launch
+  line, `--append-system-prompt "$(cat …)"`. A page of prose typed at a shell
+  prompt is one stray quote from `quote>`.
+- **A new agent's session is linked late.** Claude Code registers it only
+  after the folder-trust dialog is answered, which can be minutes later in a
+  repository it has not seen. The fleet tab asks herdr for it on every
+  refresh until it has it.
+
+Other plugins are fine alongside: herdr-sidebar puts a narrow file list in
+every tab, and fleet leaves it alone; zoetrope's `prefix+shift+z` on an
+agent's tab shows that agent's own session as a graph.
+
+herdr's client code (`src/herdr.rs`) is adapted from
+[herdr-projects](https://github.com/eliasstravik/herdr-projects), MIT; see
+[NOTICE](NOTICE).
 
 ## Use
 

@@ -135,7 +135,7 @@ fn fixture_pane(repo: &std::path::Path) -> Result<(Tmux, String)> {
     Ok((tmux, target))
 }
 
-pub fn run(width: u16, height: u16, view: Option<&str>, plain: bool) -> Result<()> {
+pub fn run(width: u16, height: u16, view: Option<&str>, plain: bool, herdr: bool) -> Result<()> {
     let repo = std::env::current_dir()?;
     let db = seed(&repo.to_string_lossy())?;
 
@@ -144,7 +144,13 @@ pub fn run(width: u16, height: u16, view: Option<&str>, plain: bool) -> Result<(
         db.upsert_agent("accounts-svc", None, None, None, Some(target), None)?;
     }
 
-    let mut app = App::new(db, PathBuf::from(":memory:"), Some(repo));
+    // The tmux frame: the fixture pane is what the centre shows. The herdr
+    // frame has no pane of its own, and a herdr that is never called.
+    let hosted = herdr.then(|| crate::host::Hosted {
+        herdr: crate::herdr::Herdr::with("herdr", "/nonexistent/herdr.sock"),
+        workspace: "w1".into(),
+    });
+    let mut app = App::within(db, PathBuf::from(":memory:"), Some(repo), hosted);
     // App::new found the user's tmux server. The fixture pane is not on it,
     // and nothing of theirs should be reachable from here.
     app.tmux = pane.as_ref().and(preview_tmux().ok());
@@ -160,6 +166,7 @@ pub fn run(width: u16, height: u16, view: Option<&str>, plain: bool) -> Result<(
     app.centre_view = match view {
         Some("graph") => Some(View::Graph),
         Some("log") => Some(View::Log),
+        _ if herdr => Some(View::Graph),
         _ => None,
     };
 

@@ -119,7 +119,7 @@ pub fn worker(name: &str, repo: &Path, task: Option<&Task>, body: Option<&str>) 
     opening.push_str(&format!(
         "\nMark it running with `fleet board start {}` when you begin, and \
          `fleet board done {}` when it is finished. If you are blocked, \
-         `fleet board block {} --reason ...` and tell the chief.\n\n\
+         `fleet board block {} '<why>'` and tell the chief.\n\n\
          Start by reading enough of the repository to say what you intend to \
          do. Say it here, and send the chief the short version with \
          `fleet board msg {} chief '...'`. Then wait for a go-ahead, from the \
@@ -175,9 +175,92 @@ pub fn resume_command_for(program: &str, brief: &Brief, session: &str) -> String
     out
 }
 
+/// Which `claude` to start, by its full path.
+///
+/// Not whatever a new pane's shell finds first. The shell's startup rebuilds
+/// PATH, and on a machine that once had Claude Code from npm, a Node version
+/// manager puts that old copy ahead of the one the user runs: it started,
+/// rejected the user's settings file, and sat at a dialog. `FLEET_CLAUDE`
+/// overrides; then the native installer's link; then the name as a last
+/// resort.
+pub fn claude_program() -> String {
+    if let Ok(p) = std::env::var("FLEET_CLAUDE")
+        && !p.trim().is_empty()
+    {
+        return p;
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let native = Path::new(&home).join(".local/bin/claude");
+    if native.is_file() {
+        return native.to_string_lossy().into_owned();
+    }
+    "claude".into()
+}
+
+/// Where a brief is written for a launch line to read.
+pub fn default_dir() -> std::path::PathBuf {
+    crate::db::default_path()
+        .parent()
+        .map(|p| p.join("briefs"))
+        .unwrap_or_else(|| std::path::PathBuf::from("briefs"))
+}
+
+/// The command line that starts the agent, with the brief read from files.
+///
+/// For a pane whose shell fleet types into, which is how herdr starts one.
+/// A page of prose with newlines in it, typed at a prompt, is one stray
+/// quote from a shell waiting on `quote>`; a line that says `$(cat file)`
+/// is not. The files are kept: they are what the agent was told.
+pub fn launch_line(program: &str, brief: &Brief, dir: &Path, stem: &str) -> std::io::Result<String> {
+    let (role, opening) = write_brief(brief, dir, stem)?;
+    let mut out = format!(
+        "{} --append-system-prompt \"$(cat {})\" \"$(cat {})\"",
+        quote(program),
+        quote(&role.to_string_lossy()),
+        quote(&opening.to_string_lossy())
+    );
+    push_deny(&mut out, brief);
+    Ok(out)
+}
+
+/// `launch_line` for coming back into a conversation: the role and the deny
+/// list again, no opening turn.
+pub fn resume_line(program: &str, brief: &Brief, session: &str, dir: &Path, stem: &str) -> std::io::Result<String> {
+    let (role, _) = write_brief(brief, dir, stem)?;
+    let mut out = format!(
+        "{} --resume {} --append-system-prompt \"$(cat {})\"",
+        quote(program),
+        quote(session),
+        quote(&role.to_string_lossy())
+    );
+    push_deny(&mut out, brief);
+    Ok(out)
+}
+
+fn write_brief(brief: &Brief, dir: &Path, stem: &str) -> std::io::Result<(std::path::PathBuf, std::path::PathBuf)> {
+    std::fs::create_dir_all(dir)?;
+    let stem: String = stem
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    let role = dir.join(format!("{stem}.role.md"));
+    let opening = dir.join(format!("{stem}.opening.md"));
+    std::fs::write(&role, &brief.role)?;
+    std::fs::write(&opening, &brief.opening)?;
+    Ok((role, opening))
+}
+
+fn push_deny(out: &mut String, brief: &Brief) {
+    // Variadic, so last: anything after it would be read as a tool name.
+    if !brief.deny.is_empty() {
+        out.push_str(" --disallowed-tools ");
+        out.push_str(&brief.deny.join(" "));
+    }
+}
+
 /// Single quotes, because a brief is prose with apostrophes, backticks and
 /// newlines in it, and a shell would otherwise read some of it as commands.
-fn quote(text: &str) -> String {
+pub fn quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
 }
 
@@ -292,6 +375,16 @@ mod tests {
             assert!(!text.contains("fleet msg "), "{text}");
             assert!(text.contains("fleet board msg"), "{text}");
         }
+    }
+
+    #[test]
+    fn a_worker_is_told_to_block_the_way_the_command_takes_it() {
+        // It said `--reason`, which `fleet board block` refuses: the reason is
+        // the second argument.
+        let t = task("ENG-2553-2", &[]);
+        let b = worker("billing-svc", Path::new("/w"), Some(&t), None);
+        assert!(b.opening.contains("fleet board block ENG-2553-2 '<why>'"), "{}", b.opening);
+        assert!(!b.opening.contains("--reason"));
     }
 
     #[test]
@@ -442,5 +535,72 @@ mod tests {
         assert_eq!(args.first(), Some(&"--append-system-prompt"), "{args:?}");
         assert_eq!(args.get(1), Some(&expected.role.as_str()), "the role, intact");
         assert_eq!(args.get(2), Some(&expected.opening.as_str()), "then the opening");
+    }
+
+    /// A stand-in for Claude Code that writes its arguments, NUL-separated,
+    /// to `argv` beside it.
+    fn recorder(dir: &Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let fake = dir.join("claude");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\000' \"$a\"; done > '{}'\n",
+                dir.join("argv").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        fake
+    }
+
+    fn landed(line: &str, dir: &Path) -> Vec<String> {
+        // zsh, as a herdr pane runs it; sh where there is none.
+        let shell = if Path::new("/bin/zsh").exists() { "/bin/zsh" } else { "sh" };
+        let out = std::process::Command::new(shell).arg("-c").arg(line).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        std::fs::read_to_string(dir.join("argv"))
+            .unwrap()
+            .split('\0')
+            .filter(|a| !a.is_empty())
+            .map(String::from)
+            .collect()
+    }
+
+    #[test]
+    fn a_launch_line_reads_the_brief_back_from_its_files_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = recorder(dir.path());
+        let b = chief(Path::new("/w/it's here"));
+        let line = launch_line(&program.to_string_lossy(), &b, &dir.path().join("briefs"), "chief").unwrap();
+        assert!(!line.contains('\n'), "one line, to type at a prompt: {line}");
+
+        let args = landed(&line, dir.path());
+        assert_eq!(args[0], "--append-system-prompt");
+        assert_eq!(args[1], b.role, "the role, newlines and apostrophes intact");
+        assert_eq!(args[2], b.opening);
+        assert_eq!(&args[3..], ["--disallowed-tools", "Edit", "Write", "NotebookEdit"]);
+    }
+
+    #[test]
+    fn a_resume_line_gives_back_the_role_and_the_deny_list_and_no_opening() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = recorder(dir.path());
+        let b = chief(Path::new("/w"));
+        let line = resume_line(&program.to_string_lossy(), &b, "sid-1", &dir.path().join("b"), "chief").unwrap();
+        let args = landed(&line, dir.path());
+        assert_eq!(&args[..2], ["--resume", "sid-1"]);
+        assert_eq!(args[2], "--append-system-prompt");
+        assert_eq!(args[3], b.role);
+        assert_eq!(&args[4..], ["--disallowed-tools", "Edit", "Write", "NotebookEdit"]);
+    }
+
+    #[test]
+    fn a_name_cannot_walk_the_brief_out_of_its_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = worker("x", Path::new("/w"), None, None);
+        let line = launch_line("claude", &b, dir.path(), "../../etc/x").unwrap();
+        assert!(!line.contains("/../"), "{line}");
+        assert!(std::fs::read_dir(dir.path()).unwrap().count() == 2);
     }
 }

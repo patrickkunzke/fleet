@@ -575,6 +575,7 @@ mod tests {
             branch: Some("feature/ENG-2553-2".into()),
             tmux_target: None,
             pid: Some(1),
+            asking: false,
         }
     }
 
