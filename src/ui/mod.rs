@@ -178,6 +178,8 @@ impl App {
     }
 
     pub(crate) fn within(db: Db, db_path: PathBuf, root: Option<PathBuf>, hosted: Option<Hosted>) -> App {
+        // The agents this view starts are named in herdr for its fleet.
+        let hosted = hosted.map(|h| Hosted { fleet: crate::scope::fleet_of(&db_path), ..h });
         let (tx, rx) = channel();
         App {
             db_path,
@@ -1955,6 +1957,7 @@ mod tests {
         let hosted = Hosted {
             herdr: crate::herdr::Herdr::with(bin.to_string_lossy(), dir.join("sock")),
             workspace: "w1".into(),
+            fleet: None,
         };
         let mut app = App::within(db, PathBuf::from(":memory:"), Some(PathBuf::from("/nowhere")), Some(hosted));
         app.refresh();

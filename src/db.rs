@@ -19,12 +19,6 @@ use serde::Serialize;
 /// The schema travels in the binary, so `fleet board init` needs no checkout.
 const SCHEMA: &str = include_str!("../schema.sql");
 
-pub fn default_path() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
-    std::path::PathBuf::from(home)
-        .join(".claude-fleet")
-        .join("fleet.db")
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -168,6 +162,9 @@ pub struct NewTask<'a> {
 
 pub struct Db {
     conn: Connection,
+    /// Where the board is, for the agents a fleet starts: they are handed it,
+    /// and it is what makes them part of this fleet. None in memory.
+    path: Option<std::path::PathBuf>,
 }
 
 impl Db {
@@ -179,7 +176,13 @@ impl Db {
         }
         let conn = Connection::open(path)
             .with_context(|| format!("opening {}", path.display()))?;
-        Db::prepare(conn)
+        let mut db = Db::prepare(conn)?;
+        db.path = Some(path.to_path_buf());
+        Ok(db)
+    }
+
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
     }
 
     /// A board that exists only for this process: tests, and the preview's
@@ -196,7 +199,7 @@ impl Db {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA).context("applying the schema")?;
-        Ok(Db { conn })
+        Ok(Db { conn, path: None })
     }
 
     // ------------------------------------------------------------- reads ---

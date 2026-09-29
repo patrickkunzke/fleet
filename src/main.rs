@@ -14,6 +14,7 @@ mod host;
 mod msg;
 mod plugin;
 mod registry;
+mod scope;
 mod tmux;
 mod transcript;
 mod ui;
@@ -142,14 +143,20 @@ enum Command {
         #[arg(long, env = "FLEET_DB")]
         db: Option<PathBuf>,
     },
-    /// Read and write the coordination database.
+    /// Read and write the coordination database: the board of the fleet
+    /// this session was started by, or the one named.
     Board {
         #[command(subcommand)]
         cmd: BoardCmd,
-        /// Override the database path.
-        #[arg(long, env = "FLEET_DB")]
+        /// The board. Every agent a fleet starts carries its own.
+        #[arg(long, env = "FLEET_DB", global = true)]
         db: Option<PathBuf>,
+        /// Another fleet's board, by the name `fleet fleets` prints.
+        #[arg(long, global = true)]
+        fleet: Option<String>,
     },
+    /// Every fleet there is, and the directory each one covers.
+    Fleets,
 }
 
 #[derive(Subcommand)]
@@ -315,12 +322,18 @@ enum BgCmd {
 }
 
 fn resume(run: Option<i64>, root: Option<PathBuf>, db_path: Option<PathBuf>) -> Result<()> {
-    let db = Db::open(db_path.unwrap_or_else(db::default_path))?;
     let root = match root {
         Some(r) => r,
         None => std::env::current_dir()?,
     };
     let root = root.canonicalize().unwrap_or(root);
+    // The fleet of the directory named: a run is brought back into the
+    // fleet it was part of, or it would be a stranger on another's board.
+    let path = match db_path {
+        Some(p) => p,
+        None => scope::board_for_root(&root)?,
+    };
+    let db = Db::open(&path)?;
     let workspace = root.to_string_lossy().to_string();
     let _ = db.adopt_legacy_run(&workspace);
 
@@ -357,7 +370,7 @@ fn resume(run: Option<i64>, root: Option<PathBuf>, db_path: Option<PathBuf>) -> 
     let run = db
         .run(id)?
         .with_context(|| format!("no run {id} on the board"))?;
-    let host = Host::detect(None)?;
+    let host = Host::detect(None)?.in_fleet(Some(&path));
     let live: Vec<String> = db
         .agents()?
         .into_iter()
@@ -464,11 +477,16 @@ fn main() -> Result<()> {
             snapshot,
             view,
         } => {
-            let path = db.unwrap_or_else(db::default_path);
-            let db = Db::open(&path)?;
             // Standing somewhere is the usual way of saying which workspace
-            // you mean, so it does not need a flag.
+            // you mean, so it does not need a flag. The workspace is the
+            // fleet, and the fleet has its own board.
             let root = root.or_else(|| std::env::current_dir().ok());
+            let path = match (db, &root) {
+                (Some(p), _) => p,
+                (None, Some(r)) => scope::board_for_root(r)?,
+                (None, None) => bail!("no workspace: run fleet in one, or pass --root"),
+            };
+            let db = Db::open(&path)?;
             match snapshot {
                 Some(size) => {
                     let (w, h) = parse_size(&size)?;
@@ -491,10 +509,23 @@ fn main() -> Result<()> {
         Command::Resume { run, root, db } => resume(run, root, db),
         Command::Sessions { watch } => sessions(watch),
         Command::Session { name, watch, lines } => session(&name, watch, lines),
-        Command::Board { cmd, db } => board(cmd, db),
+        Command::Board { cmd, db, fleet } => board(cmd, db, fleet),
+        Command::Fleets => {
+            let all = scope::fleets();
+            if all.is_empty() {
+                println!("no fleets yet: start fleet in a workspace's directory");
+            }
+            for (name, root) in all {
+                println!("{name:<20} {}", root.display());
+            }
+            Ok(())
+        }
         Command::Repos { root, db } => {
-            let db = Db::open(db.unwrap_or_else(db::default_path))?;
-            let taken: Vec<String> = db.agents()?.into_iter().filter_map(|a| a.repo).collect();
+            // Outside a fleet there is no board to say which are taken.
+            let taken: Vec<String> = match scope::board_for_command(db, None) {
+                Ok(path) => Db::open(path)?.agents()?.into_iter().filter_map(|a| a.repo).collect(),
+                Err(_) => Vec::new(),
+            };
             let found = agent::candidates(&root, &taken);
             println!("{} repositories under {}", found.len(), root.display());
             for c in found {
@@ -538,8 +569,9 @@ fn spawn(
     timeout: u64,
     db_path: Option<PathBuf>,
 ) -> Result<()> {
-    let host = Host::detect(session)?;
-    let db = Db::open(db_path.unwrap_or_else(db::default_path))?;
+    let path = scope::board_for_command(db_path, None)?;
+    let host = Host::detect(session)?.in_fleet(Some(&path));
+    let db = Db::open(&path)?;
 
     // Read the task before the pane exists: a key that is not on the board
     // is a typo worth refusing, not an agent to start and then correct.
@@ -706,8 +738,8 @@ fn emit<T: serde::Serialize>(value: &T) -> Result<bool> {
     Ok(false)
 }
 
-fn board(cmd: BoardCmd, path: Option<PathBuf>) -> Result<()> {
-    let path = path.unwrap_or_else(db::default_path);
+fn board(cmd: BoardCmd, path: Option<PathBuf>, fleet: Option<String>) -> Result<()> {
+    let path = scope::board_for_command(path, fleet.as_deref())?;
     let db = Db::open(&path)?;
 
     match cmd {

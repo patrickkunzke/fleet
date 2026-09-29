@@ -156,10 +156,12 @@ fn open_in(herdr: &Herdr, workspace: &str, root: &Path, fresh: Option<&Created>,
     }
 
     let root_text = root.to_string_lossy();
+    let fleet = crate::scope::board_for_root(root).ok().and_then(|b| crate::scope::fleet_of(&b));
+    let chief_name = crate::host::herdr_agent_name(fleet.as_deref(), "chief");
     let chief = herdr
         .agents()?
         .into_iter()
-        .find(|a| a.name == "chief" && a.workspace_id == workspace);
+        .find(|a| a.name == chief_name && a.workspace_id == workspace);
     let pane = match (fresh, chief) {
         (Some(created), _) => {
             herdr.tab_rename(&created.tab_id, TAB)?;
@@ -188,7 +190,7 @@ struct Opening(PathBuf);
 
 impl Opening {
     fn take(workspace: &str) -> Option<Opening> {
-        let dir = crate::db::default_path().parent()?.to_path_buf();
+        let dir = crate::scope::home();
         std::fs::create_dir_all(&dir).ok()?;
         let path = dir.join(format!("opening-{}", workspace.replace(['/', ':'], "-")));
         for _ in 0..2 {
@@ -233,10 +235,7 @@ fn find_text(json: &serde_json::Value, key: &str) -> Option<String> {
 
 /// Where the list of directories that open in fleet mode lives.
 pub fn auto_open_path() -> PathBuf {
-    crate::db::default_path()
-        .parent()
-        .map(|p| p.join("auto-open"))
-        .unwrap_or_else(|| PathBuf::from("auto-open"))
+    crate::scope::home().join("auto-open")
 }
 
 fn auto_open_roots() -> Vec<PathBuf> {

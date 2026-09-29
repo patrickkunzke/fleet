@@ -21,7 +21,8 @@ else
   printf 'skill  %s -> %s\n' "$SKILL_DIR" "$ROOT/skills/board"
 fi
 
-"$BIN_DIR/fleet" board init
+# No board to make: each fleet makes its own, the first time fleet is started
+# in its workspace.
 
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;

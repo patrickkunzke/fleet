@@ -149,6 +149,7 @@ pub fn run(width: u16, height: u16, view: Option<&str>, plain: bool, herdr: bool
     let hosted = herdr.then(|| crate::host::Hosted {
         herdr: crate::herdr::Herdr::with("herdr", "/nonexistent/herdr.sock"),
         workspace: "w1".into(),
+        fleet: None,
     });
     let mut app = App::within(db, PathBuf::from(":memory:"), Some(repo), hosted);
     // App::new found the user's tmux server. The fixture pane is not on it,

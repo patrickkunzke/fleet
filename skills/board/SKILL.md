@@ -17,6 +17,22 @@ description: |
 `fleet.db` is the fleet's **live coordination state**: who is working, on what,
 what blocks what, what is running in the background, and who told whom.
 
+## Which board
+
+Each fleet has a board of its own. A fleet is one workspace, such as
+`~/Code/acme`, and its board holds only that fleet's chief, workers and
+tasks. You are on a board only if a fleet started you: fleet hands every agent
+it starts its board in `FLEET_DB`, and the CLI uses it without being told.
+
+If a command answers **`not part of a fleet`**, this session was not started by
+one. That is not an error to work around. Carry on without the board: do not
+retry, do not pick a fleet with `--fleet`, and do not message a chief. You
+have none. If the user wants the work tracked, say so, and let them start it
+from the fleet.
+
+The same holds for a session that once was a fleet worker. A conversation
+carried on after its fleet was closed is no longer part of it.
+
 It is not a memory store. Long-term recall belongs in claude-mem; raw tool
 activity stays in the transcripts. Write to the board only what another agent
 needs in order to act.

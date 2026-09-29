@@ -8,7 +8,9 @@
 //! board, the briefs, the runs — does not care which of the two it is.
 //!
 //! A board row remembers which by its target: `herdr:<name>` for an agent
-//! herdr holds, a tmux `session:window` otherwise.
+//! herdr holds, a tmux `session:window` otherwise. herdr's name is the
+//! board's qualified with the fleet, `acme-chief`: herdr wants live agent
+//! names unique across all its workspaces, and every fleet has a chief.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -37,6 +39,8 @@ pub enum Host {
 pub struct Hosted {
     pub herdr: Herdr,
     pub workspace: String,
+    /// The fleet the agents belong to, which their herdr names carry.
+    pub fleet: Option<String>,
 }
 
 /// What to run in the new terminal.
@@ -61,9 +65,22 @@ pub struct Placed {
     pub pid: i32,
     /// herdr's pane id, for naming what appears in it.
     pane: Option<String>,
+    /// And the name to give it there.
+    herdr_name: Option<String>,
 }
 
 impl Host {
+    /// The same host, starting agents for the fleet whose board this is.
+    pub fn in_fleet(self, board: Option<&Path>) -> Host {
+        match self {
+            Host::Herdr(mut h) => {
+                h.fleet = board.and_then(crate::scope::fleet_of);
+                Host::Herdr(h)
+            }
+            tmux => tmux,
+        }
+    }
+
     /// herdr when fleet runs in a herdr pane, tmux otherwise.
     pub fn detect(tmux_session: Option<&str>) -> Result<Host> {
         if let Some(hosted) = Hosted::from_env() {
@@ -117,6 +134,7 @@ impl Host {
                     place: format!("pane {} in session {}", pane.id, pane.session),
                     pid: pane.pid,
                     pane: None,
+                    herdr_name: None,
                 })
             }
             Host::Herdr(h) => h.open(name, repo, command, beside_view),
@@ -128,7 +146,10 @@ impl Host {
     /// to it can find it. Nothing to do in tmux, whose window has the name.
     pub fn settle(&self, placed: &Placed, name: &str, timeout: Duration) -> bool {
         match (self, placed.pane.as_deref()) {
-            (Host::Herdr(h), Some(pane)) => h.herdr.name_when_up(pane, name, timeout).is_some(),
+            (Host::Herdr(h), Some(pane)) => {
+                let name = placed.herdr_name.as_deref().unwrap_or(name);
+                h.herdr.name_when_up(pane, name, timeout).is_some()
+            }
             _ => true,
         }
     }
@@ -198,7 +219,7 @@ impl Hosted {
         }
         let herdr = Herdr::from_env()?;
         let workspace = std::env::var("HERDR_WORKSPACE_ID").ok().filter(|w| !w.is_empty())?;
-        Some(Hosted { herdr, workspace })
+        Some(Hosted { herdr, workspace, fleet: None })
     }
 
     /// A tab of its own per agent, labelled with its name. A Claude Code
@@ -249,8 +270,10 @@ impl Hosted {
         }
         let pid = self.herdr.shell_pid(&pane)?;
         self.herdr.pane_run(&pane, command)?;
+        let herdr_name = herdr_agent_name(self.fleet.as_deref(), name);
         Ok(Placed {
-            target: format!("{HERDR_PREFIX}{name}"),
+            target: format!("{HERDR_PREFIX}{herdr_name}"),
+            herdr_name: Some(herdr_name),
             place: format!("tab {tab} ({pane})"),
             pid,
             pane: Some(pane),
@@ -297,6 +320,15 @@ impl Hosted {
     }
 }
 
+/// What herdr calls an agent of `fleet`: the board's name, qualified so two
+/// fleets' chiefs are two agents to herdr.
+pub fn herdr_agent_name(fleet: Option<&str>, name: &str) -> String {
+    match fleet {
+        Some(f) => herdr_safe(&format!("{f}-{name}")),
+        None => herdr_safe(name),
+    }
+}
+
 pub fn is_herdr(target: &str) -> bool {
     target.starts_with(HERDR_PREFIX)
 }
@@ -331,6 +363,13 @@ mod tests {
         assert!(!is_herdr("fleet:chief"));
         assert_eq!(herdr_name("herdr:eng-2155"), Some("eng-2155"));
         assert_eq!(herdr_name("herdr:"), None);
+    }
+
+    #[test]
+    fn herdr_names_an_agent_by_its_fleet_as_well() {
+        assert_eq!(herdr_agent_name(Some("acme"), "chief"), "acme-chief");
+        assert_eq!(herdr_agent_name(Some("storefront"), "chief"), "storefront-chief");
+        assert_eq!(herdr_agent_name(None, "chief"), "chief");
     }
 
     #[test]

@@ -72,7 +72,7 @@ pub fn start(
         Naming::Unique => unique_name(db, &wanted)?,
         Naming::Exact => wanted,
     };
-    let command = format!("{}{}", environment(run), host.line(what, &name)?);
+    let command = format!("{}{}", environment(run, db.path()), host.line(what, &name)?);
     let placed = host.open(&name, &repo, &command, role == "chief")?;
     if let Some(id) = run {
         db.join_run(id, &name, role, &repo.to_string_lossy())?;
@@ -96,17 +96,17 @@ pub fn start(
 }
 
 /// What the agent's shell is told before the command: the run it joins, and
-/// the board fleet itself is using. A new terminal gets its environment from
-/// the multiplexer's server, not from fleet, so a board set with `FLEET_DB`
-/// would otherwise be one the agent never sees — it would read and write the
-/// default board instead.
-fn environment(run: Option<i64>) -> String {
+/// its fleet's board. The board is what makes it part of the fleet: a
+/// session without one is refused by the board, which is how a session
+/// fleet did not start is kept off it. A new terminal gets its environment
+/// from the multiplexer's server, not from fleet, so it has to be said here.
+fn environment(run: Option<i64>, board: Option<&Path>) -> String {
     let mut out = String::new();
     if let Some(id) = run {
         out.push_str(&format!("FLEET_RUN={id} "));
     }
-    if let Some(db) = std::env::var_os("FLEET_DB").filter(|v| !v.is_empty()) {
-        out.push_str(&format!("FLEET_DB={} ", brief::quote(&db.to_string_lossy())));
+    if let Some(board) = board {
+        out.push_str(&format!("FLEET_DB={} ", brief::quote(&board.to_string_lossy())));
     }
     out
 }

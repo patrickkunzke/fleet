@@ -199,10 +199,7 @@ pub fn claude_program() -> String {
 
 /// Where a brief is written for a launch line to read.
 pub fn default_dir() -> std::path::PathBuf {
-    crate::db::default_path()
-        .parent()
-        .map(|p| p.join("briefs"))
-        .unwrap_or_else(|| std::path::PathBuf::from("briefs"))
+    crate::scope::home().join("briefs")
 }
 
 /// The command line that starts the agent, with the brief read from files.

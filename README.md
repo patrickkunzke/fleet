@@ -16,6 +16,7 @@ already runs on the machine.
 | `src/registry.rs` — session discovery and watching | done, 6 tests |
 | `src/transcript.rs` — transcript reading and tailing | done, 8 tests |
 | `src/db.rs` — fleet.db reads and writes, and runs | done, 30 tests |
+| `src/scope.rs` — one board per fleet, and who is in one | done, 4 tests |
 | `fleet board` — the whole board, in the binary | done, 13 tests |
 | `src/tmux.rs` — spawning and pane control | done, 17 tests |
 | `src/ui/` — frame, fleet rail, session pane, board rail | done, 57 tests |
@@ -32,7 +33,7 @@ already runs on the machine.
 | `src/ui/clipboard.rs` — pbcopy and OSC 52 | done, 3 tests |
 | `src/ui/preview.rs` — the fixture fleet, for layout work | done, 4 tests |
 | `src/herdr.rs` — typed calls to the herdr CLI | done, 7 tests |
-| `src/host.rs` — tmux window or herdr tab, one interface | done, 2 tests |
+| `src/host.rs` — tmux window or herdr tab, one interface | done, 3 tests |
 | `src/plugin.rs` + `herdr-plugin.toml` — fleet as a herdr plugin, fleet mode | done, 7 tests |
 | `src/ui/hosting.rs` — herdr's events, sidebar labels, notifications | done, 6 tests |
 
@@ -43,7 +44,7 @@ sources, and owns only the first:
 
 | Source | Holds | Access |
 |---|---|---|
-| `~/.claude-fleet/fleet.db` | tasks, agents, flow events, background processes | ours, read/write |
+| `~/.claude-fleet/fleets/<fleet>/fleet.db` | one fleet's tasks, agents, flow events, background processes | ours, read/write |
 | `~/.claude/sessions/<pid>.json` | live sessions: name, cwd, status, socket | read, watched |
 | `~/.claude/projects/<slug>/<id>.jsonl` | raw tool activity per session | read, tailed |
 | `~/.claude-mem/claude-mem.db` | long-term recall across every project | read only |
@@ -54,6 +55,25 @@ it excellent for "what did we decide about the shared flag" and useless for
 "has !412 landed yet". Anything an agent must act on right now goes in
 fleet.db; anything worth remembering next month goes to claude-mem.
 
+### One board per fleet
+
+A fleet is one workspace — the directory fleet is started in, such as
+`~/Code/acme` — and it has a board of its own, named after the directory
+(`fleet fleets` lists them). Its chief, its workers and its tasks are on that
+board and no other, and a message reaches only an agent of the same fleet.
+
+Membership comes from how a session was started, not from where it stands.
+Every agent a fleet starts is handed its board in `FLEET_DB`; a Claude
+session fleet did not start has none, and `fleet board` refuses it with
+`not part of a fleet`. It has to be that way round: a repository inside the
+landscape is not thereby in the landscape's fleet, and a conversation carried
+on after its fleet closed is no longer a worker in it. From a shell, name a
+fleet: `fleet board ls --fleet acme`.
+
+In herdr, agents are named for their fleet as well — `acme-chief` — since
+herdr wants live agent names unique across its workspaces and every fleet has
+a chief. On the board, and in messages, it is still `chief`.
+
 ## Install (development)
 
 ```bash
@@ -61,7 +81,8 @@ fleet.db; anything worth remembering next month goes to claude-mem.
 ```
 
 Builds the binary, links it to `~/.local/bin/fleet`, links `skills/board` into
-`~/.claude/skills/`, and creates the database.
+`~/.claude/skills/`. There is no database to create: each fleet makes its own
+the first time fleet starts in its workspace.
 
 ## Inside herdr
 
@@ -211,8 +232,9 @@ fleet board ls
 fleet board log
 ```
 
-`FLEET_JSON=1` before any read gives JSON. `FLEET_DB` overrides the database
-path, which is how the tests run against a scratch copy. `fleet board sql`
+`FLEET_JSON=1` before any read gives JSON. `FLEET_DB` names the board, which is
+how an agent finds its fleet's and how the tests run against a scratch copy;
+`--fleet <name>` picks one from a shell. `fleet board sql`
 takes a SELECT and refuses anything else: every write goes through a verb that
 records the matching flow event, and a bare UPDATE is the one way to break
 that.
@@ -404,7 +426,7 @@ fleet preview --plain    # the same frame as text, for a diff
 task state and every agent presence, and a canned Claude Code pane on a
 **private tmux server** (`-L fleet-preview`). It draws one frame where your
 prompt was, in colour, and gives the shell back. Nothing it does can reach
-`~/.claude-fleet/fleet.db`, your registry, or your tmux server, so it is safe
+a fleet's board, your registry, or your tmux server, so it is safe
 to run beside a fleet that is up.
 
 `dev.sh` polls for changes rather than needing `cargo-watch` or `fswatch`
