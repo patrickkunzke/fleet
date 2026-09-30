@@ -321,6 +321,36 @@ impl Db {
         Ok(rows)
     }
 
+    /// The flow log of one run, newest first: what has happened since it
+    /// started. The board keeps every run a workspace has had, and the view
+    /// is about the crew in front of you, not last week's.
+    ///
+    /// Compared as times rather than text: a run is stamped to the second
+    /// and an event to the millisecond, and as text an event in the run's
+    /// first second sorts before it.
+    pub fn run_events(&self, run: i64, limit: usize) -> Result<Vec<Event>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT e.ts, e.kind, e.from_agent, e.to_agent, e.task_key, e.summary, e.body
+             FROM events e JOIN runs r ON r.id = ?1
+             WHERE julianday(e.ts) >= julianday(r.started_at)
+             ORDER BY e.ts DESC, e.id DESC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![run, limit as i64], |r| {
+                Ok(Event {
+                    ts: r.get(0)?,
+                    kind: r.get(1)?,
+                    from_agent: r.get(2)?,
+                    to_agent: r.get(3)?,
+                    task_key: r.get(4)?,
+                    summary: r.get(5)?,
+                    body: r.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// One task with its brief and everything that has happened to it.
     pub fn show(&self, key: &str) -> Result<(Task, Option<String>, Vec<Event>)> {
         let task = self
@@ -1266,6 +1296,28 @@ mod tests {
         chain(&db, &["A", "B"]);
         db.add_dep("B", "A").unwrap();
         db.add_dep("B", "A").unwrap();
+    }
+
+    #[test]
+    fn a_runs_log_starts_where_the_run_did() {
+        let db = Db::open_in_memory().unwrap();
+        let old = db.start_run("/w").unwrap();
+        db.conn
+            .execute("UPDATE runs SET started_at = '2026-09-29T08:50:09Z' WHERE id = ?1", [old])
+            .unwrap();
+        db.log_event("note", Some("chief"), None, None, "yesterday", None, None).unwrap();
+        db.conn
+            .execute("UPDATE events SET ts = '2026-09-29T08:50:09.955Z'", [])
+            .unwrap();
+        let new = db.start_run("/w").unwrap();
+        db.log_event("note", Some("chief"), None, None, "today", None, None).unwrap();
+
+        let today: Vec<_> = db.run_events(new, 50).unwrap().into_iter().map(|e| e.summary).collect();
+        assert_eq!(today, ["today"]);
+        // An event in the run's first second is the run's, though as text it
+        // sorts before the run's own stamp.
+        let all: Vec<_> = db.run_events(old, 50).unwrap().into_iter().map(|e| e.summary).collect();
+        assert_eq!(all, ["today", "yesterday"]);
     }
 
     #[test]

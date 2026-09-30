@@ -262,7 +262,14 @@ impl App {
         if let Ok(bg) = self.db.background() {
             self.background = bg;
         }
-        if let Ok(events) = self.db.events(200) {
+        // Only this run's: the board has every run the workspace has had.
+        // With no run yet, as in a view of all repos, there is nothing to
+        // narrow it to.
+        let events = match self.run {
+            Some(run) => self.db.run_events(run, 200),
+            None => self.db.events(200),
+        };
+        if let Ok(events) = events {
             self.events = events;
             let now = unix_now();
             let keys: std::collections::HashSet<String> = self.events.iter().map(event_key).collect();
