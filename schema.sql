@@ -19,6 +19,8 @@ CREATE TABLE IF NOT EXISTS schema_version (
   applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
 INSERT OR IGNORE INTO schema_version (version) VALUES (1);
+-- 2: agents.tmux_target renamed to target. Done in db.rs, before this runs.
+INSERT OR IGNORE INTO schema_version (version) VALUES (2);
 
 
 -- ---------------------------------------------------------------- agents ---
@@ -33,7 +35,7 @@ CREATE TABLE IF NOT EXISTS agents (
                 CHECK (role IN ('chief', 'worker')),
   repo        TEXT,                         -- absolute path; NULL for the chief
   session_id  TEXT,                         -- ~/.claude/sessions/*.json .sessionId
-  tmux_target TEXT,                         -- e.g. "fleet:billing-service"
+  target      TEXT,                         -- e.g. "herdr:acme-billing-service"
   branch      TEXT,
   spawned_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
   ended_at    TEXT,
@@ -240,10 +242,10 @@ LEFT JOIN epics  e ON e.id = t.epic_id
 LEFT JOIN agents a ON a.id = t.agent_id
 ORDER BY e.position, t.position, t.id;
 
--- Live agents with their current task, for the left rail.
+-- Live agents with their current task, for the graph.
 CREATE VIEW IF NOT EXISTS v_agents AS
 SELECT
-  a.name, a.role, a.repo, a.session_id, a.tmux_target, a.branch,
+  a.name, a.role, a.repo, a.session_id, a.target, a.branch,
   t.key   AS task_key,
   t.title AS task_title,
   t.state AS task_state,

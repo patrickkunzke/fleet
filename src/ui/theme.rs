@@ -33,11 +33,6 @@ pub const TEXT: Color = Color::Rgb(0xE8, 0xE3, 0xDA);
 pub const DIM: Color = Color::Rgb(0x8B, 0x82, 0x78);
 pub const FAINT: Color = Color::Rgb(0x5C, 0x55, 0x4D);
 pub const ACCENT: Color = Color::Rgb(0xD9, 0x77, 0x57);
-/// The one place a background is painted. The selected agent is the thing
-/// every other key acts on, and a bar alone at the left edge does not say
-/// which of two adjacent rows it belongs to. Lifted barely off the design's
-/// ground, so it reads on a dark terminal without becoming a panel.
-pub const SELECTED_BG: Color = Color::Rgb(0x1C, 0x18, 0x15);
 pub const OK: Color = Color::Rgb(0x7F, 0xB3, 0xA3);
 pub const BUSY: Color = Color::Rgb(0xD9, 0xA7, 0x5B);
 
@@ -116,10 +111,9 @@ fn truncate<'a>(spans: Vec<Span<'a>>, budget: usize) -> (Vec<Span<'a>>, usize) {
 
 /// Where a list had to stop, and which way the rest of it is.
 ///
-/// Both rails run out of room and both say so the same way. The arrow is the
-/// half that matters: the agent rail hides rows at either end, and a bare
-/// count leaves you to guess which. `+` is not used for this — it means "add
-/// one" three lines below, on the same rail.
+/// Every list that runs out of room says so the same way. The arrow is the
+/// half that matters: a bare count leaves you to guess which end the rest
+/// is at.
 pub fn more(arrow: &str, n: usize) -> ratatui::text::Line<'static> {
     ratatui::text::Line::from(vec![
         // To the text column, not the glyph column: this is a note about the
@@ -135,19 +129,8 @@ pub fn more(arrow: &str, n: usize) -> ratatui::text::Line<'static> {
 /// adjacent, but visibly not connected. This walks the divider columns and
 /// swaps in the junction the neighbours ask for.
 ///
-/// Only the divider columns are touched, and `theirs` marks the area an
-/// agent draws into. Without that exclusion, a `───` an agent printed sits
-/// next to a divider and drags it into a junction with something that is
-/// not one of our rules at all.
-pub fn join(
-    buf: &mut ratatui::buffer::Buffer,
-    columns: &[u16],
-    top: u16,
-    bottom: u16,
-    // Cells belonging to an agent rather than to us. A rule an agent printed
-    // must not pull a divider into a junction with it.
-    theirs: Rect,
-) {
+/// Only the divider columns are touched.
+pub fn join(buf: &mut ratatui::buffer::Buffer, columns: &[u16], top: u16, bottom: u16) {
     const VERTICAL: [char; 6] = ['│', '├', '┤', '┬', '┴', '┼'];
     const HORIZONTAL: [char; 6] = ['─', '├', '┤', '┬', '┴', '┼'];
 
@@ -165,14 +148,8 @@ pub fn join(
             }
             let up = y > top && VERTICAL.contains(&at(buf, x, y - 1));
             let down = y + 1 < bottom && VERTICAL.contains(&at(buf, x, y + 1));
-            let ours = |x: u16, y: u16| {
-                !(x >= theirs.x
-                    && x < theirs.x + theirs.width
-                    && y >= theirs.y
-                    && y < theirs.y + theirs.height)
-            };
-            let left = x > 0 && ours(x - 1, y) && HORIZONTAL.contains(&at(buf, x - 1, y));
-            let right = ours(x + 1, y) && HORIZONTAL.contains(&at(buf, x + 1, y));
+            let left = x > 0 && HORIZONTAL.contains(&at(buf, x - 1, y));
+            let right = HORIZONTAL.contains(&at(buf, x + 1, y));
 
             let glyph = match (up, down, left, right) {
                 (true, true, true, true) => '┼',
@@ -208,38 +185,6 @@ pub fn selected() -> Style {
     Style::default().fg(TEXT).add_modifier(Modifier::BOLD)
 }
 
-/// The selection's own edge, hard against the wall of the pane.
-///
-/// A left half-block rather than a border character: the design draws a 2px
-/// rule down the edge of the row, and `│` is a divider between two things,
-/// which is not what this is. Written after the fill so it keeps the ground
-/// the fill laid down.
-pub fn bar(frame: &mut ratatui::Frame, area: Rect, colour: Color) {
-    let buf = frame.buffer_mut();
-    for y in area.y..area.y + area.height {
-        if let Some(cell) = buf.cell_mut((area.x, y)) {
-            cell.set_symbol("▌").set_fg(colour);
-        }
-    }
-}
-
-/// Paint the selection behind whatever is already drawn there.
-///
-/// Rendered after the text, not before: a widget writes its own background
-/// over every cell it touches, so a fill laid down first is erased by the
-/// line that lands on it. Patching afterwards keeps the glyphs and their
-/// colours and changes only the ground — which is also how the fill reaches
-/// the gutters, where no text is drawn at all.
-pub fn fill(frame: &mut ratatui::Frame, area: Rect, colour: Color) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    frame.render_widget(
-        ratatui::widgets::Block::default().style(Style::default().bg(colour)),
-        area,
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,23 +211,10 @@ mod tests {
     #[test]
     fn a_rule_crossing_a_divider_becomes_a_junction() {
         let mut buf = buffer(&["──────", "  │   ", "  │   ", "──────"]);
-        join(&mut buf, &[2], 0, 4, Rect::ZERO);
+        join(&mut buf, &[2], 0, 4);
 
         assert_eq!(row(&buf, 0, 6), "──┬───", "the divider starts below the rule");
         assert_eq!(row(&buf, 3, 6), "──┴───", "and ends above this one");
-    }
-
-    #[test]
-    fn a_rule_an_agent_printed_does_not_pull_the_divider_into_it() {
-        // The right half is the agent's pane; the ─ in it is its own.
-        let mut buf = buffer(&["  │───", "  │───", "  │───"]);
-        join(&mut buf, &[2], 0, 3, Rect::new(3, 0, 3, 3));
-
-        assert_eq!(
-            row(&buf, 1, 6),
-            "  │───",
-            "the divider stays a divider"
-        );
     }
 
     #[test]

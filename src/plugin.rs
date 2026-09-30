@@ -321,9 +321,9 @@ pub fn doctor() -> Result<()> {
 
     let inside = herdr::inside();
     say(
-        true,
+        inside,
         "running in",
-        if inside { "a herdr pane".into() } else { "a plain terminal: fleet uses tmux here".into() },
+        if inside { "a herdr pane".into() } else { "a plain terminal: fleet runs only inside herdr".into() },
     );
 
     let program = brief::claude_program();

@@ -1,16 +1,13 @@
-//! Where an agent's terminal lives: a tmux window, or a herdr tab.
+//! Where an agent's terminal lives: a herdr tab, or a pane beside the view.
 //!
-//! Fleet started out owning its terminals through tmux, and drew them itself
-//! — which is where the mouse, the selection, pasting and scrolling all had
-//! to be rebuilt by hand, and never felt native. Inside herdr none of that is
-//! fleet's: herdr draws the agent's pane, and fleet only asks it to open one,
-//! type a command into it, and knock with a message. Everything else — the
-//! board, the briefs, the runs — does not care which of the two it is.
+//! herdr draws the agent's pane; fleet only asks it to open one, type a
+//! command into it, and knock with a message. Everything else — the board,
+//! the briefs, the runs — does not care where the terminal is.
 //!
-//! A board row remembers which by its target: `herdr:<name>` for an agent
-//! herdr holds, a tmux `session:window` otherwise. herdr's name is the
-//! board's qualified with the fleet, `acme-chief`: herdr wants live agent
-//! names unique across all its workspaces, and every fleet has a chief.
+//! A board row remembers the agent by its target, `herdr:<name>`. herdr's
+//! name is the board's qualified with the fleet, `acme-chief`: herdr wants
+//! live agent names unique across all its workspaces, and every fleet has a
+//! chief.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -19,7 +16,6 @@ use anyhow::{Context, Result, bail};
 
 use crate::brief::{self, Brief};
 use crate::herdr::{Herdr, Pane};
-use crate::tmux::Tmux;
 
 const HERDR_PREFIX: &str = "herdr:";
 
@@ -27,16 +23,10 @@ const HERDR_PREFIX: &str = "herdr:";
 /// half. Without the rail, the view's graph and board fit in the other.
 pub const CHIEF_SHARE: f32 = 0.5;
 
-#[derive(Clone)]
-pub enum Host {
-    Tmux(Tmux),
-    Herdr(Hosted),
-}
-
 /// herdr, and the workspace new agents open in: the one fleet itself runs
 /// in, so the crew sits together in one herdr sidebar entry.
 #[derive(Debug, Clone)]
-pub struct Hosted {
+pub struct Host {
     pub herdr: Herdr,
     pub workspace: String,
     /// The fleet the agents belong to, which their herdr names carry.
@@ -58,175 +48,97 @@ pub enum What<'a> {
 pub struct Placed {
     /// What the board records, and what a message is delivered to.
     pub target: String,
-    /// Where it is, said the way the host says it.
+    /// Where it is, said the way herdr says it.
     pub place: String,
     /// The terminal's shell. The agent's session descends from it, which is
     /// how the registry entry is matched to the pane.
     pub pid: i32,
     /// herdr's pane id, for naming what appears in it.
-    pane: Option<String>,
+    pane: String,
     /// And the name to give it there.
-    herdr_name: Option<String>,
+    herdr_name: String,
 }
 
 impl Host {
     /// The same host, starting agents for the fleet whose board this is.
-    pub fn in_fleet(self, board: Option<&Path>) -> Host {
-        match self {
-            Host::Herdr(mut h) => {
-                h.fleet = board.and_then(crate::scope::fleet_of);
-                Host::Herdr(h)
-            }
-            tmux => tmux,
-        }
+    pub fn in_fleet(mut self, board: Option<&Path>) -> Host {
+        self.fleet = board.and_then(crate::scope::fleet_of);
+        self
     }
 
-    /// herdr when fleet runs in a herdr pane, tmux otherwise.
-    pub fn detect(tmux_session: Option<&str>) -> Result<Host> {
-        if let Some(hosted) = Hosted::from_env() {
-            return Ok(Host::Herdr(hosted));
-        }
-        Ok(Host::Tmux(Tmux::detect(tmux_session)?))
+    /// The herdr fleet is running in, or why it is not.
+    pub fn detect() -> Result<Host> {
+        Host::from_env().context("fleet runs inside herdr: start it from a herdr pane, or with the plugin's fleet.open")
     }
 
-    /// The host a recorded target belongs to — which is not always the one
-    /// fleet is running under: an agent in herdr can message one fleet
-    /// started earlier in tmux.
-    pub fn for_target(target: &str) -> Option<Host> {
-        if is_herdr(target) {
-            Hosted::from_env().map(Host::Herdr)
-        } else {
-            Tmux::detect(None).ok().map(Host::Tmux)
-        }
-    }
-
-    pub fn is_herdr(&self) -> bool {
-        matches!(self, Host::Herdr(_))
-    }
-
-    /// The command line for `what`, in the form this host's terminal takes.
+    /// The command line for `what`, with the brief read from files: see
+    /// `brief::launch_line`.
     pub fn line(&self, what: &What, stem: &str) -> Result<String> {
-        Ok(match (self, what) {
-            (_, What::Command(c)) => c.to_string(),
-            (Host::Tmux(_), What::Brief { brief, .. }) => brief::command(brief),
-            (Host::Tmux(_), What::Resume { brief, session, program }) => {
-                brief::resume_command_for(program, brief, session)
-            }
-            (Host::Herdr(_), What::Brief { brief, program }) => {
-                brief::launch_line(program, brief, &brief::default_dir(), stem)?
-            }
-            (Host::Herdr(_), What::Resume { brief, session, program }) => {
+        Ok(match what {
+            What::Command(c) => c.to_string(),
+            What::Brief { brief, program } => brief::launch_line(program, brief, &brief::default_dir(), stem)?,
+            What::Resume { brief, session, program } => {
                 brief::resume_line(program, brief, session, &brief::default_dir(), stem)?
             }
         })
     }
 
-    /// Open a terminal named `name` in `repo`, and run `command` in it.
-    /// `beside_view` puts it next to the fleet view rather than in a tab of
-    /// its own, where the host can: the chief, who is talked to while the
-    /// board is watched.
-    pub fn open(&self, name: &str, repo: &Path, command: &str, beside_view: bool) -> Result<Placed> {
-        match self {
-            Host::Tmux(tmux) => {
-                let pane = tmux.spawn(name, repo, command)?;
-                Ok(Placed {
-                    target: format!("{}:{}", pane.session, pane.window_name),
-                    place: format!("pane {} in session {}", pane.id, pane.session),
-                    pid: pane.pid,
-                    pane: None,
-                    herdr_name: None,
-                })
-            }
-            Host::Herdr(h) => h.open(name, repo, command, beside_view),
-        }
-    }
-
     /// Once the agent is up: herdr names only the agents it starts itself,
     /// so the one fleet started gets its name here, and a message addressed
-    /// to it can find it. Nothing to do in tmux, whose window has the name.
-    pub fn settle(&self, placed: &Placed, name: &str, timeout: Duration) -> bool {
-        match (self, placed.pane.as_deref()) {
-            (Host::Herdr(h), Some(pane)) => {
-                let name = placed.herdr_name.as_deref().unwrap_or(name);
-                h.herdr.name_when_up(pane, name, timeout).is_some()
-            }
-            _ => true,
-        }
+    /// to it can find it.
+    pub fn settle(&self, placed: &Placed, timeout: Duration) -> bool {
+        self.herdr.name_when_up(&placed.pane, &placed.herdr_name, timeout).is_some()
     }
 
-    /// The conversation running at `target`, as the host knows it. Only herdr
-    /// does; in tmux it is found through the session registry instead.
+    /// The conversation running at `target`, as herdr knows it.
     pub fn session_at(&self, target: &str) -> Option<String> {
-        match self {
-            Host::Herdr(h) => h.herdr.agent(herdr_name(target)?)?.session_id().map(String::from),
-            Host::Tmux(_) => None,
-        }
-    }
-
-    /// Whether anything is running at `target` now.
-    pub fn is_live(&self, target: &str) -> bool {
-        match self {
-            Host::Tmux(tmux) => tmux.find(target).ok().flatten().is_some(),
-            Host::Herdr(h) => herdr_name(target).is_some_and(|n| h.herdr.agent(n).is_some()),
-        }
+        self.herdr.agent(herdr_name(target)?)?.session_id().map(String::from)
     }
 
     /// Put a message in front of the agent at `target`. False when nobody
     /// is there.
     pub fn deliver(&self, target: &str, text: &str) -> Result<bool> {
-        match self {
-            Host::Tmux(tmux) => crate::msg::deliver(tmux, target, text),
-            Host::Herdr(h) => {
-                let Some(name) = herdr_name(target) else { return Ok(false) };
-                if h.herdr.agent(name).is_none() {
-                    return Ok(false);
-                }
-                match h.herdr.agent_prompt(name, text) {
-                    Ok(()) => Ok(true),
-                    // At a question or permission dialog: herdr refused
-                    // before typing anything, and the message is on the
-                    // board for when the dialog is answered.
-                    Err(e) if e.code == "agent_blocked" => {
-                        bail!("{name} is waiting at a dialog; it is on the board")
-                    }
-                    Err(e) => Err(e.into()),
-                }
+        let Some(name) = herdr_name(target) else { return Ok(false) };
+        if self.herdr.agent(name).is_none() {
+            return Ok(false);
+        }
+        match self.herdr.agent_prompt(name, text) {
+            Ok(()) => Ok(true),
+            // At a question or permission dialog: herdr refused before
+            // typing anything, and the message is on the board for when the
+            // dialog is answered.
+            Err(e) if e.code == "agent_blocked" => {
+                bail!("{name} is waiting at a dialog; it is on the board")
             }
+            Err(e) => Err(e.into()),
         }
     }
 
     /// Bring the agent at `target` to the front.
     pub fn focus(&self, target: &str) -> Result<()> {
-        match self {
-            Host::Herdr(h) => {
-                let name = herdr_name(target).context("not a herdr agent")?;
-                h.herdr.agent_focus(name)?;
-                Ok(())
-            }
-            Host::Tmux(tmux) => {
-                let pane = tmux.find(target)?.context("nothing running there")?;
-                tmux.select(&pane)
-            }
-        }
+        let name = herdr_name(target).context("not a herdr agent")?;
+        self.herdr.agent_focus(name)?;
+        Ok(())
     }
 }
 
-impl Hosted {
+impl Host {
     /// The herdr session and workspace this pane is in, when it is in one.
-    pub fn from_env() -> Option<Hosted> {
+    pub fn from_env() -> Option<Host> {
         if !crate::herdr::inside() {
             return None;
         }
         let herdr = Herdr::from_env()?;
         let workspace = std::env::var("HERDR_WORKSPACE_ID").ok().filter(|w| !w.is_empty())?;
-        Some(Hosted { herdr, workspace, fleet: None })
+        Some(Host { herdr, workspace, fleet: None })
     }
 
     /// A tab of its own per agent, labelled with its name. A Claude Code
     /// session wants the width: split beside the others, each would be a
     /// column too narrow to read a diff in. The one exception is the chief,
-    /// split on the fleet view's left when it asks to be.
-    fn open(&self, name: &str, repo: &Path, command: &str, beside_view: bool) -> Result<Placed> {
+    /// split on the fleet view's left: `beside_view`, since it is talked to
+    /// while the board is watched.
+    pub fn open(&self, name: &str, repo: &Path, command: &str, beside_view: bool) -> Result<Placed> {
         let cwd = repo.to_string_lossy();
         // A terminal of the agent's own that is still there is used again:
         // after herdr restarts, every pane comes back with a shell where the
@@ -273,15 +185,15 @@ impl Hosted {
         let herdr_name = herdr_agent_name(self.fleet.as_deref(), name);
         Ok(Placed {
             target: format!("{HERDR_PREFIX}{herdr_name}"),
-            herdr_name: Some(herdr_name),
+            herdr_name,
             place: format!("tab {tab} ({pane})"),
             pid,
-            pane: Some(pane),
+            pane,
         })
     }
 }
 
-impl Hosted {
+impl Host {
     /// The pane the fleet view runs in, in this workspace.
     pub fn view_pane(&self) -> Option<Pane> {
         self.herdr.panes(&self.workspace).ok()?.into_iter().find(|p| p.label == crate::plugin::TAB)
@@ -360,7 +272,7 @@ mod tests {
     #[test]
     fn a_target_says_which_host_holds_it() {
         assert!(is_herdr("herdr:chief"));
-        assert!(!is_herdr("fleet:chief"));
+        assert!(!is_herdr("fleet:chief"), "a tmux window, from before fleet ran only in herdr");
         assert_eq!(herdr_name("herdr:eng-2155"), Some("eng-2155"));
         assert_eq!(herdr_name("herdr:"), None);
     }

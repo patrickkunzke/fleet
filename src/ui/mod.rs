@@ -1,52 +1,41 @@
-//! The terminal UI: the frame, and the panes inside it.
+//! The fleet view: the crew as a graph or a log, and the board beside it.
 //!
-//! The frame is three columns — the agents on the left, whatever is selected
-//! in the middle, the chief's tasks and the background processes on the
-//! right. Only the left rail is filled in so far; the other two say so rather
-//! than showing invented content.
+//! herdr draws every agent's terminal, in a tab of its own, and owns
+//! everything about it — typing, the mouse, the clipboard. This is the view
+//! of the crew: who is doing what, the board, the graph. `↵` goes to an
+//! agent's own tab rather than drawing it here, and no key belongs to an
+//! agent, so none needs a prefix.
 //!
-//! Redraws are event-driven, not polled. Three sources feed one channel:
-//! keystrokes, the session registry moving, and a slow tick that catches what
-//! produces no event of its own — a process that died, and a clock that has
-//! to keep showing elapsed time.
+//! Redraws are event-driven, not polled. Four sources feed one channel:
+//! keystrokes, the session registry moving, herdr's agents changing, and a
+//! slow tick that catches what produces no event of its own — a process
+//! that died, and a clock that has to keep showing elapsed time.
 
 pub mod board;
-pub mod clipboard;
-pub mod fleet;
+pub mod crew;
 pub mod flow;
 pub mod graph;
 pub mod hosting;
-pub mod keys;
 pub mod picker;
-pub mod mirror;
 pub mod preview;
 pub mod resume;
-pub mod selection;
-pub mod sender;
-pub mod session;
 pub mod theme;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{
-    self, DisableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Paragraph};
 
 use crate::agent;
 use crate::brief;
 use crate::db::{self, Db};
-use crate::host::{Host, Hosted, What};
+use crate::host::{Host, What};
 use crate::registry::{self, Registry, Watcher};
-use crate::tmux::Tmux;
-use crate::ui::fleet::Row;
+use crate::ui::crew::Row;
 use crate::ui::flow::View;
 use crate::ui::picker::Picker;
 
@@ -55,54 +44,34 @@ use crate::ui::picker::Picker;
 /// exited without touching its registry file.
 const TICK: Duration = Duration::from_secs(2);
 
+/// How often the graph is redrawn while a message travels across it.
+const FRAME: Duration = Duration::from_millis(40);
+
 enum Msg {
     Key(KeyEvent),
     /// A paste, whole. Only arrives because bracketed paste is on: without
-    /// it the terminal types the text out, a keystroke at a time.
-    Paste(String),
-    /// Word back from the thread that sends into panes.
-    Sent(sender::Reply),
-    Mouse(MouseEvent),
+    /// it the terminal types the text out, and every letter would be a key.
+    Paste,
     Registry,
     /// herdr's agents, as they are now: after one of them changed.
     Agents(Vec<crate::herdr::Agent>),
     Tick,
-    /// The selected session may have written something. Far more frequent
-    /// than the others and usually finds nothing, so it redraws only when
-    /// the transcript actually grew.
-    Transcript,
+    /// Time for the next frame of a message in flight. Far more frequent
+    /// than the others, and draws only while one is.
+    Frame,
 }
-
-/// Which half of the frame the arrow keys belong to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Focus {
-    Rail,
-    Session,
-}
-
-/// Fleet's own key, borrowed from every multiplexer there has ever been.
-///
-/// Typing belongs to the agent, so fleet cannot also own the alphabet. Ctrl-A
-/// rather than tmux's Ctrl-B, because `↵` hands you to tmux and the two must
-/// not be the same key. Ctrl-A twice sends a literal one through.
-pub(crate) const PREFIX: char = 'a';
 
 pub struct App {
     registry: Registry,
     db: Db,
     root: Option<PathBuf>,
-    projects: PathBuf,
-    tmux: Option<Tmux>,
-    /// herdr, when fleet runs in one of its panes. herdr then owns every
-    /// agent's terminal — drawing, typing, the mouse, the clipboard — and
-    /// fleet is the view of the crew: who is doing what, the board, the
-    /// graph. ↵ goes to the agent's own tab instead of drawing it here.
-    hosted: Option<Hosted>,
-    /// What herdr last said about its agents. Empty outside herdr, and until
-    /// the first answer.
+    /// herdr, which starts the agents and draws them. None only in a test
+    /// or a preview, which must not reach a real one.
+    host: Option<Host>,
+    /// What herdr last said about its agents. Empty until the first answer.
     herdr_agents: Vec<crate::herdr::Agent>,
     /// Where sidebar labels and notifications are sent, off this thread.
-    /// None until the loop starts, and outside herdr.
+    /// None until the loop starts.
     jobs: Option<Sender<hosting::Job>>,
     /// The labels last handed over, so an unchanged board sends nothing.
     labels: Vec<(String, String)>,
@@ -110,33 +79,13 @@ pub struct App {
     /// read, which marks everything already on the board as seen: starting
     /// fleet must not replay yesterday's blockers as news.
     noticed: Option<std::collections::HashSet<String>>,
-    /// The centre column as last drawn, so a mirror can be attached at the
-    /// right size before its first frame.
-    centre_size: (u16, u16),
     rows: Vec<Row>,
     selected: usize,
-    centre: session::Pane,
-    focus: Focus,
-    /// Where each pane was last drawn, so a click can be routed to it.
-    rail_at: Rect,
-    centre_at: Rect,
-    /// Whether fleet is taking the mouse. While it does, the terminal
-    /// cannot select text, so this is something you can give back.
-    mouse: bool,
-    /// Whether the terminal speaks the kitty keyboard protocol, and so
-    /// whether it was asked to. Remembered so it can be given back.
-    enhanced: bool,
     /// When fleet first saw each event, in seconds since the epoch. The graph
     /// shows a message travelling from the moment it appears here, which can
     /// be a beat after it was written: a pulse timed from the write alone
     /// would already be over by the time anyone could see it.
     first_seen: std::collections::HashMap<String, f64>,
-    /// Where keystrokes, pastes and the wheel go, off this thread. None
-    /// until the loop starts: a frame drawn for a test or a preview sends
-    /// nothing anywhere.
-    sender: Option<sender::Sender>,
-    /// True between the prefix and the key it modifies.
-    armed: bool,
     /// The run new agents join: the crew in this workspace that a later
     /// resume brings back together.
     run: Option<i64>,
@@ -150,17 +99,11 @@ pub struct App {
     db_path: PathBuf,
     tx: Sender<Msg>,
     rx: Option<Receiver<Msg>>,
-    /// Rails folded away, leaving the agent's terminal the whole window.
-    wide: bool,
-    /// Set when the user asked for the real terminal. Acted on by the run
-    /// loop, which owns the screen — the key handler does not.
-    wants_attach: bool,
     tasks: Vec<db::Task>,
     background: Vec<db::BgTask>,
     events: Vec<db::Event>,
-    /// What the middle column is showing. The rail selection still drives
-    /// the session view underneath, so switching away and back keeps it.
-    centre_view: Option<View>,
+    /// What the main column is showing.
+    view: View,
     event_selected: usize,
     status: Option<String>,
     /// Whether the message on screen is one refresh put there, and so one
@@ -170,57 +113,32 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(db: Db, db_path: PathBuf, root: Option<PathBuf>) -> App {
-        // A test must not become a herdr view because the terminal it was
-        // run from happens to be a herdr pane.
-        let hosted = if cfg!(test) { None } else { Hosted::from_env() };
-        App::within(db, db_path, root, hosted)
-    }
-
-    pub(crate) fn within(db: Db, db_path: PathBuf, root: Option<PathBuf>, hosted: Option<Hosted>) -> App {
+    pub fn new(db: Db, db_path: PathBuf, root: Option<PathBuf>, host: Option<Host>) -> App {
         // The agents this view starts are named in herdr for its fleet.
-        let hosted = hosted.map(|h| Hosted { fleet: crate::scope::fleet_of(&db_path), ..h });
+        let host = host.map(|h| h.in_fleet(Some(&db_path)));
         let (tx, rx) = channel();
         App {
             db_path,
             tx,
             rx: Some(rx),
-            wide: false,
-            wants_attach: false,
             registry: Registry::new(registry::default_dir()),
             db,
             root,
-            projects: registry::default_projects_dir(),
-            // No tmux is survivable: every agent then falls back to its
-            // transcript, which is exactly the non-local case.
-            tmux: if hosted.is_some() { None } else { Tmux::detect(None).ok() },
-            // With herdr drawing the agents, the middle column is the crew.
-            centre_view: hosted.is_some().then_some(View::Graph),
-            hosted,
+            host,
             herdr_agents: Vec::new(),
             jobs: None,
             labels: Vec::new(),
             noticed: None,
-            centre_size: (80, 24),
             rows: Vec::new(),
             selected: 0,
-            centre: session::Pane::default(),
-            // The agent has the keyboard by default; that is the whole
-            // point of a prefix.
-            focus: Focus::Session,
-            rail_at: Rect::ZERO,
-            centre_at: Rect::ZERO,
-            mouse: true,
-            enhanced: false,
-            sender: None,
             first_seen: std::collections::HashMap::new(),
-            armed: false,
             picker: None,
             run: None,
             resume_picker: None,
             tasks: Vec::new(),
             background: Vec::new(),
             events: Vec::new(),
+            view: View::Graph,
             event_selected: 0,
             status: None,
             status_is_db_error: false,
@@ -228,7 +146,7 @@ impl App {
         }
     }
 
-    /// Re-read both sources and rebuild the rail.
+    /// Re-read both sources and rebuild the crew.
     ///
     /// A failure here is shown rather than fatal: the database is a file
     /// other processes are writing, and a locked moment should not take the
@@ -240,7 +158,7 @@ impl App {
 
         match self.db.agents() {
             Ok(agents) => {
-                self.rows = fleet::merge(&agents, &sessions);
+                self.rows = crew::merge(&agents, &sessions);
                 self.apply_herdr();
                 // Only clear what refresh itself reported. Anything else on
                 // screen was said by an action, and a refresh two ticks
@@ -263,8 +181,7 @@ impl App {
             self.background = bg;
         }
         // Only this run's: the board has every run the workspace has had.
-        // With no run yet, as in a view of all repos, there is nothing to
-        // narrow it to.
+        // With no run yet there is nothing to narrow it to.
         let events = match self.run {
             Some(run) => self.db.run_events(run, 200),
             None => self.db.events(200),
@@ -284,7 +201,6 @@ impl App {
             .min(self.events.len().saturating_sub(1));
 
         self.selected = self.selected.min(self.rows.len().saturating_sub(1));
-        self.retarget();
         self.publish();
     }
 
@@ -294,14 +210,14 @@ impl App {
     /// folder trust prompt, in a repository it has not seen — is answered,
     /// and that can be minutes after it was started. herdr knows the session
     /// as soon as there is one, so it is asked on every refresh until then.
-    /// Without it the agent is on the rail but a later resume cannot find it.
+    /// Without it the agent is on the graph but a later resume cannot find it.
     fn link_hosted(&mut self) {
         if self.herdr_agents.is_empty() {
             return;
         }
         let Ok(agents) = self.db.agents() else { return };
         for a in agents.iter().filter(|a| a.session_id.is_none()) {
-            let Some(sid) = self.herdr_agent(a.tmux_target.as_deref()).and_then(|h| h.session_id()) else {
+            let Some(sid) = self.herdr_agent(a.target.as_deref()).and_then(|h| h.session_id()) else {
                 continue;
             };
             let _ = agent::link(&self.db, &a.name, sid, self.run);
@@ -324,20 +240,20 @@ impl App {
         let states: Vec<Option<String>> = self
             .rows
             .iter()
-            .map(|r| self.herdr_agent(r.tmux_target.as_deref()).map(|h| h.agent_status.clone()))
+            .map(|r| self.herdr_agent(r.target.as_deref()).map(|h| h.agent_status.clone()))
             .collect();
         for (row, state) in self.rows.iter_mut().zip(states) {
             match state.as_deref() {
                 Some("working") => {
-                    row.presence = fleet::Presence::Working;
+                    row.presence = crew::Presence::Working;
                     row.asking = false;
                 }
                 Some("blocked") => {
-                    row.presence = fleet::Presence::Waiting;
+                    row.presence = crew::Presence::Waiting;
                     row.asking = true;
                 }
                 Some("idle" | "done") => {
-                    row.presence = fleet::Presence::Waiting;
+                    row.presence = crew::Presence::Waiting;
                     row.asking = false;
                 }
                 _ => {}
@@ -354,10 +270,10 @@ impl App {
             .rows
             .iter()
             .filter_map(|r| {
-                let pane = self.herdr_agent(r.tmux_target.as_deref())?.pane_id.clone();
+                let pane = self.herdr_agent(r.target.as_deref())?.pane_id.clone();
                 let text = match r.role {
-                    fleet::Role::Chief => hosting::chief_label(&self.tasks),
-                    fleet::Role::Worker => hosting::worker_label(&r.name, &self.tasks),
+                    crew::Role::Chief => hosting::chief_label(&self.tasks),
+                    crew::Role::Worker => hosting::worker_label(&r.name, &self.tasks),
                 };
                 Some((pane, text))
             })
@@ -382,17 +298,6 @@ impl App {
         }
     }
 
-    /// Point the centre pane at the selection. Cheap when it has not changed.
-    fn retarget(&mut self) {
-        // Nothing to follow: herdr has the agent's terminal.
-        if self.hosted.is_some() {
-            return;
-        }
-        let row = self.selected().cloned();
-        self.centre
-            .follow(row.as_ref(), &self.projects, self.tmux.as_ref(), self.centre_size);
-    }
-
     fn on_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
             return;
@@ -405,167 +310,33 @@ impl App {
             self.picker_key(key);
             return;
         }
-
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        if self.armed {
-            self.armed = false;
-            // The prefix twice means the prefix itself, as everywhere else.
-            if ctrl && key.code == KeyCode::Char(PREFIX) {
-                self.forward(key);
-            } else {
-                self.command(key);
-            }
-            return;
-        }
-        if ctrl && key.code == KeyCode::Char(PREFIX) {
-            self.armed = true;
-            return;
-        }
-
-        // With a pane in front of you and the keyboard pointed at it, every
-        // key is the agent's. Otherwise — a transcript, the flow, the rail —
-        // there is nothing to type into, so keys act directly.
-        if self.focus == Focus::Session && self.centre_view.is_none() && self.centre.is_live() {
-            self.forward(key);
-        } else {
-            self.command(key);
-        }
-    }
-
-    /// One of fleet's own keys.
-    fn command(&mut self, key: KeyEvent) {
         match (key.code, key.modifiers) {
-            (KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Char('q'), _) => {
-                self.quit = true
-            }
-            // Over the graph the cards are what the keys move between, and
-            // ↵ opens the one selected — the design's "zoom into session".
-            (KeyCode::Right | KeyCode::Tab, _) if self.centre_view == Some(View::Graph) => {
-                self.move_by(1)
-            }
-            (KeyCode::Left | KeyCode::BackTab, _) if self.centre_view == Some(View::Graph) => {
-                self.move_by(-1)
-            }
-            (KeyCode::Enter, _) if self.hosted.is_some() && self.centre_view == Some(View::Graph) => {
-                self.go_to_selected()
-            }
-            (KeyCode::Enter, _) if self.centre_view == Some(View::Graph) => {
-                self.centre_view = None;
-                self.focus = Focus::Session;
-            }
-            (KeyCode::Tab, _) => {
-                self.focus = match self.focus {
-                    Focus::Rail => Focus::Session,
-                    Focus::Session => Focus::Rail,
-                }
-            }
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) | (KeyCode::Char('q'), _) => self.quit = true,
             // Refresh used to live here; the board and the registry are
             // watched now, and bringing a run back is worth the key more.
             (KeyCode::Char('r'), _) => self.open_resume(),
-            (KeyCode::Char('z'), _) => {
-                self.wide = !self.wide;
-                self.focus = Focus::Session;
-            }
-            // In herdr there is no session to go back to: the two keys move
-            // between the graph and the log.
-            (KeyCode::Char('g'), _) if self.hosted.is_some() => self.centre_view = Some(View::Graph),
-            (KeyCode::Char('l'), _) if self.hosted.is_some() => {
-                self.centre_view = Some(if self.centre_view == Some(View::Log) { View::Graph } else { View::Log })
-            }
-            (KeyCode::Char('g'), _) => {
-                self.centre_view = (self.centre_view != Some(View::Graph)).then_some(View::Graph)
-            }
+            (KeyCode::Char('g'), _) => self.view = View::Graph,
             (KeyCode::Char('l'), _) => {
-                self.centre_view = (self.centre_view != Some(View::Log)).then_some(View::Log)
+                self.view = if self.view == View::Log { View::Graph } else { View::Log }
             }
-            (KeyCode::Char('m'), _) => self.take_mouse(!self.mouse),
             (KeyCode::Char('n'), _) => self.open_picker(),
             (KeyCode::Char('x'), _) => self.retire_selected(),
-            (KeyCode::Enter, _) if self.centre_view.is_none() => self.hand_over(),
-            _ if self.centre_view == Some(View::Log) => self.log_key(key),
-            // Paging and the wheel move a transcript; the arrows do not.
-            // Keys only reach here when nothing is live to type into, and in
-            // that state switching agent is what they are wanted for.
-            (KeyCode::PageUp | KeyCode::PageDown | KeyCode::End, _) => {
-                self.transcript_key(key)
-            }
-            _ => self.rail_key(key),
-        }
-    }
-
-    /// Hand a keystroke to the agent.
-    /// A paste goes to the agent the keyboard is pointed at, in one piece.
-    fn on_paste(&mut self, text: &str) {
-        // The prefix was pressed and then a paste arrived instead of a
-        // command: the paste wins, because nothing in fleet takes text.
-        self.armed = false;
-        let typing = self.focus == Focus::Session
-            && self.centre_view.is_none()
-            && self.centre.is_live();
-        if !typing {
-            self.status = Some(if self.hosted.is_some() {
-                "a paste goes to an agent — ↵ opens its tab".into()
-            } else {
-                "a paste goes to an agent — click its pane first".into()
-            });
-            return;
-        }
-        let Some(tmux) = self.tmux.clone() else { return };
-        self.centre.mirror_to_live();
-        self.centre.clear_selection();
-        if let (Some(sender), Some(pane)) = (&self.sender, self.centre.tmux_pane()) {
-            sender.send(pane, sender::Job::Paste(text.to_string()));
-            return;
-        }
-        if let Err(e) = self.centre.paste(&tmux, text) {
-            self.status = Some(e.to_string());
-        }
-    }
-
-    fn forward(&mut self, key: KeyEvent) {
-        let Some(translated) = keys::translate(key) else {
-            return;
-        };
-        let Some(tmux) = self.tmux.clone() else { return };
-        // Typing returns you to the live edge: writing into a screen you are
-        // scrolled away from shows nothing happening. It also moves the text
-        // a selection was drawn over, so the selection goes with it.
-        self.centre.mirror_to_live();
-        self.centre.clear_selection();
-        // Queued, not sent here: a send is a tmux process, and waiting on
-        // one per keystroke is what made typing lag. The pane's echo arrives
-        // through the mirror's own poll, not by sleeping for it.
-        if let (Some(sender), Some(pane)) = (&self.sender, self.centre.tmux_pane()) {
-            let job = match translated {
-                keys::Key::Literal(text) => sender::Job::Text(text),
-                keys::Key::Named(name) => sender::Job::Key(name),
-            };
-            sender.send(pane, job);
-            return;
-        }
-        if let Err(e) = self.centre.send(&tmux, &translated) {
-            self.status = Some(e.to_string());
-        }
-    }
-
-    /// Give the user the actual terminal.
-    fn hand_over(&mut self) {
-        if Tmux::inside() {
-            if let Some(tmux) = self.tmux.as_ref() {
-                self.status = self.centre.zoom(tmux);
-            }
-        } else if self.centre.is_live() {
-            self.wants_attach = true;
-        }
-    }
-
-    fn transcript_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::PageUp => self.centre.scroll_by(1, 10),
-            KeyCode::PageDown => self.centre.scroll_by(-1, 10),
-            KeyCode::End => self.centre.to_tail(),
+            _ if self.view == View::Log => self.log_key(key),
+            // Over the graph the cards are what the keys move between, and
+            // ↵ goes to the one selected.
+            (KeyCode::Right | KeyCode::Tab | KeyCode::Down | KeyCode::Char('j'), _) => self.move_by(1),
+            (KeyCode::Left | KeyCode::BackTab | KeyCode::Up | KeyCode::Char('k'), _) => self.move_by(-1),
+            (KeyCode::Home, _) => self.selected = 0,
+            (KeyCode::End | KeyCode::Char('G'), _) => self.selected = self.rows.len().saturating_sub(1),
+            (KeyCode::Enter, _) => self.go_to_selected(),
             _ => {}
         }
+    }
+
+    /// Nothing in the view takes text, and a paste typed out a key at a
+    /// time would be a burst of commands.
+    fn on_paste(&mut self) {
+        self.status = Some("a paste goes to an agent — ↵ opens its tab".into());
     }
 
     fn log_key(&mut self, key: KeyEvent) {
@@ -582,73 +353,7 @@ impl App {
         }
     }
 
-    /// Clicks and the wheel. The reason there is a prefix at all: a mouse
-    /// needs no mode.
-    /// Returns whether anything changed, so a stray event costs no frame.
-    fn on_mouse(&mut self, ev: MouseEvent) -> bool {
-        let at = (ev.column, ev.row);
-        if matches!(ev.kind, MouseEventKind::Moved) {
-            return false;
-        }
-        match ev.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                if inside(self.rail_at, at) {
-                    self.focus = Focus::Rail;
-                    if let Some(i) =
-                        fleet::row_at(self.rail_at, ev.row, self.rows.len(), self.selected)
-                        && i < self.rows.len()
-                    {
-                        self.selected = i;
-                        self.retarget();
-                    }
-                } else if inside(self.centre_at, at) {
-                    // Clicking a terminal is how you say "talk to this one".
-                    self.focus = Focus::Session;
-                    // And it is where a drag over its output begins.
-                    self.centre.press(ev.column, ev.row);
-                }
-            }
-            MouseEventKind::Drag(MouseButton::Left) => self.centre.drag(ev.column, ev.row),
-            MouseEventKind::Up(MouseButton::Left) => {
-                if let Some(text) = self.centre.release() {
-                    let lines = text.lines().count();
-                    let s = if lines == 1 { "" } else { "s" };
-                    self.status = Some(if clipboard::copy(&text) {
-                        format!("copied {lines} line{s}")
-                    } else {
-                        "nothing here can reach the clipboard".into()
-                    });
-                }
-            }
-            // The live pane and the transcript each keep their own history,
-            // so the wheel means the same thing over either.
-            MouseEventKind::ScrollUp if inside(self.centre_at, at) => self.wheel(1),
-            MouseEventKind::ScrollDown if inside(self.centre_at, at) => self.wheel(-1),
-            MouseEventKind::ScrollUp => self.rail_key(KeyEvent::from(KeyCode::Up)),
-            MouseEventKind::ScrollDown => self.rail_key(KeyEvent::from(KeyCode::Down)),
-            _ => {}
-        }
-        true
-    }
-
-    fn rail_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Down | KeyCode::Char('j') => self.move_by(1),
-            KeyCode::Up | KeyCode::Char('k') => self.move_by(-1),
-            KeyCode::Home => {
-                self.selected = 0;
-                self.retarget();
-            }
-            KeyCode::End | KeyCode::Char('G') => {
-                self.selected = self.rows.len().saturating_sub(1);
-                self.retarget();
-            }
-            KeyCode::Char('n') => self.open_picker(),
-            _ => {}
-        }
-    }
-
-    /// Select the agent an event came from, and go back to watching it.
+    /// Go to the agent an event came from.
     fn jump_to_event(&mut self) {
         let Some(event) = self.events.get(self.event_selected) else {
             return;
@@ -658,15 +363,9 @@ impl App {
         };
         if let Some(at) = self.rows.iter().position(|r| r.name == who) {
             self.selected = at;
-            if self.hosted.is_some() {
-                self.go_to_selected();
-                return;
-            }
-            self.centre_view = None;
-            self.focus = Focus::Rail;
-            self.retarget();
+            self.go_to_selected();
         } else {
-            self.status = Some(format!("{who} is not on the rail any more"));
+            self.status = Some(format!("{who} is not on the board any more"));
         }
     }
 
@@ -722,9 +421,9 @@ impl App {
         );
     }
 
-    /// Take the selected agent off the rail.
+    /// Take the selected agent off the board.
     ///
-    /// Its pane is left alone: the row is fleet's bookkeeping, and killing
+    /// Its tab is left alone: the row is fleet's bookkeeping, and killing
     /// somebody's running session because they tidied a list would be a
     /// surprising thing for a list to do.
     fn retire_selected(&mut self) {
@@ -734,7 +433,7 @@ impl App {
         }
         match self.db.retire_agent(&row.name) {
             Ok(()) => {
-                self.status = Some(format!("{} is off the rail; its pane is untouched", row.name));
+                self.status = Some(format!("{} is off the board; its tab is untouched", row.name));
                 self.refresh();
             }
             Err(e) => self.status = Some(e.to_string()),
@@ -744,46 +443,23 @@ impl App {
     /// Clear out agents that are finished with.
     ///
     /// Quitting fleet leaves every agent's row behind with its session gone,
-    /// so without this the rail fills with the dead from previous runs. Only
+    /// so without this the graph fills with the dead from previous runs. Only
     /// the ones holding no task: an agent that died mid-task is exactly what
     /// somebody needs to see.
     fn prune_dead(&mut self) {
         let dead: Vec<String> = self
             .rows
             .iter()
-            .filter(|r| r.presence == fleet::Presence::Gone && r.detail == "session ended")
+            .filter(|r| r.presence == crew::Presence::Gone && r.detail == "session ended")
             .map(|r| r.name.clone())
             .collect();
         for name in dead {
-            // Off the rail, but not retired: its run keeps it, so it can be
+            // Off the graph, but not retired: its run keeps it, so it can be
             // resumed. Retiring it here, as this used to, is how a reboot
             // lost the whole crew.
             let _ = self.db.end_agent(&name);
         }
         self.refresh();
-    }
-
-    /// Take the mouse, or hand it back to the terminal.
-    ///
-    /// A terminal selects text with the mouse, and an application that
-    /// reports mouse events takes that away: there is no way to have both,
-    /// and no way for us to put a selection on the clipboard on the
-    /// terminal's behalf. So it is a switch. Clicking a pane and scrolling
-    /// one stop working while it is off, which is a fair trade for being
-    /// able to copy what an agent just said.
-    fn take_mouse(&mut self, take: bool) {
-        use std::io::stdout;
-        let done = if take {
-            crossterm::execute!(stdout(), CaptureMouse)
-        } else {
-            crossterm::execute!(stdout(), DisableMouseCapture)
-        };
-        if done.is_err() {
-            self.status = Some("the terminal would not change mouse reporting".into());
-            return;
-        }
-        self.mouse = take;
-        self.status = take.then(|| "mouse back to fleet — click a pane, scroll it".into());
     }
 
     /// Make sure there is someone to brief.
@@ -794,8 +470,8 @@ impl App {
     /// session; the board skill is what makes it a chief of staff.
     fn ensure_chief(&mut self) {
         let live = self.rows.iter().any(|r| {
-            r.role == fleet::Role::Chief
-                && matches!(r.presence, fleet::Presence::Working | fleet::Presence::Waiting)
+            r.role == crew::Role::Chief
+                && matches!(r.presence, crew::Presence::Working | crew::Presence::Waiting)
         });
         if live {
             return;
@@ -814,7 +490,7 @@ impl App {
         self.refresh();
     }
 
-    /// Open the pane now, and let the session catch up on its own.
+    /// Open the tab now, and let the session catch up on its own.
     ///
     /// Waiting here for Claude Code to register itself would freeze the UI
     /// for several seconds on every spawn, which is how a key stops being
@@ -827,8 +503,8 @@ impl App {
         role: &str,
         brief: &brief::Brief,
     ) {
-        let Some(host) = self.host() else {
-            self.status = Some("no tmux — agents are started in tmux panes".into());
+        let Some(host) = self.host.clone() else {
+            self.status = Some("not in herdr — agents are started in herdr tabs".into());
             return;
         };
         let program = brief::claude_program();
@@ -847,26 +523,16 @@ impl App {
         // Select what was just started: pressing the key was the intent.
         if let Some(at) = self.rows.iter().position(|r| r.name == spawned.name) {
             self.selected = at;
-            self.retarget();
         }
 
         self.adopt_later(host, spawned);
-    }
-
-    /// Where agents are started: herdr's tabs when fleet runs in herdr,
-    /// tmux windows otherwise.
-    fn host(&self) -> Option<Host> {
-        match &self.hosted {
-            Some(h) => Some(Host::Herdr(h.clone())),
-            None => self.tmux.clone().map(Host::Tmux),
-        }
     }
 
     /// Hand the selected agent to herdr: its tab comes to the front, and the
     /// keyboard is its. This view stays where it is, a tab away.
     fn go_to_selected(&mut self) {
         let Some(row) = self.selected().cloned() else { return };
-        let (Some(host), Some(target)) = (self.host(), row.tmux_target.as_deref()) else {
+        let (Some(host), Some(target)) = (self.host.as_ref(), row.target.as_deref()) else {
             self.status = Some(format!("{} has no terminal fleet knows of", row.name));
             return;
         };
@@ -883,7 +549,7 @@ impl App {
         let tx = self.tx.clone();
         let run = self.run;
         std::thread::spawn(move || {
-            host.settle(&spawned.placed, &spawned.name, Duration::from_secs(30));
+            host.settle(&spawned.placed, Duration::from_secs(30));
             let Some(found) = agent::adopt(spawned.placed.pid, Duration::from_secs(30)) else {
                 return;
             };
@@ -968,15 +634,15 @@ impl App {
 
     /// Bring a run's crew back, each into its own conversation.
     fn resume_run(&mut self, run: db::Run) {
-        let Some(host) = self.host() else {
-            self.status = Some("no tmux — agents are resumed into tmux panes".into());
+        let Some(host) = self.host.clone() else {
+            self.status = Some("not in herdr — agents are resumed into herdr tabs".into());
             return;
         };
         self.run = Some(run.id);
         let live: std::collections::HashSet<String> = self
             .rows
             .iter()
-            .filter(|r| matches!(r.presence, fleet::Presence::Working | fleet::Presence::Waiting))
+            .filter(|r| matches!(r.presence, crew::Presence::Working | crew::Presence::Waiting))
             .map(|r| r.name.clone())
             .collect();
 
@@ -1012,31 +678,8 @@ impl App {
     }
 
     fn select_chief(&mut self) {
-        if let Some(at) = self.rows.iter().position(|r| r.role == fleet::Role::Chief) {
+        if let Some(at) = self.rows.iter().position(|r| r.role == crew::Role::Chief) {
             self.selected = at;
-            self.retarget();
-        }
-    }
-
-    /// Select the agent an event came from, and go back to watching it.
-    /// Wait briefly for the pane to echo what was just sent.
-    ///
-    /// Without this a keystroke is invisible until the next poll, up to
-    /// 400ms later, which reads as a dropped key. Bounded tightly: an agent
-    /// that is busy will not echo at all, and the loop must not stall for it.
-    /// A wheel notch over the centre pane.
-    fn wheel(&mut self, notches: isize) {
-        self.centre.clear_selection();
-        match (&self.sender, self.centre.tmux_pane()) {
-            // Where the notch goes depends on what the program in the pane
-            // asked for, which only a tmux call can say — so it is decided
-            // on the sender's thread, not this one.
-            (Some(sender), Some(pane)) => sender.send(pane, sender::Job::Wheel(notches)),
-            _ => {
-                if !self.centre.scroll_mirror(notches * 3) {
-                    self.centre.scroll_by(notches, 3);
-                }
-            }
         }
     }
 
@@ -1061,20 +704,12 @@ impl App {
 
     /// Whether the graph has something moving on it, and so wants frames.
     fn animating(&self) -> bool {
-        self.centre_view == Some(View::Graph)
+        self.view == View::Graph
             && self
                 .ages()
                 .iter()
                 .zip(&self.events)
                 .any(|(&age, e)| e.kind == "message" && age < graph::PULSE_SECS + 0.2)
-    }
-
-    /// What the sender reported back.
-    fn on_sent(&mut self, reply: sender::Reply) {
-        match reply {
-            sender::Reply::Failed(e) => self.status = Some(e),
-            sender::Reply::ScrollLocal(lines) => self.centre.scroll_local(lines),
-        }
     }
 
     fn move_by(&mut self, delta: isize) {
@@ -1083,7 +718,6 @@ impl App {
         }
         let last = self.rows.len() as isize - 1;
         self.selected = (self.selected as isize + delta).clamp(0, last) as usize;
-        self.retarget();
     }
 
     pub fn selected(&self) -> Option<&Row> {
@@ -1119,72 +753,38 @@ impl App {
         theme::rule(frame, top_rule);
         theme::rule(frame, key_rule);
 
-        // Folded away, the terminal is the window. That is the point of the
-        // key: a REPL rendered into a third of the screen is a preview of a
-        // terminal rather than one.
-        let (rail, rest) = if self.wide || self.hosted.is_some() {
-            // In herdr the rail says nothing the graph does not: its cards
-            // are the agents, selected with ←→ and opened with ↵, and herdr's
-            // own sidebar lists the live ones with what they are on. Its
-            // width goes to the graph.
-            (Rect::ZERO, body)
-        } else {
-            let [rail, rest] = Layout::horizontal([Constraint::Length(28), Constraint::Min(0)]).areas(body);
-            (rail, rest)
-        };
         // A side column of tasks needs a wide window. In a split pane it
         // leaves the graph a sliver and clips every title, so there the
         // board goes along the foot and has the whole width instead.
-        let stacked = !self.wide && rest.width < STACK_BELOW && rest.height >= 20;
-        let (centre, side, side_rule) = if self.wide {
-            (rest, Rect::ZERO, Rect::ZERO)
-        } else if stacked {
+        let stacked = body.width < STACK_BELOW && body.height >= 20;
+        let (centre, side, side_rule) = if stacked {
             let height = board::stacked_height(&self.tasks, &self.background)
-                .min(rest.height / 2)
+                .min(body.height / 2)
                 .max(6);
             let [centre, rule, side] =
                 Layout::vertical([Constraint::Min(0), Constraint::Length(1), Constraint::Length(height)])
-                    .areas(rest);
+                    .areas(body);
             (centre, side, rule)
         } else {
-            let [centre, side] = Layout::horizontal([Constraint::Min(24), Constraint::Length(36)]).areas(rest);
+            let [centre, side] = Layout::horizontal([Constraint::Min(24), Constraint::Length(36)]).areas(body);
             (centre, side, Rect::ZERO)
         };
-        // Nothing to the centre's right to rule it off from, once the board
-        // is below it.
-        let bordered = !self.wide && !stacked;
 
-        self.rail_at = rail;
-        self.centre_at = centre;
-        self.centre_size = (
-            centre.width.saturating_sub(theme::GUTTER * 2 + 1),
-            centre.height.saturating_sub(3),
+        let ages = self.ages();
+        let agent = self.rows.get(self.selected).map(|r| r.name.clone());
+        flow::render(
+            frame,
+            centre,
+            self.view,
+            &self.events,
+            &ages,
+            &self.rows,
+            self.event_selected,
+            agent.as_deref(),
+            // Nothing to the centre's right to rule it off from, once the
+            // board is below it.
+            !stacked,
         );
-        if !rail.is_empty() {
-            fleet::render(frame, rail, &self.rows, self.selected);
-        }
-        match self.centre_view {
-            Some(view) => {
-                let ages = self.ages();
-                let agent = self.rows.get(self.selected).map(|r| r.name.clone());
-                flow::render(
-                    frame,
-                    centre,
-                    view,
-                    &self.events,
-                    &ages,
-                    &self.rows,
-                    self.event_selected,
-                    agent.as_deref(),
-                    bordered,
-                )
-            }
-            None => {
-                let row = self.rows.get(self.selected).cloned();
-                let typing = self.focus == Focus::Session;
-                self.centre.render(frame, centre, row.as_ref(), typing, bordered);
-            }
-        }
         if stacked {
             theme::rule(frame, side_rule);
             board::render_stacked(
@@ -1194,32 +794,25 @@ impl App {
                 &self.background,
                 self.selected().map(|r| r.name.as_str()),
             );
-        } else if !self.wide {
-            self.draw_side(frame, side);
+        } else {
+            board::render(
+                frame,
+                side,
+                &self.tasks,
+                &self.background,
+                self.selected().map(|r| r.name.as_str()),
+            );
         }
         self.draw_keys(frame, keys);
 
         // After everything, so that every rule and divider is on the buffer
         // to be joined up.
-        if !self.wide {
-            let columns: Vec<u16> = [rail, if stacked { Rect::ZERO } else { centre }]
-                .iter()
-                .filter(|r| !r.is_empty())
-                .map(|r| r.x + r.width - 1)
-                .collect();
-            // The flow views are ours to draw; a session's output is not.
-            let theirs = match self.centre_view {
-                Some(_) => Rect::ZERO,
-                None => self.centre.content_at(),
-            };
-            theme::join(
-                frame.buffer_mut(),
-                &columns,
-                top_rule.y,
-                key_rule.y + 1,
-                theirs,
-            );
-        }
+        let columns: Vec<u16> = [if stacked { Rect::ZERO } else { centre }]
+            .iter()
+            .filter(|r| !r.is_empty())
+            .map(|r| r.x + r.width - 1)
+            .collect();
+        theme::join(frame.buffer_mut(), &columns, top_rule.y, key_rule.y + 1);
 
         if let Some(picker) = &self.picker {
             picker.render(frame, area);
@@ -1230,9 +823,9 @@ impl App {
     }
 
     fn draw_top(&self, frame: &mut Frame, area: Rect) {
-        let count = |p: fleet::Presence| self.rows.iter().filter(|r| r.presence == p).count();
-        let working = count(fleet::Presence::Working);
-        let waiting = count(fleet::Presence::Waiting);
+        let count = |p: crew::Presence| self.rows.iter().filter(|r| r.presence == p).count();
+        let working = count(crew::Presence::Working);
+        let waiting = count(crew::Presence::Waiting);
         let blocked = self
             .tasks
             .iter()
@@ -1269,7 +862,7 @@ impl App {
         let taken: usize = right.iter().map(|s| s.width()).sum::<usize>() + 5 + 2;
         let root = match self.root.as_deref() {
             Some(p) => shorten(p, (inner.width as usize).saturating_sub(taken)),
-            None => "all repos".to_string(),
+            None => "no workspace".to_string(),
         };
         let left = vec![
             Span::styled("fleet", theme::accent().add_modifier(Modifier::BOLD)),
@@ -1280,32 +873,7 @@ impl App {
         frame.render_widget(Paragraph::new(theme::spread(left, right, inner.width)), inner);
     }
 
-    fn draw_side(&self, frame: &mut Frame, area: Rect) {
-        board::render(
-            frame,
-            area,
-            &self.tasks,
-            &self.background,
-            self.selected().map(|r| r.name.as_str()),
-            if self.hosted.is_some() { "l" } else { "^a l" },
-        );
-    }
-
     fn draw_keys(&self, frame: &mut Frame, area: Rect) {
-        // Before the status, and instead of the keys: with the mouse gone,
-        // half of what the bar advertises does nothing, and a click that
-        // quietly fails is worse than one the bar warned you about.
-        if !self.mouse {
-            frame.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled("the terminal has the mouse", theme::accent()),
-                    Span::styled("   ^a m", theme::dim()),
-                    Span::styled(" mouse back to fleet", theme::faint()),
-                ])),
-                theme::pad(area),
-            );
-            return;
-        }
         if let Some(status) = &self.status {
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(status.clone(), theme::accent()))),
@@ -1313,66 +881,21 @@ impl App {
             );
             return;
         }
-        // What the prefix is for is worth saying, since nothing else on the
-        // screen can: every other key is going to the agent.
-        if self.armed {
-            frame.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled(" ^a ", theme::accent().add_modifier(Modifier::REVERSED)),
-                    Span::styled(
-                        "  n new  x retire  r resume  m mouse  z wide  g graph  l log  tab focus  q quit",
-                        theme::dim(),
-                    ),
-                ])),
-                theme::pad(area),
-            );
-            return;
-        }
-
-        let typing = self.focus == Focus::Session
-            && self.centre_view.is_none()
-            && self.centre.is_live();
-        let keys: &[(&str, &str)] = match self.centre_view {
-            Some(View::Log) if self.hosted.is_some() => &[
+        let keys: &[(&str, &str)] = match self.view {
+            View::Log => &[
                 ("↑↓", "event"),
                 ("↵", "go to its agent"),
                 ("l", "graph"),
                 ("r", "resume"),
                 ("q", "quit"),
             ],
-            _ if self.hosted.is_some() => &[
+            View::Graph => &[
                 ("↑↓ ←→", "agent"),
                 ("↵", "go to it"),
                 ("n", "new agent"),
                 ("l", "log"),
                 ("r", "resume"),
                 ("x", "retire"),
-                ("q", "quit"),
-            ],
-            _ if typing => &[
-                ("keys", "→ agent"),
-                ("^a", "fleet"),
-                ("↵", "attach"),
-                ("drag", "to copy"),
-            ],
-            Some(View::Log) => &[
-                ("↑↓", "event"),
-                ("↵", "jump to agent"),
-                ("l", "back"),
-                ("^a q", "quit"),
-            ],
-            Some(View::Graph) => &[
-                ("←→", "agent"),
-                ("↵", "open"),
-                ("g", "back"),
-                ("l", "log"),
-                ("^a q", "quit"),
-            ],
-            None => &[
-                ("↑↓", "agent"),
-                ("n", "new agent"),
-                ("z", "wide"),
-                ("tab", "focus"),
                 ("q", "quit"),
             ],
         };
@@ -1388,35 +911,9 @@ impl App {
     }
 }
 
-pub fn snapshot(
-    db: Db,
-    db_path: PathBuf,
-    root: Option<PathBuf>,
-    width: u16,
-    height: u16,
-    view: Option<&str>,
-) -> Result<()> {
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-
-    let mut app = App::new(db, db_path, root);
+pub fn run(db: Db, db_path: PathBuf, root: Option<PathBuf>, host: Host) -> Result<()> {
+    let mut app = App::new(db, db_path, root, Some(host));
     app.refresh();
-    app.centre_view = match view {
-        Some("graph") => Some(View::Graph),
-        Some("log") => Some(View::Log),
-        _ => None,
-    };
-    let mut term = Terminal::new(TestBackend::new(width, height))?;
-    term.draw(|f| app.draw(f))?;
-    print!("{}", term.backend());
-    Ok(())
-}
-
-pub fn run(db: Db, db_path: PathBuf, root: Option<PathBuf>) -> Result<()> {
-    let mut app = App::new(db, db_path, root);
-    app.refresh();
-    // Only here, never in snapshot: drawing a frame must not start a
-    // Claude Code session as a side effect.
     if let Some(root) = app.workspace() {
         // A board from before runs existed still holds the last crew that
         // ran; give it a run, once, so it can be brought back.
@@ -1425,7 +922,7 @@ pub fn run(db: Db, db_path: PathBuf, root: Option<PathBuf>) -> Result<()> {
     let live = app
         .rows
         .iter()
-        .any(|r| matches!(r.presence, fleet::Presence::Working | fleet::Presence::Waiting));
+        .any(|r| matches!(r.presence, crew::Presence::Working | crew::Presence::Waiting));
     app.prune_dead();
     if live {
         // A fleet still running from before fleet was last closed: carry on
@@ -1447,51 +944,38 @@ pub fn run(db: Db, db_path: PathBuf, root: Option<PathBuf>) -> Result<()> {
 
     let rx = app.rx.take().expect("the app owns its channel until run takes it");
     let tx = app.tx.clone();
-    let paused = Arc::new(AtomicBool::new(false));
-    spawn_input(tx.clone(), paused.clone());
+    spawn_input(tx.clone());
     spawn_registry(tx.clone());
     spawn_board_watch(tx.clone(), &app.db_path);
-    spawn_transcript_poll(tx.clone());
-    if let Some(tmux) = app.tmux.clone() {
+    spawn_frames(tx.clone());
+    if let Some(host) = app.host.clone() {
         let back = tx.clone();
-        app.sender = Some(sender::Sender::start(tmux, move |reply| {
-            let _ = back.send(Msg::Sent(reply));
-        }));
-    }
-    if let Some(hosted) = app.hosted.clone() {
-        let back = tx.clone();
-        hosting::follow(hosted.herdr.clone(), move |agents| back.send(Msg::Agents(agents)).is_ok());
-        app.jobs = Some(hosting::worker(hosted.herdr));
+        hosting::follow(host.herdr.clone(), move |agents| back.send(Msg::Agents(agents)).is_ok());
+        app.jobs = Some(hosting::worker(host.herdr));
     }
     spawn_ticker(tx);
 
     let mut term = ratatui::init();
-    // Asked once. The answer is the terminal's, and it does not change
-    // between an attach and the return from one.
-    app.enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
-    enter_modes(app.mouse, app.enhanced);
+    // Bracketed paste, so a paste arrives whole instead of as a burst of
+    // keys, each of them a command here.
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
     let result = (|| -> Result<()> {
         term.draw(|f| app.draw(f))?;
         while let Ok(first) = rx.recv() {
             // Everything already waiting, then one frame. One frame per
-            // message meant a wheel flick or a burst of output redrew the
-            // screen dozens of times to show the last of them.
+            // message meant a burst of events redrew the screen dozens of
+            // times to show the last of them.
             let mut dirty = false;
             let mut refresh = false;
-            let mut poll = false;
+            let mut frame = false;
             for msg in std::iter::once(first).chain(rx.try_iter()) {
                 match msg {
                     Msg::Key(key) => {
                         app.on_key(key);
                         dirty = true;
                     }
-                    Msg::Paste(text) => {
-                        app.on_paste(&text);
-                        dirty = true;
-                    }
-                    Msg::Mouse(ev) => dirty |= app.on_mouse(ev),
-                    Msg::Sent(reply) => {
-                        app.on_sent(reply);
+                    Msg::Paste => {
+                        app.on_paste();
                         dirty = true;
                     }
                     // Several of these in one batch are one re-read.
@@ -1500,9 +984,9 @@ pub fn run(db: Db, db_path: PathBuf, root: Option<PathBuf>) -> Result<()> {
                         app.herdr_agents = agents;
                         refresh = true;
                     }
-                    Msg::Transcript => poll = true,
+                    Msg::Frame => frame = true,
                 }
-                if app.quit || app.wants_attach {
+                if app.quit {
                     break;
                 }
             }
@@ -1516,12 +1000,7 @@ pub fn run(db: Db, db_path: PathBuf, root: Option<PathBuf>) -> Result<()> {
             // Nothing new is the common case, and then there is no frame —
             // unless a message is travelling across the graph, which needs
             // one every tick for as long as it is.
-            if poll && (app.centre.poll() | app.animating()) {
-                dirty = true;
-            }
-            if app.wants_attach {
-                app.wants_attach = false;
-                attach(&mut term, &mut app, &paused)?;
+            if frame && app.animating() {
                 dirty = true;
             }
             if dirty {
@@ -1530,11 +1009,10 @@ pub fn run(db: Db, db_path: PathBuf, root: Option<PathBuf>) -> Result<()> {
         }
         Ok(())
     })();
-    leave_modes(app.enhanced);
+    // A shell left in bracketed paste misreads the next thing typed into it.
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
     ratatui::restore();
-    if app.hosted.is_some() {
-        crate::plugin::close_own_tab();
-    }
+    crate::plugin::close_own_tab();
     result
 }
 
@@ -1570,154 +1048,14 @@ fn shorten(path: &Path, width: usize) -> String {
     parts.last().unwrap_or(&"").to_string()
 }
 
-/// Show what the terminal sends for each key, and what fleet would pass on.
-///
-/// "The keys don't work" is unanswerable without this: a terminal decides
-/// what Option+Left or Cmd+Left produces, the answer differs between Warp,
-/// iTerm and Ghostty, and it differs again with each one's settings. Run it
-/// in the terminal fleet is used in and the question answers itself.
-pub fn keys() -> Result<()> {
-    use std::io::Write;
-    crossterm::terminal::enable_raw_mode()?;
-    let enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
-    enter_modes(false, enhanced);
-
-    let mut out = std::io::stdout();
-    let say = |out: &mut std::io::Stdout, line: &str| {
-        let _ = write!(out, "{line}\r\n");
-        let _ = out.flush();
-    };
-    say(&mut out, "fleet keys — press keys to see what arrives and what fleet sends on.");
-    say(&mut out, "Ctrl-C twice to stop.\r\n");
-    say(
-        &mut out,
-        &format!(
-            "kitty keyboard protocol: {}    bracketed paste: on\r\n",
-            if enhanced { "on — Shift+Enter can be told from Enter" } else { "not supported — Shift+Enter is the same byte as Enter" }
-        ),
-    );
-
-    let mut last_ctrl_c = false;
-    loop {
-        match event::read()? {
-            Event::Key(key) if key.kind == KeyEventKind::Press => {
-                let sent = match keys::translate(key) {
-                    Some(keys::Key::Literal(t)) => format!("types {t:?}"),
-                    Some(keys::Key::Named(n)) => format!("sends {n}"),
-                    None => "sends nothing".into(),
-                };
-                // Spelled the way a keyboard labels them, not the way the
-                // bitflags debug-print.
-                let mut mods = String::new();
-                for (flag, label) in [
-                    (KeyModifiers::CONTROL, "Ctrl"),
-                    (KeyModifiers::ALT, "Alt"),
-                    (KeyModifiers::SHIFT, "Shift"),
-                    (KeyModifiers::SUPER, "Cmd"),
-                ] {
-                    if key.modifiers.contains(flag) {
-                        mods.push_str(label);
-                        mods.push('+');
-                    }
-                }
-                let note = if key.code == KeyCode::Char(PREFIX)
-                    && key.modifiers.contains(KeyModifiers::CONTROL)
-                {
-                    "   ← fleet's prefix: an agent never sees this key"
-                } else {
-                    ""
-                };
-                say(&mut out, &format!("{:<24} {sent}{note}", format!("{mods}{:?}", key.code)));
-
-                let ctrl_c = key.code == KeyCode::Char('c')
-                    && key.modifiers.contains(KeyModifiers::CONTROL);
-                if ctrl_c && last_ctrl_c {
-                    break;
-                }
-                last_ctrl_c = ctrl_c;
-            }
-            Event::Paste(text) => {
-                let lines = text.lines().count().max(1);
-                say(
-                    &mut out,
-                    &format!(
-                        "{:<24} pasted whole, bracketed — its newlines will not send",
-                        format!("paste ({} chars, {lines} lines)", text.chars().count())
-                    ),
-                );
-            }
-            _ => {}
-        }
-    }
-
-    leave_modes(enhanced);
-    crossterm::terminal::disable_raw_mode()?;
-    Ok(())
-}
-
-/// Clicks, drags and the wheel — and not every movement of the pointer.
-///
-/// crossterm's EnableMouseCapture also turns on any-motion tracking, mode
-/// 1003, which reports the pointer every time it crosses a cell. Fleet uses
-/// none of those reports, and each one was a message and a redrawn frame.
-/// 1002 still reports movement while a button is held, which is what a drag
-/// to select needs.
-struct CaptureMouse;
-
-impl crossterm::Command for CaptureMouse {
-    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
-        f.write_str(concat!(
-            "\x1b[?1000h", // presses and releases, and the wheel
-            "\x1b[?1002h", // movement, but only with a button down
-            "\x1b[?1006h", // SGR coordinates, with no 223-column limit
-        ))
-    }
-}
-
-/// Ask the terminal fleet runs in for what it needs, all in one place.
-///
-/// Three modes, each for a reason the pane would otherwise feel wrong for.
-/// The mouse, so a pane can be clicked and scrolled. Bracketed paste, so a
-/// paste arrives whole instead of typed out a key at a time with every
-/// newline an Enter. And, where the terminal has it, the kitty keyboard
-/// protocol's disambiguation, which is the only way to tell Shift+Enter from
-/// Enter at all — without it the two are the same byte.
-fn enter_modes(mouse: bool, enhanced: bool) {
-    use crossterm::event::{EnableBracketedPaste, KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
-    let mut out = std::io::stdout();
-    if mouse {
-        let _ = crossterm::execute!(out, CaptureMouse);
-    }
-    let _ = crossterm::execute!(out, EnableBracketedPaste);
-    if enhanced {
-        let _ = crossterm::execute!(
-            out,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-        );
-    }
-}
-
-/// Everything `enter_modes` asked for, given back. Before tmux takes the
-/// terminal on attach, and before fleet exits: a shell left in bracketed
-/// paste or the kitty protocol misreads the next thing typed into it.
-fn leave_modes(enhanced: bool) {
-    use crossterm::event::{DisableBracketedPaste, PopKeyboardEnhancementFlags};
-    let mut out = std::io::stdout();
-    if enhanced {
-        let _ = crossterm::execute!(out, PopKeyboardEnhancementFlags);
-    }
-    let _ = crossterm::execute!(out, DisableBracketedPaste);
-    let _ = crossterm::execute!(out, DisableMouseCapture);
-}
-
 fn unix_now() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |d| d.as_secs_f64())
 }
 
-/// Below this many columns beside the rail, the board goes under the centre
-/// rather than beside it: what a graph or a session needs, and the board's 36.
+/// Below this many columns, the board goes under the graph rather than
+/// beside it: what a graph needs, and the board's 36.
 const STACK_BELOW: u16 = 80 + 36;
 
 /// An event's identity, for remembering when it was first seen. The log has
@@ -1732,89 +1070,18 @@ fn event_key(e: &db::Event) -> String {
     )
 }
 
-fn inside(area: Rect, (x, y): (u16, u16)) -> bool {
-    area.width > 0
-        && x >= area.x
-        && x < area.x + area.width
-        && y >= area.y
-        && y < area.y + area.height
-}
-
-/// Give the terminal to tmux, and take it back when the user detaches.
-fn attach(
-    term: &mut ratatui::DefaultTerminal,
-    app: &mut App,
-    paused: &Arc<AtomicBool>,
-) -> Result<()> {
-    let Some(tmux) = app.tmux.clone() else {
-        return Ok(());
-    };
-
-    // Stop reading stdin before tmux starts: two readers on one terminal
-    // means keystrokes land wherever they happen to be collected. The pause
-    // outlasts the reader's poll window so nothing is in flight.
-    paused.store(true, Ordering::SeqCst);
-    std::thread::sleep(POLL * 2);
-
-    leave_modes(app.enhanced);
-    ratatui::restore();
-    let failed = app.centre.attach(&tmux);
-    *term = ratatui::init();
-    // The mouse as the user left it. Handing it back and then taking it
-    // again behind their back is the sort of thing that makes a program feel
-    // haunted.
-    enter_modes(app.mouse, app.enhanced);
-
-    paused.store(false, Ordering::SeqCst);
-    term.clear()?;
-    app.status = failed;
-    // The pane kept running while we were away, and its size may have
-    // changed under tmux's attached client.
-    app.refresh();
-    Ok(())
-}
-
-/// How long the reader waits for a key before looking at the pause flag.
-/// Short enough that handing the terminal over feels immediate.
-const POLL: Duration = Duration::from_millis(60);
-
-fn spawn_input(tx: Sender<Msg>, paused: Arc<AtomicBool>) {
+fn spawn_input(tx: Sender<Msg>) {
     std::thread::spawn(move || {
         loop {
-            // Polled rather than blocking on read, so that stdin can be
-            // given up while tmux has the terminal.
-            if paused.load(Ordering::SeqCst) {
-                std::thread::sleep(POLL);
-                continue;
-            }
-            match event::poll(POLL) {
-                Ok(false) => continue,
+            let msg = match event::read() {
+                Ok(Event::Key(key)) => Msg::Key(key),
+                Ok(Event::Paste(_)) => Msg::Paste,
+                // A resize still wants a redraw.
+                Ok(_) => Msg::Tick,
                 Err(_) => return,
-                Ok(true) => {}
-            }
-            match event::read() {
-                Ok(Event::Key(key)) => {
-                    if tx.send(Msg::Key(key)).is_err() {
-                        return;
-                    }
-                }
-                Ok(Event::Mouse(ev)) => {
-                    if tx.send(Msg::Mouse(ev)).is_err() {
-                        return;
-                    }
-                }
-                Ok(Event::Paste(text)) => {
-                    if tx.send(Msg::Paste(text)).is_err() {
-                        return;
-                    }
-                }
-                // Resize and mouse events still want a redraw.
-                Ok(_) => {
-                    if tx.send(Msg::Tick).is_err() {
-                        return;
-                    }
-                }
-                Err(_) => return,
+            };
+            if tx.send(msg).is_err() {
+                return;
             }
         }
     });
@@ -1864,23 +1131,12 @@ fn spawn_registry(tx: Sender<Msg>) {
     });
 }
 
-/// A live agent writes to its transcript continuously, and those writes
-/// produce no event this loop would otherwise see.
-/// How often the mirrored pane is checked for new output.
-///
-/// This is the frame rate of the centre pane, and it has to be a terminal's
-/// rather than a dashboard's: at 400ms an agent's output arrived in visible
-/// chunks and the pane felt slower than the terminal it is a picture of.
-/// The check itself is one `stat`, and the loop skips the redraw when the
-/// file has not grown, so the cost of the shorter interval is a syscall
-/// twenty-five times a second.
-const MIRROR_POLL: Duration = Duration::from_millis(40);
 
-fn spawn_transcript_poll(tx: Sender<Msg>) {
+fn spawn_frames(tx: Sender<Msg>) {
     std::thread::spawn(move || {
         loop {
-            std::thread::sleep(MIRROR_POLL);
-            if tx.send(Msg::Transcript).is_err() {
+            std::thread::sleep(FRAME);
+            if tx.send(Msg::Frame).is_err() {
                 return;
             }
         }
@@ -1910,7 +1166,7 @@ mod tests {
             .unwrap();
         db.upsert_agent("billing-svc", None, Some("/repo/content"), None, None, None)
             .unwrap();
-        let mut app = App::new(db, PathBuf::from(":memory:"), Some(PathBuf::from("/nowhere")));
+        let mut app = App::new(db, PathBuf::from(":memory:"), Some(PathBuf::from("/nowhere")), None);
         app.refresh();
         app
     }
@@ -1922,13 +1178,11 @@ mod tests {
     }
 
     #[test]
-    fn the_frame_has_all_three_columns_and_a_key_bar() {
-        let out = drawn(&mut app(), 110, 24);
+    fn the_frame_has_the_graph_the_board_and_a_key_bar() {
+        let out = drawn(&mut app(), 130, 24);
         assert!(out.contains("fleet"), "{out}");
-        assert!(out.contains("AGENTS"), "the rail: {out}");
-        assert!(out.contains("new agent"), "the rail's footer: {out}");
-        assert!(out.contains("no session linked"), "the centre: {out}");
-        assert!(out.contains("TASKS"), "the right rail: {out}");
+        assert!(out.contains("topology"), "the graph: {out}");
+        assert!(out.contains("TASKS"), "the board: {out}");
         assert!(out.contains("BACKGROUND"), "and its lower half: {out}");
         assert!(
             out.contains("nothing on the board"),
@@ -1940,7 +1194,6 @@ mod tests {
     #[test]
     fn selection_moves_and_stops_at_the_ends() {
         let mut app = app();
-        // No agent here has a live pane, so the arrows are fleet's.
         assert_eq!(app.selected().unwrap().name, "chief");
 
         app.on_key(KeyEvent::from(KeyCode::Down));
@@ -1954,19 +1207,6 @@ mod tests {
         app.on_key(KeyEvent::from(KeyCode::Up));
         app.on_key(KeyEvent::from(KeyCode::Up));
         assert_eq!(app.selected().unwrap().name, "chief");
-    }
-
-    #[test]
-    fn the_centre_follows_the_selection() {
-        let mut app = app();
-        app.on_key(KeyEvent::from(KeyCode::Down));
-
-        let out = drawn(&mut app,  110, 24);
-        assert!(out.contains("billing-svc"), "{out}");
-        assert!(
-            out.contains("no session linked"),
-            "an agent with no live session says so: {out}"
-        );
     }
 
     /// The view as it runs in a herdr pane, with a herdr that records what
@@ -1987,29 +1227,28 @@ mod tests {
         db.upsert_agent("chief", Some("chief"), None, None, Some("herdr:chief"), None).unwrap();
         db.upsert_agent("billing-svc", None, Some("/repo/content"), None, Some("herdr:billing-svc"), None)
             .unwrap();
-        let hosted = Hosted {
+        let host = Host {
             herdr: crate::herdr::Herdr::with(bin.to_string_lossy(), dir.join("sock")),
             workspace: "w1".into(),
             fleet: None,
         };
-        let mut app = App::within(db, PathBuf::from(":memory:"), Some(PathBuf::from("/nowhere")), Some(hosted));
+        let mut app = App::new(db, PathBuf::from(":memory:"), Some(PathBuf::from("/nowhere")), Some(host));
         app.refresh();
         app
     }
 
     #[test]
-    fn in_herdr_the_centre_is_the_crew_and_never_a_terminal() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut app = hosted_app(dir.path());
-        assert_eq!(app.centre_view, Some(View::Graph), "herdr draws the agents; fleet draws the crew");
+    fn l_flips_between_the_graph_and_the_log() {
+        let mut app = app();
+        assert_eq!(app.view, View::Graph, "herdr draws the agents; fleet draws the crew");
         app.on_key(KeyEvent::from(KeyCode::Char('l')));
-        assert_eq!(app.centre_view, Some(View::Log));
+        assert_eq!(app.view, View::Log);
+        assert!(drawn(&mut app, 110, 24).contains("chronological"));
         app.on_key(KeyEvent::from(KeyCode::Char('l')));
-        assert_eq!(app.centre_view, Some(View::Graph), "and back, not to an empty session view");
+        assert_eq!(app.view, View::Graph, "and back");
+        app.on_key(KeyEvent::from(KeyCode::Char('l')));
         app.on_key(KeyEvent::from(KeyCode::Char('g')));
-        assert_eq!(app.centre_view, Some(View::Graph));
-        let out = drawn(&mut app, 120, 30);
-        assert!(!out.contains("^a"), "no prefix where no key is an agent's:\n{out}");
+        assert_eq!(app.view, View::Graph, "g is always the graph");
     }
 
     #[test]
@@ -2021,7 +1260,7 @@ mod tests {
         app.on_key(KeyEvent::from(KeyCode::Enter));
         let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap_or_default();
         assert!(calls.contains("agent focus billing-svc"), "{calls}");
-        assert_eq!(app.centre_view, Some(View::Graph), "fleet stays as it was, a tab away");
+        assert_eq!(app.view, View::Graph, "fleet stays as it was, a tab away");
     }
 
     fn herdr_agent(name: &str, pane: &str, status: &str) -> crate::herdr::Agent {
@@ -2045,8 +1284,8 @@ mod tests {
         app.refresh();
         let row = |app: &App, n: &str| app.rows.iter().find(|r| r.name == n).cloned().unwrap();
         assert!(row(&app, "billing-svc").asking);
-        assert_eq!(row(&app, "billing-svc").presence, fleet::Presence::Waiting);
-        assert_eq!(row(&app, "chief").presence, fleet::Presence::Working, "herdr's word over the registry's");
+        assert_eq!(row(&app, "billing-svc").presence, crew::Presence::Waiting);
+        assert_eq!(row(&app, "chief").presence, crew::Presence::Working, "herdr's word over the registry's");
         assert!(drawn(&mut app, 120, 30).contains("! needs you"), "and the graph says so");
 
         app.herdr_agents[1].agent_status = "working".into();
@@ -2133,23 +1372,6 @@ mod tests {
     }
 
     #[test]
-    fn g_and_l_swap_the_centre_and_put_it_back() {
-        let mut app = app();
-        assert!(app.centre_view.is_none());
-
-        app.on_key(KeyEvent::from(KeyCode::Char('g')));
-        assert_eq!(app.centre_view, Some(View::Graph));
-        assert!(drawn(&mut app, 110, 24).contains("topology"));
-
-        app.on_key(KeyEvent::from(KeyCode::Char('l')));
-        assert_eq!(app.centre_view, Some(View::Log), "l switches straight across");
-        assert!(drawn(&mut app, 110, 24).contains("chronological"));
-
-        app.on_key(KeyEvent::from(KeyCode::Char('l')));
-        assert!(app.centre_view.is_none(), "the same key again goes back");
-    }
-
-    #[test]
     fn the_log_takes_the_arrows_while_it_is_up() {
         let db = Db::open_in_memory().unwrap();
         db.upsert_agent("chief", Some("chief"), None, None, None, None)
@@ -2158,7 +1380,7 @@ mod tests {
             db.log_event("message", Some("chief"), Some("worker"), None, &format!("m{i}"), None, None)
                 .unwrap();
         }
-        let mut app = App::new(db, PathBuf::from(":memory:"), None);
+        let mut app = App::new(db, PathBuf::from(":memory:"), None, None);
         app.refresh();
 
         app.on_key(KeyEvent::from(KeyCode::Char('l')));
@@ -2176,52 +1398,28 @@ mod tests {
 
     #[test]
     fn enter_in_the_log_goes_to_the_agent_the_event_came_from() {
-        let db = Db::open_in_memory().unwrap();
-        db.upsert_agent("chief", Some("chief"), None, None, None, None)
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = hosted_app(dir.path());
+        app.db
+            .log_event("message", Some("billing-svc"), Some("chief"), None, "blocked", None, None)
             .unwrap();
-        db.upsert_agent("billing-svc", None, Some("/repo"), None, None, None)
-            .unwrap();
-        db.log_event("message", Some("billing-svc"), Some("chief"), None, "blocked", None, None)
-            .unwrap();
-
-        let mut app = App::new(db, PathBuf::from(":memory:"), None);
         app.refresh();
         app.on_key(KeyEvent::from(KeyCode::Char('l')));
         app.on_key(KeyEvent::from(KeyCode::Enter));
 
-        assert!(app.centre_view.is_none(), "it returns to watching that agent");
         assert_eq!(app.selected().unwrap().name, "billing-svc");
+        let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap_or_default();
+        assert!(calls.contains("agent focus billing-svc"), "its tab comes forward: {calls}");
     }
 
     #[test]
-    fn keys_act_directly_when_there_is_no_pane_to_type_into() {
-        // Nothing is mirrored here, so q must still quit rather than being
-        // swallowed as a keystroke for an agent that does not exist.
-        let mut app = app();
-        app.on_key(KeyEvent::from(KeyCode::Char('q')));
-        assert!(app.quit);
-    }
-
-    #[test]
-    fn the_prefix_takes_the_next_key_for_fleet_and_then_lets_go() {
-        let mut app = app();
-        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
-        assert!(app.armed, "the key bar shows what the prefix can do");
-        assert!(drawn(&mut app, 110, 24).contains("new"));
-
-        app.on_key(KeyEvent::from(KeyCode::Char('g')));
-        assert!(!app.armed, "and lets go after one key");
-        assert_eq!(app.centre_view, Some(View::Graph));
-    }
-
-    #[test]
-    fn retiring_takes_an_agent_off_the_rail_and_leaves_its_pane_alone() {
+    fn retiring_takes_an_agent_off_the_board_and_leaves_its_tab_alone() {
         let mut app = app();
         assert_eq!(app.rows.len(), 2);
 
         app.retire_selected();
         assert_eq!(app.rows.len(), 1, "the row goes");
-        assert!(app.status.unwrap().contains("untouched"), "and says the pane did not");
+        assert!(app.status.unwrap().contains("untouched"), "and says the tab did not");
     }
 
     #[test]
@@ -2242,7 +1440,7 @@ mod tests {
         db.claim("ENG-1-1", "died-working").unwrap();
         db.transition("ENG-1-1", crate::db::State::Running, None).unwrap();
 
-        let mut app = App::new(db, PathBuf::from(":memory:"), None);
+        let mut app = App::new(db, PathBuf::from(":memory:"), None, None);
         app.refresh();
         app.prune_dead();
 
@@ -2259,6 +1457,7 @@ mod tests {
             db,
             PathBuf::from(":memory:"),
             Some(PathBuf::from("/w/Code/service/billing-service")),
+            None,
         );
         app.refresh();
         let out = drawn(&mut app, 120, 12);
@@ -2284,102 +1483,6 @@ mod tests {
     }
 
     #[test]
-    fn the_mouse_is_asked_for_clicks_and_drags_but_not_every_movement() {
-        // Any-motion tracking reported the pointer every time it crossed a
-        // cell, and each report was a message and a frame. Fleet uses none.
-        let mut ansi = String::new();
-        crossterm::Command::write_ansi(&CaptureMouse, &mut ansi).unwrap();
-        assert!(ansi.contains("?1000h"), "presses and the wheel");
-        assert!(ansi.contains("?1002h"), "drags, for selecting");
-        assert!(ansi.contains("?1006h"), "coordinates past column 223");
-        assert!(!ansi.contains("?1003h"), "every pointer movement: {ansi:?}");
-    }
-
-    #[test]
-    fn the_mouse_can_be_handed_back_to_the_terminal() {
-        // An application that reports mouse events stops the terminal
-        // selecting text, and there is no way to have both.
-        let mut app = app();
-        assert!(app.mouse, "fleet takes it to begin with");
-
-        app.on_key(KeyEvent::new(KeyCode::Char(PREFIX), KeyModifiers::CONTROL));
-        app.on_key(KeyEvent::from(KeyCode::Char('m')));
-        assert!(!app.mouse);
-
-        // The bar has to say so: with the mouse gone, half of what it
-        // advertises does nothing, and a click that quietly fails is worse
-        // than one it warned you about.
-        let out = drawn(&mut app, 110, 24);
-        assert!(out.contains("the terminal has the mouse"), "{out}");
-        assert!(out.contains("^a m"), "and how to get it back: {out}");
-
-        app.on_key(KeyEvent::new(KeyCode::Char(PREFIX), KeyModifiers::CONTROL));
-        app.on_key(KeyEvent::from(KeyCode::Char('m')));
-        assert!(app.mouse);
-        let out = drawn(&mut app, 110, 24);
-        assert!(!out.contains("the terminal has the mouse"), "{out}");
-    }
-
-    #[test]
-    fn a_click_selects_the_agent_it_landed_on() {
-        let mut app = app();
-        drawn(&mut app, 110, 24); // the rail has to have been drawn to be clicked
-        assert_eq!(app.selected().unwrap().name, "chief");
-
-        let rail = app.rail_at;
-        let click = |app: &mut App, row: u16| {
-            app.on_mouse(MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Left),
-                column: rail.x + 2,
-                row,
-                modifiers: KeyModifiers::NONE,
-            });
-        };
-
-        // The heading and its blank line, then four rows an agent: padding,
-        // its name, its detail, padding. The second agent's name is on the
-        // seventh line of the rail.
-        click(&mut app, rail.y + 7);
-        assert_eq!(app.selected().unwrap().name, "billing-svc");
-        assert_eq!(app.focus, Focus::Rail, "clicking the rail points the keys at it");
-
-        // The padding is part of the block the eye sees lit, so a click on
-        // it selects that agent rather than the one below.
-        click(&mut app, rail.y + 5);
-        assert_eq!(app.selected().unwrap().name, "chief");
-        click(&mut app, rail.y + 6);
-        assert_eq!(app.selected().unwrap().name, "billing-svc");
-    }
-
-    #[test]
-    fn clicking_the_centre_points_the_keyboard_at_the_agent() {
-        let mut app = app();
-        drawn(&mut app, 110, 24);
-        app.focus = Focus::Rail;
-
-        let centre = app.centre_at;
-        app.on_mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: centre.x + 4,
-            row: centre.y + 4,
-            modifiers: KeyModifiers::NONE,
-        });
-        assert_eq!(app.focus, Focus::Session);
-    }
-
-    #[test]
-    fn enter_on_a_transcript_only_agent_does_not_pretend_to_zoom() {
-        let mut app = app();
-        app.on_key(KeyEvent::from(KeyCode::Enter));
-        // Nothing to hand over, so nothing is claimed and nothing is queued.
-        assert!(app.status.is_none());
-        assert!(
-            !app.wants_attach,
-            "giving up the screen for an agent with no pane would strand the user"
-        );
-    }
-
-    #[test]
     fn n_opens_the_picker_and_escape_closes_it_without_starting_anything() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("storefront/.git")).unwrap();
@@ -2390,6 +1493,7 @@ mod tests {
             db,
             PathBuf::from(":memory:"),
             Some(root.path().to_path_buf()),
+            None,
         );
         app.refresh();
 
@@ -2417,6 +1521,7 @@ mod tests {
             db,
             PathBuf::from(":memory:"),
             Some(root.path().to_path_buf()),
+            None,
         );
         app.refresh();
         app.on_key(KeyEvent::from(KeyCode::Char('n')));
@@ -2429,22 +1534,12 @@ mod tests {
     #[test]
     fn spawning_without_a_root_says_why_rather_than_opening_an_empty_picker() {
         let db = Db::open_in_memory().unwrap();
-        let mut app = App::new(db, PathBuf::from(":memory:"), None);
+        let mut app = App::new(db, PathBuf::from(":memory:"), None, None);
         app.refresh();
 
         app.on_key(KeyEvent::from(KeyCode::Char('n')));
         assert!(app.picker.is_none());
         assert!(app.status.unwrap().contains("--root"));
-    }
-
-    #[test]
-    fn tab_moves_the_keyboard_between_the_rail_and_the_session() {
-        let mut app = app();
-        app.focus = Focus::Rail;
-        app.on_key(KeyEvent::from(KeyCode::Tab));
-        assert_eq!(app.focus, Focus::Session);
-        app.on_key(KeyEvent::from(KeyCode::Tab));
-        assert_eq!(app.focus, Focus::Rail);
     }
 
     #[test]

@@ -1,8 +1,10 @@
 # fleet
 
-A terminal orchestrator for Claude Code sessions working across several repos
-at once — a chief-of-staff session that plans and dispatches, worker sessions
-that do the work, and one TUI to watch them interact.
+A [herdr](https://herdr.dev) plugin that orchestrates Claude Code sessions
+working across several repos at once — a chief-of-staff session that plans and
+dispatches, worker sessions that do the work, and one view to watch them
+interact. herdr draws every agent's terminal; fleet is the crew, the board and
+the graph. It runs only inside herdr: there is no standalone mode.
 
 The equivalent of Claude Projects' coordinator/thread model, built out of what
 already runs on the machine.
@@ -13,29 +15,21 @@ already runs on the machine.
 |---|---|
 | `schema.sql` — the coordination database | done |
 | `skills/board` — the `/board` skill | done |
-| `src/registry.rs` — session discovery and watching | done, 6 tests |
-| `src/transcript.rs` — transcript reading and tailing | done, 8 tests |
-| `src/db.rs` — fleet.db reads and writes, and runs | done, 30 tests |
-| `src/scope.rs` — one board per fleet, and who is in one | done, 4 tests |
-| `fleet board` — the whole board, in the binary | done, 13 tests |
-| `src/tmux.rs` — spawning and pane control | done, 17 tests |
-| `src/ui/` — frame, fleet rail, session pane, board rail | done, 57 tests |
-| `src/agent.rs` — starting, resuming, repo discovery | done, 7 tests |
-| `src/brief.rs` — what an agent is told when it starts | done, 23 tests |
-| `src/ui/resume.rs` — picking a run to bring back | done, 5 tests |
-| `src/msg.rs` — delivering a message to its recipient | done, 6 tests |
-| `n` to spawn from the rail | done |
-| `src/ui/flow.rs` — the flow pane and its log view | done, 10 tests |
-| `src/ui/graph.rs` — the flow as a live graph | done, 16 tests |
-| `src/ui/mirror.rs` — the live tmux pane | done, 8 tests |
-| `src/ui/sender.rs` — input to panes, off the UI thread | done, 8 tests |
-| `src/ui/selection.rs` — drag to copy from a pane | done, 6 tests |
-| `src/ui/clipboard.rs` — pbcopy and OSC 52 | done, 3 tests |
-| `src/ui/preview.rs` — the fixture fleet, for layout work | done, 4 tests |
-| `src/herdr.rs` — typed calls to the herdr CLI | done, 7 tests |
-| `src/host.rs` — tmux window or herdr tab, one interface | done, 3 tests |
-| `src/plugin.rs` + `herdr-plugin.toml` — fleet as a herdr plugin, fleet mode | done, 7 tests |
-| `src/ui/hosting.rs` — herdr's events, sidebar labels, notifications | done, 6 tests |
+| `src/registry.rs` — session discovery and watching | done |
+| `src/db.rs` — fleet.db reads and writes, and runs | done |
+| `src/scope.rs` — one board per fleet, and who is in one | done |
+| `fleet board` — the whole board, in the binary | done |
+| `src/agent.rs` — starting, resuming, repo discovery | done |
+| `src/brief.rs` — what an agent is told when it starts | done |
+| `src/msg.rs` — the line a message arrives as | done |
+| `src/herdr.rs` — typed calls to the herdr CLI | done |
+| `src/host.rs` — agents in herdr tabs | done |
+| `src/plugin.rs` + `herdr-plugin.toml` — the plugin's actions, fleet mode | done |
+| `src/ui/` — the fleet view: graph, log, board, pickers | done |
+| `src/ui/hosting.rs` — herdr's events, sidebar labels, notifications | done |
+| `src/ui/preview.rs` — the fixture fleet, for layout work | done |
+
+`cargo test` runs 179 tests.
 
 ## What it is built on
 
@@ -80,17 +74,18 @@ a chief. On the board, and in messages, it is still `chief`.
 ./install.sh
 ```
 
-Builds the binary, links it to `~/.local/bin/fleet`, links `skills/board` into
-`~/.claude/skills/`. There is no database to create: each fleet makes its own
+Builds the binary, links it to `~/.local/bin/fleet` (the agents call
+`fleet board` and `fleet spawn` by name), links `skills/board` into
+`~/.claude/skills/`. Then link the plugin into herdr: see
+[Setting it up](#setting-it-up). There is no database to create: each fleet makes its own
 the first time fleet starts in its workspace.
 
 ## Inside herdr
 
-[herdr](https://herdr.dev) owns terminals properly — scrolling, selecting,
-pasting, the mouse, reattaching after a reboot — which is everything fleet had
-to rebuild by hand around tmux and never got to feel native. Run inside herdr,
-fleet stops drawing terminals at all. herdr draws every agent in a tab of its
-own; fleet is the tab that shows the crew, with the chief on its left.
+herdr owns terminals properly — scrolling, selecting, pasting, the mouse,
+reattaching after a reboot — so fleet does not draw terminals at all. herdr
+draws every agent in a tab of its own; fleet is the tab that shows the crew,
+with the chief on its left.
 
 ```
 herdr sidebar      tabs in the workspace
@@ -109,7 +104,7 @@ herdr sidebar      tabs in the workspace
   started or not. `←→` moves between cards, and `↵` switches to the agent's
   tab, or to the chief's pane. `l` flips between the graph and the log, `n`
   starts an agent, `r` brings a crew back, `x` retires one, `q` quits. None of
-  them needs the `^a` prefix: no key in this tab belongs to an agent.
+  them needs a prefix: no key in this tab belongs to an agent.
 - **Each agent is a herdr tab** named after it, in the repository it works
   in. herdr's sidebar shows which ones are working and which are waiting on
   you — and, on each agent's second line where herdr would say `claude`, what
@@ -176,7 +171,7 @@ description = "new workspace in fleet mode"
 `prefix+f` in a workspace opened at the landscape (`~/Code/acme`)
 opens its fleet tab, or brings it forward. `prefix+shift+f` opens a new
 workspace in fleet mode where the focused pane is. Typing `fleet` in any herdr
-pane runs the view in that pane.
+pane runs the view in that pane; outside herdr it refuses, and says why.
 
 To have a landscape's workspaces open in fleet mode by themselves, list it:
 
@@ -214,15 +209,12 @@ herdr's client code (`src/herdr.rs`) is adapted from
 
 ## Use
 
-Start it in any terminal. tmux holds the agents; you never have to be inside
-it. `↵` gives you the real pane and hands the screen back when you detach.
+The view opens from the plugin's actions (see above). Everything else is for
+the agents, and for you from a shell in a herdr pane:
 
 ```bash
-fleet                                       # the fleet view, scoped to $PWD
 fleet spawn billing-svc --repo ~/Code/acme/service/billing-service
-fleet sessions --watch
-fleet repos --root ~/Code/acme           # what `n` offers
-fleet tui --snapshot 104x22 --view graph    # one frame to stdout
+fleet fleets                                # every fleet and its directory
 
 fleet board epic ENG-2553 "shared settings flag"
 fleet board add ENG-2553-1 ~/Code/acme/service/accounts-service "shared column" --epic ENG-2553
@@ -239,72 +231,9 @@ takes a SELECT and refuses anything else: every write goes through a verb that
 records the matching flow event, and a bare UPDATE is the one way to break
 that.
 
-**Typing goes to the agent.** Click a pane to point the keyboard at it, and
-everything you type reaches that session — arrows, Escape, Ctrl-C, its own
-line editor. The wheel scrolls it. There is no mode to enter first.
-
-**Nothing the UI thread does waits on tmux.** A tmux call is a process, about
-11ms to start and hear back, and fleet used to make one per keystroke and four
-per wheel notch on the thread that draws — then sleep up to 60ms after each key
-waiting for the echo. A trackpad flick queued work faster than it drained; the
-pane froze, then kept scrolling after the hand had stopped. Keystrokes, pastes
-and the wheel now go to one sender thread, in order, which takes everything
-waiting at once and merges what it can: a run of typed characters is one
-`send-keys`, a flick is one call carrying every notch. The main loop drains
-everything queued before drawing a single frame, and the mouse is asked for
-clicks and drags only, not every movement of the pointer. Measured against a
-real pane: fifty notches leave the UI thread in 0.2ms and arrive in 80ms;
-forty-three keystrokes in 2.4ms and 48ms, in order.
-
-**Keys keep their modifiers, and a paste stays a paste.** Every keystroke is
-passed to tmux by name with every modifier on it — Option+Left is `M-Left`,
-which tmux delivers as the same `ESC [1;3D` a terminal would — and Shift+Enter
-goes as `M-Enter`, the `ESC CR` that Claude Code reads as a newline, because
-tmux cannot hand a shifted Enter to a program that did not ask it for extended
-keys. A paste arrives whole, over bracketed paste from the terminal and
-`paste-buffer -p` into the pane, so its newlines stay newlines and Claude Code
-shows it as a paste. Where the terminal speaks the kitty keyboard protocol,
-fleet asks for it, which is the only way to tell Shift+Enter from Enter at all.
-
-When a key does something in the terminal that it does not do in fleet,
-`fleet keys` shows what the terminal sent for it and what fleet passes on.
-The answer differs between terminals and between their settings, so it is
-the first thing to run.
-
-**The wheel goes where the program inside expects it.** Claude Code runs on
-the alternate screen and captures the mouse itself, so there is no scrollback
-for fleet to move through and the wheel is forwarded to it as a mouse report —
-it scrolls its own history. A program on the alternate screen that did not ask
-for the mouse gets arrow keys instead, which is what tmux sends in the same
-situation. Only a plain pane, a shell or a log, is scrolled through fleet's own
-view of it. Which case applies is asked of tmux rather than worked out from the
-byte stream: the modes are set once at startup and fleet attaches to agents
-that have been running for hours.
-
-**Drag over an agent's output to copy it.** Capturing the mouse is what lets
-a pane be clicked and scrolled, and it takes the terminal's own selection
-away — there is no way to have both. So fleet does the selecting: drag, and
-what was under it goes to the clipboard on release, by `pbcopy` and by OSC 52
-so it also works over SSH. Anything that moves the text — a keystroke, a
-scroll — drops the selection rather than leaving a highlight over a line that
-has gone.
-
-That covers the centre pane, which is an agent's own output. To select
-anywhere else — the rails, the flow log — **`^a m`** hands the mouse back to
-the terminal entirely; clicking and scrolling stop until you press it again,
-and the key bar says so while it is off.
-
-Fleet's own keys live behind **`Ctrl-A`**, the way a multiplexer's do: `^a n`
-new agent, `^a x` take one off the rail, `^a r` bring back an earlier run,
-`^a m` give the mouse back, `^a z`
-fold the rails away, `^a g` graph, `^a l` log, `^a tab` move the keyboard,
-`^a q` quit. `↵` hands you the real terminal until you
-detach. `^a ^a` sends a literal Ctrl-A through. Where nothing is live to type
-into — a transcript, the flow views — the keys act directly without it.
-
-Starting fleet in a workspace starts a **chief of staff** there if one is not
+Opening fleet in a workspace starts a **chief of staff** there if one is not
 already running. That is who you talk to; it plans the work and starts the
-agents that do it. The rail lists only agents the fleet started, not every
+agents that do it. The graph shows only agents the fleet started, not every
 session on the machine.
 
 **Every agent opens already briefed**, in two halves. Who it is goes into the
@@ -330,8 +259,8 @@ fleet spawn billing-svc --repo ~/Code/acme/service/billing-service --task ENG-25
 
 That also claims the task on the board in the same step, so it cannot be
 dispatched twice, and a key that is not on the board is refused before the
-pane opens. `--role chief` starts a chief instead — the other brief, the deny
-list, and a row the rail draws as one. `--command` overrides the whole thing
+tab opens. `--role chief` starts a chief instead — the other brief, the deny
+list, and a row the graph draws as one. `--command` overrides the whole thing
 and skips the briefing, which is how the plumbing is tested without starting a
 real agent.
 
@@ -345,7 +274,7 @@ Two agents that talk directly are joined under their cards. When the cards do
 not fit one row they wrap, and the line from the chief runs down the left edge
 to each row, as an org chart's does, instead of through the cards above; a
 direct line between rows is written out rather than drawn across them. `←→`
-moves between cards and `↵` opens one. The board is watched, so a message
+moves between cards and `↵` goes to one. The board is watched, so a message
 appears as it is written rather than on the next tick.
 
 The flow views read the `events` table, which every state change and every
@@ -353,27 +282,27 @@ The flow views read the `events` table, which every state change and every
 does not appear there** — the board is the record, so an agent that does not
 report is invisible to it by construction.
 
-`fleet board msg` is both halves at once: it writes the event *and* types the
-message into the recipient's pane, so the interrupt and the record cannot come
-apart. Delivery is best-effort and never costs the write — an agent that has
-died still said what it said — and the CLI reports which happened:
+`fleet board msg` is both halves at once: it writes the event *and* puts the
+message in front of the recipient, through herdr, so the interrupt and the
+record cannot come apart. Delivery is best-effort and never costs the write —
+an agent that has died still said what it said — and the CLI reports which
+happened:
 
 ```
 accounts-svc -> chief: the parameter is yours
-      delivered to chief in fleet:chief
+      delivered to chief in herdr:acme-chief
 ```
 
 It arrives as one line, marked, so the agent does not read a peer as the
 person at the keyboard: `[fleet · accounts-svc · ENG-2553-2] the parameter is
-yours`. A body is folded onto the same line, because `send-keys` types what it
-is given and a newline would submit half a message; past ~1500 characters it
-is a document and the delivery says so rather than pasting a page into
-somebody's prompt.
+yours`. A body is folded onto the same line, because a newline typed at a
+prompt would submit half a message; past ~1500 characters it is a document
+and the delivery says so rather than pasting a page into somebody's prompt.
 
 ## Picking up where you left off
 
-A reboot, a closed terminal, `tmux kill-server`: the agents' processes go, and
-their conversations do not. Claude Code keeps each one, and `claude --resume`
+A reboot, or herdr restarting: the agents' processes go, and their
+conversations do not. Claude Code keeps each one, and `claude --resume`
 continues it under the same id. What was missing was a record of which
 conversations belonged together.
 
@@ -395,14 +324,13 @@ it asks before starting a fresh chief:
 ```
 
 Choosing one relaunches each of its agents with `claude --resume` in its own
-repository, back on the rail as itself. The role goes back into the system
-prompt and the chief's editing tools stay withheld, because both are set at
-launch and not kept with the conversation. `^a r` opens the same list at any
-time; from a shell, `fleet resume` lists the runs and `fleet resume <id>`
-brings one back.
+repository and its own tab, back on the graph as itself. The role goes back
+into the system prompt and the chief's editing tools stay withheld, because
+both are set at launch and not kept with the conversation. `r` opens the same
+list at any time.
 
-Two things are deliberately left out of a resume. An agent taken off the rail
-with `^a x` stays off — that was a choice, where a process dying is not, and
+Two things are deliberately left out of a resume. An agent taken off the board
+with `x` stays off — that was a choice, where a process dying is not, and
 the two are recorded differently now. And an agent whose conversation is gone
 from disk is named rather than resumed, since `--resume` on a missing
 conversation opens an empty one that looks, at a glance, like the old agent.
@@ -418,29 +346,28 @@ fixture fleet.
 
 ```bash
 ./dev.sh                 # rebuild and redraw on every save
-./dev.sh 140x40 graph    # a size and a view: session, graph, log
+./dev.sh 140x40 log      # a size and a view: graph, log
 fleet preview --plain    # the same frame as text, for a diff
 ```
 
 `fleet preview` invents the whole thing — an in-memory board carrying every
-task state and every agent presence, and a canned Claude Code pane on a
-**private tmux server** (`-L fleet-preview`). It draws one frame where your
-prompt was, in colour, and gives the shell back. Nothing it does can reach
-a fleet's board, your registry, or your tmux server, so it is safe
-to run beside a fleet that is up.
+task state and every agent presence, and no herdr behind it. It draws one
+frame where your prompt was, in colour, and gives the shell back. Nothing it
+does can reach a fleet's board, your registry, or herdr, so it is safe to run
+beside a fleet that is up.
 
 `dev.sh` polls for changes rather than needing `cargo-watch` or `fswatch`
 installed, and builds debug — the release binary stays as it was, because
 `~/.local/bin/fleet` is a symlink to it and somebody may have it open.
 
-Worth knowing either way: **quitting fleet does not stop the agents.** tmux
-owns them and the board is a file, so starting it again reattaches to
-everything that is still running.
+Worth knowing either way: **quitting fleet does not stop the agents.** herdr
+owns them and the board is a file, so opening it again picks up everything
+that is still running.
 
 ## Packaging plan
 
-**Rust + ratatui, shipped as a Homebrew tap.** The shell CLI is a placeholder
-for the same subcommands in the binary, so the skill never has to change.
+**Rust + ratatui, shipped as a Homebrew tap**, and linked into herdr as a
+plugin.
 
 Why Rust rather than Bun, given the rest of the stack is TypeScript:
 
@@ -448,9 +375,9 @@ Why Rust rather than Bun, given the rest of the stack is TypeScript:
   ready in single-digit milliseconds; a `bun build --compile` binary is ~60MB
   and takes tens of milliseconds before the first frame. That gap is the whole
   difference between a window you keep open and one you keep closed.
-- **The workload is a steady parse.** Watching ~25 registry files, tailing
-  several transcripts that are already hundreds of KB each, and querying
-  SQLite — all while rendering. No GC pauses mid-frame.
+- **The workload is a steady parse.** Watching ~25 registry files, following
+  herdr's event stream, and querying SQLite — all while rendering. No GC
+  pauses mid-frame.
 - **The graph pane needs sub-cell drawing.** ratatui's `Canvas` widget renders
   braille, so the live topology is actually drawn rather than approximated with
   box characters.
@@ -461,23 +388,6 @@ Why Rust rather than Bun, given the rest of the stack is TypeScript:
 Bun is the faster route to a prototype if staying in TypeScript matters more
 than the above; OpenTUI exists and `bun build --compile` does produce a single
 binary. The cost is startup, size, and hand-rolling the braille drawing.
-
-### Intended layout
-
-```
-Cargo.toml
-src/main.rs          clap — default subcommand is the TUI, `board` is the CLI
-src/db.rs            fleet.db  [done]
-src/registry.rs      ~/.claude/sessions watcher (notify / FSEvents)  [done]
-src/transcript.rs    jsonl tail  [done]
-src/tmux.rs          spawn a session into a pane, zoom to it  [done]
-src/ui/…             fleet rail, session pane, board rail, flow [done]
-schema.sql           embedded with include_str!
-skills/board/        installed by `fleet install-skill`
-```
-
-Crates: `ratatui`, `crossterm`, `rusqlite` (bundled), `notify`, `serde_json`,
-`tokio`, `clap`.
 
 ### Install story once it is a binary
 
@@ -493,21 +403,9 @@ uses.
 
 ## Design
 
-Layout mockups for the TUI live in the canvas at
+Layout mockups live in the canvas at
 the project's design canvas.
 
-The frame: a left rail of **spawned agents only** (no idle repo list), a centre
-pane showing whatever is selected — an agent's live session, or the flow — and
-a right rail carrying the chief's tasks above and background processes below.
-
-The centre pane shows two different things, and prefers the first:
-
-1. **The agent's actual terminal**, mirrored out of tmux with `pipe-pane` and
-   replayed through a vt100 parser. The real REPL — spinners, permission
-   prompts, its own colours. tmux still owns the process, so an agent outlives
-   this program and `↵` hands over the unmodified terminal. Typing goes
-   straight to it; `Ctrl-A` is how you address fleet instead.
-2. **The transcript**, re-rendered from the jsonl. The only thing that can show
-   a session which is not in our tmux, or one that has ended, and the
-   structured source the flow pane is built on. A reading of the session
-   rather than the session, so it is the fallback.
+The frame: the flow — the crew as a graph, or the log — with the board beside
+it (tasks above, background processes below), or under it in a narrow pane.
+The agents themselves are herdr's tabs, not something fleet draws.

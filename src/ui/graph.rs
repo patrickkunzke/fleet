@@ -21,7 +21,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 
 use crate::db::Event;
-use crate::ui::fleet::{Presence, Role, Row};
+use crate::ui::crew::{Presence, Role, Row};
 use crate::ui::theme;
 
 /// How long a message is shown in flight along its line.
@@ -944,7 +944,7 @@ mod tests {
             uptime: Some("12m".into()),
             session_id: None,
             branch: None,
-            tmux_target: None,
+            target: None,
             pid: None,
             asking: false,
         }

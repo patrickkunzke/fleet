@@ -1,10 +1,6 @@
-//! Until the TUI lands, this binary is how the pieces get exercised against
-//! real data: live sessions, one session's transcript, and the board.
-//!
-//! Board *writes* still belong to cli/board.sh. The write path exists in
-//! [`db`] and is tested, but moving half the subcommands over would leave a
-//! CLI where some verbs write and others do not — worse than either end state.
-//! It migrates in one step when the TUI needs it.
+//! fleet, as a herdr plugin: the view the plugin's actions open, the
+//! actions themselves, and the commands its agents use — `fleet spawn` for
+//! the chief to delegate, and `fleet board` for everyone to coordinate.
 
 mod agent;
 mod brief;
@@ -15,8 +11,6 @@ mod msg;
 mod plugin;
 mod registry;
 mod scope;
-mod tmux;
-mod transcript;
 mod ui;
 
 use std::path::{Path, PathBuf};
@@ -27,11 +21,9 @@ use clap::{Parser, Subcommand};
 
 use crate::db::Db;
 use crate::host::{Host, What};
-use crate::registry::{Change, Registry, Watcher};
-use crate::transcript::{BACKFILL_BYTES, Entry, Outcome, Transcript};
 
 #[derive(Parser)]
-#[command(name = "fleet", version, about = "Orchestrate Claude Code sessions across repos")]
+#[command(name = "fleet", version, about = "Orchestrate Claude Code sessions across repos, inside herdr")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -39,78 +31,39 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// The fleet view. This is what running `fleet` with no arguments does.
+    /// The fleet view. This is what running `fleet` with no arguments does,
+    /// in a herdr pane.
     Tui {
-        /// The workspace: which sessions to show, and where `n` looks for
+        /// The workspace: which agents to show, and where `n` looks for
         /// repositories. Defaults to the directory you are standing in.
         #[arg(long)]
         root: Option<PathBuf>,
         #[arg(long, env = "FLEET_DB")]
         db: Option<PathBuf>,
-        /// Draw one frame to stdout instead of taking over the terminal.
-        #[arg(long, value_name = "WIDTHxHEIGHT")]
-        snapshot: Option<String>,
-        /// Which centre view to draw: session (default), graph, or log.
-        #[arg(long)]
-        view: Option<String>,
     },
     /// Draw one frame of an invented fleet and hand the shell back.
     ///
-    /// For working on the layout: no real agents, no real board, and nothing
-    /// to restart. `dev.sh` runs it on every save.
+    /// For working on the layout: no real agents, no real board, and no
+    /// herdr. `dev.sh` runs it on every save.
     Preview {
         /// How big to draw it. Must fit the window.
         #[arg(long, value_name = "WIDTHxHEIGHT", default_value = "110x32")]
         size: String,
-        /// Which centre view: session (default), graph, or log.
+        /// Which view: graph (default) or log.
         #[arg(long)]
         view: Option<String>,
         /// Text instead of colour, for a diff or a pipe.
         #[arg(long)]
         plain: bool,
-        /// The view as it is inside herdr: no terminal of its own.
-        #[arg(long)]
-        herdr: bool,
     },
-    /// Bring back an earlier run: the chief and every agent it started, each
-    /// into its own conversation. Without an id, lists the runs there are.
-    Resume {
-        /// Which run, as the list prints it.
-        run: Option<i64>,
-        /// The workspace. Defaults to the directory you are standing in.
-        #[arg(long)]
-        root: Option<PathBuf>,
-        #[arg(long, env = "FLEET_DB")]
-        db: Option<PathBuf>,
-    },
-    /// fleet inside herdr: what the plugin's actions run, and a check of the
-    /// setup it needs.
+    /// What the plugin's actions run, and a check of the setup they need.
     Herdr {
         #[command(subcommand)]
         cmd: HerdrCmd,
     },
-    /// Show what each key arrives as, and what fleet sends on to an agent.
-    /// For when a key does not do in fleet what it does in the terminal.
-    Keys,
-    /// Live sessions and what they are doing.
-    Sessions {
-        /// Follow the registry and report each change.
-        #[arg(short, long)]
-        watch: bool,
-    },
-    /// Render one session's transcript the way the centre pane will.
-    Session {
-        /// A name as `fleet sessions` prints it.
-        name: String,
-        #[arg(short, long)]
-        watch: bool,
-        /// How many entries to show.
-        #[arg(short, long, default_value_t = 40)]
-        lines: usize,
-    },
-    /// Start an agent in a tmux pane and register it on the board.
+    /// Start an agent in a herdr tab and register it on the board.
     Spawn {
-        /// What to call it. Also the tmux window name.
+        /// What to call it. Also the herdr tab's name.
         name: String,
         /// The repository the agent works in.
         #[arg(long)]
@@ -127,19 +80,9 @@ enum Command {
         /// how the plumbing is exercised without starting a real agent.
         #[arg(long)]
         command: Option<String>,
-        /// tmux session to spawn into. Defaults to the current one, else "fleet".
-        #[arg(long)]
-        session: Option<String>,
         /// Seconds to wait for the agent to register itself.
         #[arg(long, default_value_t = 20)]
         timeout: u64,
-        #[arg(long, env = "FLEET_DB")]
-        db: Option<PathBuf>,
-    },
-    /// Repositories an agent could be started in — what `n` offers.
-    Repos {
-        #[arg(long, default_value = ".")]
-        root: PathBuf,
         #[arg(long, env = "FLEET_DB")]
         db: Option<PathBuf>,
     },
@@ -233,8 +176,9 @@ enum BoardCmd {
         repo: Option<PathBuf>,
         #[arg(long)]
         session: Option<String>,
+        /// Where a message reaches it: `herdr:<name>`.
         #[arg(long)]
-        tmux: Option<String>,
+        target: Option<String>,
         #[arg(long)]
         branch: Option<String>,
     },
@@ -321,93 +265,6 @@ enum BgCmd {
     Ls,
 }
 
-fn resume(run: Option<i64>, root: Option<PathBuf>, db_path: Option<PathBuf>) -> Result<()> {
-    let root = match root {
-        Some(r) => r,
-        None => std::env::current_dir()?,
-    };
-    let root = root.canonicalize().unwrap_or(root);
-    // The fleet of the directory named: a run is brought back into the
-    // fleet it was part of, or it would be a stranger on another's board.
-    let path = match db_path {
-        Some(p) => p,
-        None => scope::board_for_root(&root)?,
-    };
-    let db = Db::open(&path)?;
-    let workspace = root.to_string_lossy().to_string();
-    let _ = db.adopt_legacy_run(&workspace);
-
-    let Some(id) = run else {
-        let offers: Vec<ui::resume::Offer> = db
-            .runs(&workspace)?
-            .into_iter()
-            .filter_map(ui::resume::Offer::of)
-            .collect();
-        if offers.is_empty() {
-            println!("no earlier run in {workspace} to bring back");
-            return Ok(());
-        }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0.0, |d| d.as_secs_f64());
-        for o in &offers {
-            println!(
-                "{:>4}  {:<11} {}",
-                o.run.id,
-                ui::resume::ago(now, &o.run.last_active),
-                o.run.tasks.join(", ")
-            );
-            let mut who = o.back.join(", ");
-            if !o.lost.is_empty() {
-                who.push_str(&format!("  — {} gone from disk", o.lost.join(", ")));
-            }
-            println!("                  {who}");
-        }
-        println!("\nfleet resume <id> brings one back");
-        return Ok(());
-    };
-
-    let run = db
-        .run(id)?
-        .with_context(|| format!("no run {id} on the board"))?;
-    let host = Host::detect(None)?.in_fleet(Some(&path));
-    let live: Vec<String> = db
-        .agents()?
-        .into_iter()
-        .filter(|a| {
-            a.tmux_target
-                .as_deref()
-                .and_then(|t| Some((t, Host::for_target(t)?)))
-                .is_some_and(|(t, h)| h.is_live(t))
-        })
-        .map(|a| a.name)
-        .collect();
-    let mut any = false;
-    for member in run.resumable() {
-        if live.contains(&member.name) {
-            println!("{:<18} already running", member.name);
-            continue;
-        }
-        match agent::resume(&host, &db, run.id, member) {
-            Ok(s) => {
-                any = true;
-                println!("{:<18} resumed in {}", s.name, s.placed.place);
-                if !host.settle(&s.placed, &s.name, Duration::from_secs(30)) {
-                    println!("{:<18} herdr has not recognised it yet; it keeps its tab name", "");
-                }
-            }
-            Err(e) => println!("{:<18} not resumed: {e}", member.name),
-        }
-    }
-    if let Host::Tmux(tmux) = &host
-        && any
-        && !tmux::Tmux::inside()
-    {
-        println!("\nfleet, or tmux attach -t {}, to see them", tmux.session());
-    }
-    Ok(())
-}
-
 /// Knock at the recipient's door, and say whether anyone was in.
 ///
 /// Every outcome is reported rather than returned as an error: the message
@@ -432,15 +289,15 @@ fn knock(
         // message going to an agent that does not exist.
         return format!("not delivered: no agent '{to}' on the board");
     };
-    let Some(target) = agent.tmux_target.as_deref() else {
+    let Some(target) = agent.target.as_deref() else {
         return format!("not delivered: {to} has no pane fleet can reach");
     };
-    let Some(host) = Host::for_target(target) else {
-        return if host::is_herdr(target) {
-            format!("not delivered: {to} is in herdr, and this is not")
-        } else {
-            "not delivered: no tmux".into()
-        };
+    if !host::is_herdr(target) {
+        // A tmux window, from before fleet ran only in herdr.
+        return format!("not delivered: {to} is not in herdr");
+    }
+    let Some(host) = Host::from_env() else {
+        return format!("not delivered: {to} is in herdr, and this is not");
     };
     let text = msg::line(from, task, summary, body);
     match host.deliver(target, &text) {
@@ -450,7 +307,7 @@ fn knock(
     }
 }
 
-/// `110x32`, as both `--snapshot` and `--preview` spell a size.
+/// `110x32`, as `--size` spells it.
 fn parse_size(size: &str) -> Result<(u16, u16)> {
     size.split_once('x')
         .and_then(|(w, h)| Some((w.trim().parse().ok()?, h.trim().parse().ok()?)))
@@ -465,18 +322,9 @@ fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
-    match cli.command.unwrap_or(Command::Tui {
-        root: None,
-        db: None,
-        snapshot: None,
-        view: None,
-    }) {
-        Command::Tui {
-            root,
-            db,
-            snapshot,
-            view,
-        } => {
+    match cli.command.unwrap_or(Command::Tui { root: None, db: None }) {
+        Command::Tui { root, db } => {
+            let host = Host::detect()?;
             // Standing somewhere is the usual way of saying which workspace
             // you mean, so it does not need a flag. The workspace is the
             // fleet, and the fleet has its own board.
@@ -487,50 +335,26 @@ fn main() -> Result<()> {
                 (None, None) => bail!("no workspace: run fleet in one, or pass --root"),
             };
             let db = Db::open(&path)?;
-            match snapshot {
-                Some(size) => {
-                    let (w, h) = parse_size(&size)?;
-                    ui::snapshot(db, path, root, w, h, view.as_deref())
-                }
-                None => ui::run(db, path, root),
-            }
+            ui::run(db, path, root, host)
         }
-        Command::Preview { size, view, plain, herdr } => {
+        Command::Preview { size, view, plain } => {
             let (w, h) = parse_size(&size)?;
-            ui::preview::run(w, h, view.as_deref(), plain, herdr)
+            ui::preview::run(w, h, view.as_deref(), plain)
         }
-        Command::Keys => ui::keys(),
         Command::Herdr { cmd } => match cmd {
             HerdrCmd::Open { root } => plugin::open(root),
             HerdrCmd::New { root } => plugin::new(root),
             HerdrCmd::Event => plugin::event(),
             HerdrCmd::Doctor => plugin::doctor(),
         },
-        Command::Resume { run, root, db } => resume(run, root, db),
-        Command::Sessions { watch } => sessions(watch),
-        Command::Session { name, watch, lines } => session(&name, watch, lines),
         Command::Board { cmd, db, fleet } => board(cmd, db, fleet),
         Command::Fleets => {
             let all = scope::fleets();
             if all.is_empty() {
-                println!("no fleets yet: start fleet in a workspace's directory");
+                println!("no fleets yet: open fleet in a workspace's directory");
             }
             for (name, root) in all {
                 println!("{name:<20} {}", root.display());
-            }
-            Ok(())
-        }
-        Command::Repos { root, db } => {
-            // Outside a fleet there is no board to say which are taken.
-            let taken: Vec<String> = match scope::board_for_command(db, None) {
-                Ok(path) => Db::open(path)?.agents()?.into_iter().filter_map(|a| a.repo).collect(),
-                Err(_) => Vec::new(),
-            };
-            let found = agent::candidates(&root, &taken);
-            println!("{} repositories under {}", found.len(), root.display());
-            for c in found {
-                let note = if c.taken { "has an agent" } else { "" };
-                println!("  {:<34} {:<14} {}", c.name, note, c.path.display());
             }
             Ok(())
         }
@@ -540,37 +364,25 @@ fn main() -> Result<()> {
             task,
             role,
             command,
-            session,
             timeout,
             db,
-        } => spawn(
-            &name,
-            &repo,
-            task.as_deref(),
-            &role,
-            command.as_deref(),
-            session.as_deref(),
-            timeout,
-            db,
-        ),
+        } => spawn(&name, &repo, task.as_deref(), &role, command.as_deref(), timeout, db),
     }
 }
 
-/// Start an agent and join the three sources back together: a tmux pane, the
+/// Start an agent and join the three sources back together: a herdr tab, the
 /// Claude Code session that appears inside it, and the row on the board.
-#[allow(clippy::too_many_arguments)]
 fn spawn(
     name: &str,
     repo: &Path,
     task: Option<&str>,
     role: &str,
     command: Option<&str>,
-    session: Option<&str>,
     timeout: u64,
     db_path: Option<PathBuf>,
 ) -> Result<()> {
     let path = scope::board_for_command(db_path, None)?;
-    let host = Host::detect(session)?.in_fleet(Some(&path));
+    let host = Host::detect()?.in_fleet(Some(&path));
     let db = Db::open(&path)?;
 
     // Read the task before the pane exists: a key that is not on the board
@@ -611,8 +423,8 @@ fn spawn(
     let role_name = if chief { "chief" } else { "worker" };
     let spawned = agent::start(&host, &db, name, repo, &what, naming, role_name, run)?;
     if chief {
-        // The board has to agree, or the rail draws it as a worker and the
-        // TUI starts a second chief alongside it.
+        // The board has to agree, or the graph draws it as a worker and the
+        // view starts a second chief alongside it.
         db.upsert_agent(&spawned.name, Some("chief"), None, None, None, None)?;
     }
     if let Some(key) = task {
@@ -622,7 +434,7 @@ fn spawn(
     }
     println!("{}  {}", spawned.name, spawned.placed.place);
 
-    if !host.settle(&spawned.placed, &spawned.name, Duration::from_secs(timeout)) {
+    if !host.settle(&spawned.placed, Duration::from_secs(timeout)) {
         println!("      herdr has not recognised an agent in it yet");
     }
     if let Some(sid) = host.session_at(&spawned.placed.target) {
@@ -635,94 +447,12 @@ fn spawn(
             agent::link(&db, &spawned.name, &found.session_id, run)?;
             println!("      adopted session {} (pid {})", found.session_id, found.pid);
         }
-        None if host.is_herdr() => println!(
+        None => println!(
             "      no session yet — it may be waiting at a dialog in its tab; \
              the fleet tab links it once it has one"
         ),
-        None => println!(
-            "      no session registered within {timeout}s — the pane is up, \
-             the board row is unlinked"
-        ),
     }
     Ok(())
-}
-
-fn sessions(watch: bool) -> Result<()> {
-    let dir = registry::default_dir();
-    let projects = registry::default_projects_dir();
-    let mut reg = Registry::new(&dir);
-    reg.refresh();
-
-    let mut live: Vec<_> = reg.interactive().collect();
-    live.sort_by_key(|s| s.started_at);
-
-    println!("{} live in {}", live.len(), dir.display());
-    for s in live {
-        let size = match s.transcript_path(&projects) {
-            Some(p) => std::fs::metadata(&p)
-                .map(|m| format!("{} KB", m.len() / 1024))
-                .unwrap_or_default(),
-            None => "no transcript".into(),
-        };
-        println!(
-            "  {:<6} {:<28} {:<5} {:<24} {}",
-            s.pid,
-            s.name,
-            s.status.as_str(),
-            s.repo(),
-            size
-        );
-    }
-
-    if !watch {
-        return Ok(());
-    }
-    println!("\nwatching — ctrl-c to stop");
-    let watcher = Watcher::new(&dir)?;
-    loop {
-        // The timeout is the sweep: a crashed session produces no filesystem
-        // event, so waiting on one alone would never notice it had gone.
-        watcher.wait(Duration::from_secs(5));
-        for change in reg.refresh() {
-            match change {
-                Change::Upserted(s) => {
-                    println!("  + {:<28} {:<5} {}", s.name, s.status.as_str(), s.repo())
-                }
-                Change::Removed { name, pid } => println!("  - {name} ({pid})"),
-            }
-        }
-    }
-}
-
-fn session(name: &str, watch: bool, lines: usize) -> Result<()> {
-    let mut reg = Registry::new(registry::default_dir());
-    reg.refresh();
-
-    let Some(s) = reg.by_name(name) else {
-        bail!("no live session named '{name}'");
-    };
-    let Some(path) = s.transcript_path(&registry::default_projects_dir()) else {
-        bail!("'{name}' has no transcript yet");
-    };
-
-    let mut t = Transcript::open(&path, BACKFILL_BYTES)?;
-    println!("{} · {} · {} entries\n", s.name, s.repo(), t.len());
-    for entry in t.tail(lines) {
-        println!("{}", render(entry));
-    }
-
-    if !watch {
-        return Ok(());
-    }
-    loop {
-        // Polled rather than watched: a transcript under an active session
-        // changes constantly, and the pane redraws on a tick regardless.
-        std::thread::sleep(Duration::from_millis(400));
-        let added = t.poll()?;
-        for entry in t.tail(added) {
-            println!("{}", render(entry));
-        }
-    }
 }
 
 /// True when output is meant for something that will parse it.
@@ -882,7 +612,7 @@ fn board(cmd: BoardCmd, path: Option<PathBuf>, fleet: Option<String>) -> Result<
             role,
             repo,
             session,
-            tmux,
+            target,
             branch,
         } => {
             let repo = repo.map(|r| r.canonicalize()).transpose()?;
@@ -891,7 +621,7 @@ fn board(cmd: BoardCmd, path: Option<PathBuf>, fleet: Option<String>) -> Result<
                 role.as_deref(),
                 repo.as_ref().map(|r| r.to_string_lossy()).as_deref(),
                 session.as_deref(),
-                tmux.as_deref(),
+                target.as_deref(),
                 branch.as_deref(),
             )?;
             println!("agent {name}");
@@ -1043,43 +773,4 @@ fn board(cmd: BoardCmd, path: Option<PathBuf>, fleet: Option<String>) -> Result<
         }
     }
     Ok(())
-}
-
-fn render(e: &Entry) -> String {
-    let at = e.hhmm();
-    match e {
-        Entry::Prompt { text, .. } => format!("{at}  > {}", first_line(text)),
-        Entry::CrossSessionMessage { from, text, .. } => {
-            format!("{at}  <- {from}: {}", first_line(text))
-        }
-        Entry::Say { text, .. } => format!("{at}     {}", first_line(text)),
-        Entry::Thought { chars, .. } => format!("{at}     ... thought {chars} chars"),
-        Entry::Tool {
-            name,
-            target,
-            outcome,
-            sidechain,
-            ..
-        } => {
-            let mark = if *sidechain { "  ~" } else { "  *" };
-            let result = match outcome {
-                Outcome::Pending => "running".into(),
-                Outcome::Ok(s) => s.clone(),
-                Outcome::Failed(s) => format!("failed: {s}"),
-                Outcome::Background(id) => format!("bg {id}"),
-            };
-            format!("{at}{mark} {name:<6} {target:<44} {result}")
-        }
-        Entry::Turn { secs, .. } => format!("{at}     --- turn {secs:.1}s"),
-    }
-}
-
-fn first_line(text: &str) -> String {
-    let line = text.lines().next().unwrap_or_default();
-    if line.chars().count() > 76 {
-        let cut: String = line.chars().take(75).collect();
-        format!("{cut}…")
-    } else {
-        line.to_string()
-    }
 }

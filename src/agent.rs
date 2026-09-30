@@ -1,6 +1,6 @@
 //! Starting an agent, and joining it back up with the board.
 //!
-//! Three things have to agree afterwards: a tmux pane, the Claude Code
+//! Three things have to agree afterwards: a herdr pane, the Claude Code
 //! session that appears inside it, and a row on the board. Creating the pane
 //! is instant; the session takes seconds to register itself. So the two are
 //! separated here — [`start`] returns as soon as the pane exists, and
@@ -10,7 +10,9 @@
 //! the second on a worker thread, because a UI that freezes for ten seconds
 //! after every spawn is a UI nobody spawns from.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -19,7 +21,6 @@ use crate::brief;
 use crate::db::{Db, RunAgent};
 use crate::host::{self, Host, Placed, What};
 use crate::registry::{self, Registry, Session};
-use crate::tmux;
 
 /// What a repository offers as an agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,9 +66,9 @@ pub fn start(
     let repo = repo
         .canonicalize()
         .with_context(|| format!("no such repository: {}", repo.display()))?;
-    // herdr takes a narrower set of names than tmux, and the board's name is
-    // the one a message is addressed to, so they have to be the same.
-    let wanted = if host.is_herdr() { host::herdr_safe(name) } else { name.to_string() };
+    // herdr takes a narrow set of names, and the board's name is the one a
+    // message is addressed to, so they have to be the same.
+    let wanted = host::herdr_safe(name);
     let name = match naming {
         Naming::Unique => unique_name(db, &wanted)?,
         Naming::Exact => wanted,
@@ -98,8 +99,8 @@ pub fn start(
 /// What the agent's shell is told before the command: the run it joins, and
 /// its fleet's board. The board is what makes it part of the fleet: a
 /// session without one is refused by the board, which is how a session
-/// fleet did not start is kept off it. A new terminal gets its environment
-/// from the multiplexer's server, not from fleet, so it has to be said here.
+/// fleet did not start is kept off it. A new pane gets its environment from
+/// herdr's server, not from fleet, so it has to be said here.
 fn environment(run: Option<i64>, board: Option<&Path>) -> String {
     let mut out = String::new();
     if let Some(id) = run {
@@ -138,7 +139,7 @@ pub fn adopt(pane_pid: i32, timeout: Duration) -> Option<Session> {
         reg.refresh();
         if let Some(found) = reg
             .interactive()
-            .find(|s| tmux::owns(pane_pid, s.pid))
+            .find(|s| owns(pane_pid, s.pid))
             .cloned()
         {
             return Some(found);
@@ -146,6 +147,44 @@ pub fn adopt(pane_pid: i32, timeout: Duration) -> Option<Session> {
         std::thread::sleep(Duration::from_millis(250));
     }
     None
+}
+
+/// Whether `session_pid` runs inside the pane whose shell is `pane_pid`.
+///
+/// A pane's shell runs the command, so `claude` is a child of it. Matching
+/// on the working directory instead would pick the wrong agent as soon as
+/// two of them share a repo, so this walks the process tree.
+fn owns(pane_pid: i32, session_pid: i32) -> bool {
+    let parents = parent_map();
+    let mut pid = session_pid;
+    // A pane is a handful of processes deep at most; the bound is there so
+    // a cycle in a malformed ps table cannot hang the UI.
+    for _ in 0..32 {
+        if pid == pane_pid {
+            return true;
+        }
+        match parents.get(&pid) {
+            Some(&parent) if parent > 1 => pid = parent,
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn parent_map() -> HashMap<i32, i32> {
+    let mut map = HashMap::new();
+    let Ok(out) = Command::new("ps").args(["-ax", "-o", "pid=,ppid="]).output() else {
+        return map;
+    };
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let mut f = line.split_whitespace();
+        if let (Some(pid), Some(ppid)) = (f.next(), f.next())
+            && let (Ok(pid), Ok(ppid)) = (pid.parse(), ppid.parse())
+        {
+            map.insert(pid, ppid);
+        }
+    }
+    map
 }
 
 /// Record which session an agent turned out to be — on the board, and in
@@ -169,8 +208,7 @@ pub fn link(db: &Db, name: &str, session_id: &str, run: Option<i64>) -> Result<(
 /// write code again.
 pub fn resume(host: &Host, db: &Db, run: i64, member: &RunAgent) -> Result<Spawned> {
     // herdr's panes start claude by its full path; see `brief::claude_program`.
-    let program = if host.is_herdr() { brief::claude_program() } else { "claude".into() };
-    resume_from(host, db, run, member, &registry::default_projects_dir(), &program)
+    resume_from(host, db, run, member, &registry::default_projects_dir(), &brief::claude_program())
 }
 
 /// `resume`, with Claude Code's projects directory and program given rather
@@ -350,13 +388,22 @@ mod tests {
         }
     }
 
+    /// A herdr that is never reached: resuming is refused before a pane is
+    /// asked for.
+    fn nowhere() -> Host {
+        Host {
+            herdr: crate::herdr::Herdr::with("false", "/nonexistent/sock"),
+            workspace: "w1".into(),
+            fleet: None,
+        }
+    }
+
     #[test]
     fn an_agent_that_never_reported_a_session_is_not_resumed() {
         let db = Db::open_in_memory().unwrap();
         let run = db.start_run("/w").unwrap();
-        let Ok(tmux) = crate::tmux::Tmux::detect(Some("unused")) else { return };
         let dir = tempfile::tempdir().unwrap();
-        let err = resume_from(&Host::Tmux(tmux.clone()), &db, run, &member("x", "worker", dir.path(), None), dir.path(), "false")
+        let err = resume_from(&nowhere(), &db, run, &member("x", "worker", dir.path(), None), dir.path(), "false")
             .err()
             .expect("refused");
         assert!(err.to_string().contains("never reported a session"), "{err}");
@@ -368,81 +415,18 @@ mod tests {
         // the old agent, and a pane that looks like it did is worse.
         let db = Db::open_in_memory().unwrap();
         let run = db.start_run("/w").unwrap();
-        let Ok(tmux) = crate::tmux::Tmux::detect(Some("unused")) else { return };
         let dir = tempfile::tempdir().unwrap();
-        let err = resume_from(&Host::Tmux(tmux.clone()), &db, run, &member("x", "worker", dir.path(), Some("s")), dir.path(), "false")
+        let err = resume_from(&nowhere(), &db, run, &member("x", "worker", dir.path(), Some("s")), dir.path(), "false")
             .err()
             .expect("refused");
         assert!(err.to_string().contains("no longer on disk"), "{err}");
     }
 
     #[test]
-    fn a_resumed_agent_comes_back_into_its_own_conversation_and_its_run() {
-        use std::time::Duration;
-
-        let socket = format!("fleet-resume-{}", std::process::id());
-        let Ok(tmux) = crate::tmux::Tmux::detect(Some(&socket)) else { return };
-        let tmux = tmux.on_socket(&socket);
-        if tmux.ensure_session().is_err() {
-            return;
-        }
-
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().join("billing-service");
-        std::fs::create_dir_all(&repo).unwrap();
-        let repo = repo.canonicalize().unwrap();
-
-        // The conversation, where Claude Code keeps it.
-        let projects = dir.path().join("projects");
-        let slug = projects.join(registry::project_slug(&repo));
-        std::fs::create_dir_all(&slug).unwrap();
-        std::fs::write(slug.join("sess-abc.jsonl"), "{}\n").unwrap();
-
-        // A stand-in for Claude Code that records what it was started with.
-        let bin = dir.path().join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        let argv = dir.path().join("argv");
-        let env = dir.path().join("env");
-        std::fs::write(
-            bin.join("claude"),
-            format!(
-                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\000' \"$a\"; done > {}\nprintf %s \"$FLEET_RUN\" > {}\n",
-                argv.display(),
-                env.display()
-            ),
-        )
-        .unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(bin.join("claude"), std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        let db = Db::open_in_memory().unwrap();
-        let run = db.start_run("/w").unwrap();
-        let who = member("billing-svc", "worker", &repo, Some("sess-abc"));
-        let program = bin.join("claude").to_string_lossy().to_string();
-        let spawned = resume_from(&Host::Tmux(tmux.clone()), &db, run, &who, &projects, &program);
-        for _ in 0..40 {
-            if env.is_file() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        let got = std::fs::read_to_string(&argv).unwrap_or_default();
-        let fleet_run = std::fs::read_to_string(&env).unwrap_or_default();
-        let _ = tmux.kill_server();
-
-        assert!(spawned.is_ok(), "{:?}", spawned.err());
-        let args: Vec<&str> = got.split('\0').filter(|a| !a.is_empty()).collect();
-        assert_eq!(args.get(..2), Some(&["--resume", "sess-abc"][..]), "its own conversation: {args:?}");
-        assert!(args.contains(&"--append-system-prompt"), "with its role: {args:?}");
-        assert_eq!(fleet_run, run.to_string(), "and knows which run it is in");
-
-        // Back on the rail, as itself.
-        let a = db.agents().unwrap().into_iter().find(|a| a.name == "billing-svc").unwrap();
-        assert_eq!(a.session_id.as_deref(), Some("sess-abc"));
-        let r = db.run(run).unwrap().unwrap();
-        assert_eq!(r.agents[0].session_id.as_deref(), Some("sess-abc"));
+    fn a_process_is_owned_by_the_shell_it_descends_from() {
+        let me = std::process::id() as i32;
+        assert!(owns(me, me), "a pane owns its own process");
+        assert!(!owns(me, 1), "and not launchd");
     }
 
     #[test]

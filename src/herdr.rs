@@ -135,6 +135,7 @@ impl Herdr {
 
     /// herdr at a given binary and socket: a test's fake, or the preview's
     /// stand-in, which never calls it.
+    #[cfg(test)]
     pub fn with(bin: impl Into<String>, socket: impl Into<PathBuf>) -> Herdr {
         Herdr {
             bin: bin.into(),

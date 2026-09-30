@@ -61,14 +61,6 @@ impl Status {
             None => Status::Other(String::new()),
         }
     }
-
-    pub fn as_str(&self) -> &str {
-        match self {
-            Status::Idle => "idle",
-            Status::Busy => "busy",
-            Status::Other(s) => s,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,36 +155,6 @@ impl Session {
     pub fn is_interactive(&self) -> bool {
         self.kind == "interactive"
     }
-
-    /// The last path segment of the cwd — what the fleet rail shows.
-    pub fn repo(&self) -> &str {
-        self.cwd
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("?")
-    }
-
-    /// This session's transcript, if it has one yet.
-    ///
-    /// The directory name is derived from the cwd, but the derivation is
-    /// Claude Code's, not ours, so a miss falls back to searching for the
-    /// transcript by session id rather than reporting that none exists.
-    pub fn transcript_path(&self, projects_dir: &Path) -> Option<PathBuf> {
-        let direct = projects_dir
-            .join(project_slug(&self.cwd))
-            .join(format!("{}.jsonl", self.session_id));
-        if direct.is_file() {
-            return Some(direct);
-        }
-        let wanted = format!("{}.jsonl", self.session_id);
-        for entry in fs::read_dir(projects_dir).ok()?.flatten() {
-            let candidate = entry.path().join(&wanted);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-        None
-    }
 }
 
 /// Claude Code's project-directory name for a working directory: every
@@ -200,8 +162,8 @@ impl Session {
 ///
 /// `/Users/p/.claude-mem/obs` becomes `-Users-p--claude-mem-obs` — note the
 /// doubled dash where the dot was. That collision is in Claude Code's scheme,
-/// not ours, which is why [`Session::transcript_path`] verifies before
-/// trusting the result.
+/// not ours, which is why a lookup checks the file is there before trusting
+/// the result.
 pub fn project_slug(cwd: &Path) -> String {
     cwd.to_string_lossy()
         .chars()
@@ -284,34 +246,12 @@ impl Registry {
     }
 
     /// Live sessions, chief-of-staff ordering left to the caller.
-    // Used by the fleet rail and the message router, neither written yet.
-    #[allow(dead_code)]
     pub fn sessions(&self) -> impl Iterator<Item = &Session> {
         self.sessions.values()
     }
 
-    #[allow(dead_code)]
     pub fn interactive(&self) -> impl Iterator<Item = &Session> {
         self.sessions.values().filter(|s| s.is_interactive())
-    }
-
-    // Used by the fleet rail and the message router, neither written yet.
-    #[allow(dead_code)]
-    pub fn by_name(&self, name: &str) -> Option<&Session> {
-        self.sessions.values().find(|s| s.name == name)
-    }
-
-    // Used by the fleet rail and the message router, neither written yet.
-    #[allow(dead_code)]
-    pub fn by_session_id(&self, id: &str) -> Option<&Session> {
-        self.sessions.values().find(|s| s.session_id == id)
-    }
-
-    /// Sessions whose cwd is inside `root` — the fleet for one workspace.
-    // Used by the fleet rail and the message router, neither written yet.
-    #[allow(dead_code)]
-    pub fn under(&self, root: &Path) -> impl Iterator<Item = &Session> {
-        self.sessions.values().filter(move |s| s.cwd.starts_with(root))
     }
 }
 
@@ -420,9 +360,8 @@ mod tests {
         let changes = reg.refresh();
 
         assert_eq!(changes.len(), 1, "the .key file must not produce a session");
-        let s = reg.by_name("scratch").expect("session by name");
+        let s = reg.sessions().find(|s| s.name == "scratch").expect("session by name");
         assert_eq!(s.status, Status::Busy);
-        assert_eq!(s.repo(), "repo");
         assert!(s.is_interactive());
     }
 

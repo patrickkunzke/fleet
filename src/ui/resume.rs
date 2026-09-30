@@ -1,7 +1,7 @@
 //! Picking an earlier run to bring back.
 //!
 //! Shown when fleet starts in a workspace with nothing running in it and
-//! something to come back to, and on `^a r` at any time. A run is the crew
+//! something to come back to, and on `r` at any time. A run is the crew
 //! that worked together — the chief and the agents it started, each with the
 //! conversation it had — so choosing one brings all of them back at once,
 //! each into its own session.

@@ -39,9 +39,6 @@ pub fn render(
     tasks: &[Task],
     background: &[BgTask],
     selected_agent: Option<&str>,
-    // The key that opens the log from here: `^a l` where every other key
-    // is an agent's, `l` where none is.
-    log_key: &str,
 ) {
     let open = unfinished(tasks);
     let tasks = open.as_slice();
@@ -56,7 +53,7 @@ pub fn render(
     let wanted = 1 /* divider */ + 1 /* header */ + 1 /* its blank line */ + content;
     let bg_height = wanted.min(area.height / 2).max(4);
 
-    // A strip at the foot, ruled off, the way the left rail has one.
+    // A strip at the foot, ruled off, saying how to reach the log.
     let [top, bottom, foot_rule, foot] = Layout::vertical([
         Constraint::Min(0),
         Constraint::Length(bg_height),
@@ -77,7 +74,7 @@ pub fn render(
     theme::rule(frame, foot_rule);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(log_key.to_string(), theme::dim()),
+            Span::styled("l", theme::dim()),
             Span::styled(" the flow log", theme::faint()),
         ])),
         theme::pad(foot),
@@ -378,7 +375,7 @@ mod tests {
 
     fn drawn(tasks: &[Task], background: &[BgTask], agent: Option<&str>, w: u16, h: u16) -> String {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-        term.draw(|f| render(f, f.area(), tasks, background, agent, "^a l"))
+        term.draw(|f| render(f, f.area(), tasks, background, agent))
             .unwrap();
         format!("{}", term.backend())
     }

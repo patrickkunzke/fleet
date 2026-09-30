@@ -15,7 +15,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::db::Event;
-use crate::ui::fleet::Row;
+use crate::ui::crew::Row;
 use crate::ui::{graph, theme};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,7 +260,7 @@ fn wrap(text: &str, width: u16) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::fleet::{Presence, Role};
+    use crate::ui::crew::{Presence, Role};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -290,7 +290,7 @@ mod tests {
                 uptime: None,
                 session_id: None,
                 branch: None,
-                tmux_target: None,
+                target: None,
                 pid: None,
                 asking: false,
             })
@@ -308,8 +308,7 @@ mod tests {
 
     #[test]
     fn the_header_is_closed_by_a_rule_in_both_views() {
-        // The session pane closes its header the same way. Switching views
-        // must not drop a divider the eye was following across the frame.
+        // Switching views must not drop a divider the eye was following across the frame.
         for view in [View::Graph, View::Log] {
             let out = drawn(view, &[event("message", "chief", "billing-svc", "go")], 0, 60, 14);
             let second = out.lines().nth(1).unwrap_or_default();

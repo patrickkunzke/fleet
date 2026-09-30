@@ -110,7 +110,7 @@ pub struct Agent {
     pub role: String,
     pub repo: Option<String>,
     pub session_id: Option<String>,
-    pub tmux_target: Option<String>,
+    pub target: Option<String>,
     pub branch: Option<String>,
     pub task_key: Option<String>,
     pub task_title: Option<String>,
@@ -167,6 +167,27 @@ pub struct Db {
     path: Option<std::path::PathBuf>,
 }
 
+/// Bring a board made by an older fleet up to the schema, before the schema
+/// runs: its `IF NOT EXISTS` would otherwise keep the old shape.
+///
+/// A board from when fleet also ran in tmux calls an agent's target
+/// `tmux_target`. The view over it goes first — the schema makes it again —
+/// since SQLite would keep the old column name in the view's output.
+fn migrate(conn: &Connection) -> Result<()> {
+    let old: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('agents') WHERE name = 'tmux_target'")?
+        .exists([])?;
+    if old {
+        conn.execute_batch(
+            "BEGIN;
+             DROP VIEW IF EXISTS v_agents;
+             ALTER TABLE agents RENAME COLUMN tmux_target TO target;
+             COMMIT;",
+        )?;
+    }
+    Ok(())
+}
+
 impl Db {
     pub fn open(path: impl AsRef<Path>) -> Result<Db> {
         let path = path.as_ref();
@@ -198,6 +219,7 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        migrate(&conn).context("migrating the board")?;
         conn.execute_batch(SCHEMA).context("applying the schema")?;
         Ok(Db { conn, path: None })
     }
@@ -242,7 +264,7 @@ impl Db {
 
     pub fn agents(&self) -> Result<Vec<Agent>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, role, repo, session_id, tmux_target, branch,
+            "SELECT name, role, repo, session_id, target, branch,
                     task_key, task_title, bg_running
              FROM v_agents",
         )?;
@@ -253,7 +275,7 @@ impl Db {
                     role: r.get(1)?,
                     repo: r.get(2)?,
                     session_id: r.get(3)?,
-                    tmux_target: r.get(4)?,
+                    target: r.get(4)?,
                     branch: r.get(5)?,
                     task_key: r.get(6)?,
                     task_title: r.get(7)?,
@@ -530,7 +552,7 @@ impl Db {
         role: Option<&str>,
         repo: Option<&str>,
         session_id: Option<&str>,
-        tmux_target: Option<&str>,
+        target: Option<&str>,
         branch: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
@@ -544,11 +566,11 @@ impl Db {
                role        = COALESCE(?2, role),
                repo        = COALESCE(?3, repo),
                session_id  = COALESCE(?4, session_id),
-               tmux_target = COALESCE(?5, tmux_target),
+               target      = COALESCE(?5, target),
                branch      = COALESCE(?6, branch),
                ended_at    = NULL
              WHERE name = ?1",
-            params![name, role, repo, session_id, tmux_target, branch],
+            params![name, role, repo, session_id, target, branch],
         )?;
         Ok(())
     }
@@ -1533,6 +1555,31 @@ mod tests {
             db.board().unwrap().iter().filter(|t| t.state == State::Done).count(),
             0
         );
+    }
+
+    #[test]
+    fn a_board_from_the_tmux_days_keeps_its_agents_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fleet.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE agents (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE,
+                   role TEXT NOT NULL DEFAULT 'worker', repo TEXT, session_id TEXT,
+                   tmux_target TEXT, branch TEXT,
+                   spawned_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                   ended_at TEXT, note TEXT);
+                 CREATE VIEW v_agents AS SELECT a.name, a.tmux_target FROM agents a;
+                 INSERT INTO agents (name, tmux_target) VALUES ('chief', 'herdr:acme-chief');",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let chief = db.agents().unwrap().into_iter().find(|a| a.name == "chief").unwrap();
+        assert_eq!(chief.target.as_deref(), Some("herdr:acme-chief"));
+        drop(db);
+        Db::open(&path).expect("and opens again once migrated");
     }
 
     #[test]

@@ -3,18 +3,16 @@
 //! Layout work is the part of this that needs the tightest loop, and it is
 //! also the part that has nothing to do with real agents: a column that is
 //! one off is one off whether the pane behind it holds Claude Code or a cat.
-//! So the preview invents the whole fleet — a seeded in-memory board, and a
-//! private tmux server running canned output — and draws one frame inline,
-//! in colour, where the shell prompt was.
+//! So the preview invents the whole fleet — a seeded in-memory board, with
+//! no herdr behind it — and draws one frame inline, in colour, where the
+//! shell prompt was.
 //!
-//! Nothing here touches `~/.claude-fleet/fleet.db`, the registry, or the
-//! user's tmux server. Running it while a real fleet is up is safe, which is
-//! the whole point: the alternative was killing the agents to look at a
-//! margin.
+//! Nothing here touches a fleet's board, the registry, or herdr. Running it
+//! while a real fleet is up is safe, which is the whole point: the
+//! alternative was killing the agents to look at a margin.
 
 use std::io;
 use std::path::PathBuf;
-use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::tty::IsTty;
@@ -23,31 +21,8 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::{TerminalOptions, Viewport};
 
 use crate::db::{Db, NewTask, State};
-use crate::tmux::Tmux;
 use crate::ui::flow::View;
-use crate::ui::{App, fleet};
-
-/// The private server the fixture pane runs on. Named rather than random so
-/// that a preview which died without cleaning up is replaced by the next one
-/// instead of leaking a server per run.
-const SOCKET: &str = "fleet-preview";
-
-/// What the centre pane shows. Close enough to a real agent mid-turn that
-/// the colours and the spacing either look right or visibly do not.
-const CANNED: &str = concat!(
-    "\x1b[38;5;250m> \x1b[0mthe flag has to reach billing-service\n",
-    "\n",
-    "\x1b[38;5;180m⏺\x1b[0m I'll add the column, then the parameter.\n",
-    "\n",
-    "\x1b[38;5;108m  ⎿\x1b[0m  \x1b[1mRead\x1b[0m AccountService.kt\n",
-    "\x1b[38;5;108m  ⎿\x1b[0m  \x1b[1mEdit\x1b[0m V12__shared.sql  \x1b[38;5;108m+7\x1b[0m \x1b[38;5;174m-0\x1b[0m\n",
-    "\x1b[38;5;108m  ⎿\x1b[0m  \x1b[1mBash\x1b[0m ./gradlew test  \x1b[38;5;245m51 passed\x1b[0m\n",
-    "\n",
-    "\x1b[38;5;180m⏺\x1b[0m Column is in, suite is green. Open the\n",
-    "  MR, or wait for billing-service?\n",
-    "\n",
-    "\x1b[38;5;245m❯ \x1b[0m\n",
-);
+use crate::ui::{App, crew};
 
 /// Build the fixture board. Every presence and every task state appears
 /// once, so a palette change shows up here rather than in production.
@@ -107,100 +82,25 @@ fn seed(repo: &str) -> Result<Db> {
     Ok(db)
 }
 
-/// A handle on the preview's own tmux server. Never the user's: a preview
-/// that could reach their agents could also kill them.
-fn preview_tmux() -> Result<Tmux> {
-    Ok(Tmux::detect(Some("preview"))?.on_socket(SOCKET))
-}
-
-/// Start the canned pane on a private server, replacing whatever a previous
-/// run left behind.
-fn fixture_pane(repo: &std::path::Path) -> Result<(Tmux, String)> {
-    let tmux = preview_tmux()?;
-    // A pane left over from the last run holds the old output at the old
-    // size; cheaper to start clean than to reason about which.
-    let _ = tmux.kill_server();
-
-    let script = std::env::temp_dir().join("fleet-preview.txt");
-    std::fs::write(&script, CANNED)?;
-    let pane = tmux.spawn(
-        "accounts-svc",
-        repo,
-        &format!("cat {}; exec sleep 86400", script.display()),
-    )?;
-    let target = format!("{}:{}", pane.session, pane.window_name);
-    // tmux has the pane before the shell inside it has run; without this the
-    // first capture is empty and the centre pane previews as blank.
-    std::thread::sleep(Duration::from_millis(200));
-    Ok((tmux, target))
-}
-
-pub fn run(width: u16, height: u16, view: Option<&str>, plain: bool, herdr: bool) -> Result<()> {
+pub fn run(width: u16, height: u16, view: Option<&str>, plain: bool) -> Result<()> {
     let repo = std::env::current_dir()?;
     let db = seed(&repo.to_string_lossy())?;
-
-    let pane = fixture_pane(&repo).ok();
-    if let Some((_, target)) = &pane {
-        db.upsert_agent("accounts-svc", None, None, None, Some(target), None)?;
-    }
-
-    // The tmux frame: the fixture pane is what the centre shows. The herdr
-    // frame has no pane of its own, and a herdr that is never called.
-    let hosted = herdr.then(|| crate::host::Hosted {
-        herdr: crate::herdr::Herdr::with("herdr", "/nonexistent/herdr.sock"),
-        workspace: "w1".into(),
-        fleet: None,
-    });
-    let mut app = App::within(db, PathBuf::from(":memory:"), Some(repo), hosted);
-    // App::new found the user's tmux server. The fixture pane is not on it,
-    // and nothing of theirs should be reachable from here.
-    app.tmux = pane.as_ref().and(preview_tmux().ok());
+    let mut app = App::new(db, PathBuf::from(":memory:"), Some(repo), None);
     app.refresh();
     dress(&mut app.rows);
-    // The fixture agent with the live pane is the one worth looking at.
-    app.selected = app
-        .rows
-        .iter()
-        .position(|r| r.name == "accounts-svc")
-        .unwrap_or(0);
-    app.retarget();
-    app.centre_view = match view {
-        Some("graph") => Some(View::Graph),
-        Some("log") => Some(View::Log),
-        _ if herdr => Some(View::Graph),
-        _ => None,
+    app.view = match view {
+        Some("log") => View::Log,
+        _ => View::Graph,
     };
-
-    // Only drawing a frame says how wide the centre column is, and the pane
-    // has to be that wide before it is worth looking at: a mirror at the
-    // wrong size wraps mid-word and every judgement about spacing made from
-    // it is wrong. So one frame is thrown away to settle the size.
-    settle(&mut app, width, height)?;
 
     // Piped to a file or a diff there is no terminal to draw into, and the
     // inline viewport needs one. Falling back is friendlier than the error
     // crossterm gives, which names a device rather than the pipe.
-    let plain = plain || !io::stdout().is_tty();
-    let drawn = if plain {
+    if plain || !io::stdout().is_tty() {
         plain_frame(&mut app, width, height)
     } else {
         inline_frame(&mut app, width, height)
-    };
-
-    if let Some((tmux, _)) = pane {
-        let _ = tmux.kill_server();
     }
-    drawn
-}
-
-/// Draw once into nothing, so that the layout reaches the mirror and tmux
-/// has reflowed by the time the frame anybody sees is drawn.
-fn settle(app: &mut App, width: u16, height: u16) -> Result<()> {
-    let mut term = Terminal::new(ratatui::backend::TestBackend::new(width, height))?;
-    term.draw(|f| app.draw(f))?;
-    std::thread::sleep(Duration::from_millis(120));
-    app.centre.poll();
-    Ok(())
 }
 
 /// Give the fixture rows the liveness the registry would have given them.
@@ -209,8 +109,8 @@ fn settle(app: &mut App, width: u16, height: u16) -> Result<()> {
 /// The preview has no processes, so rather than inventing registry files it
 /// says outright what each row is — which also lets one frame carry every
 /// presence at once.
-fn dress(rows: &mut [fleet::Row]) {
-    use fleet::Presence::*;
+fn dress(rows: &mut [crew::Row]) {
+    use crew::Presence::*;
     for row in rows.iter_mut() {
         let (presence, uptime) = match row.name.as_str() {
             "chief" => (Waiting, Some("2h14m")),
@@ -280,10 +180,7 @@ mod tests {
 
     fn previewed(width: u16, height: u16) -> String {
         let db = seed("/w/fleet").unwrap();
-        let mut app = App::new(db, PathBuf::from(":memory:"), Some(PathBuf::from("/w/fleet")));
-        // No tmux in a test: the centre falls back to saying there is no
-        // session, which is the rest of the frame unchanged.
-        app.tmux = None;
+        let mut app = App::new(db, PathBuf::from(":memory:"), Some(PathBuf::from("/w/fleet")), None);
         app.refresh();
         dress(&mut app.rows);
         let mut term = ratatui::Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -294,7 +191,7 @@ mod tests {
     #[test]
     fn the_fixture_fills_every_pane() {
         let out = previewed(110, 30);
-        assert!(out.contains("chief"), "the rail: {out}");
+        assert!(out.contains("chief"), "the graph: {out}");
         assert!(out.contains("ENG-2553"), "the tasks: {out}");
         assert!(out.contains("pnpm dev"), "the background half: {out}");
         assert!(
@@ -306,12 +203,11 @@ mod tests {
     #[test]
     fn it_carries_every_presence_so_one_frame_shows_the_whole_palette() {
         let db = seed("/w/fleet").unwrap();
-        let mut app = App::new(db, PathBuf::from(":memory:"), None);
-        app.tmux = None;
+        let mut app = App::new(db, PathBuf::from(":memory:"), None, None);
         app.refresh();
         dress(&mut app.rows);
 
-        use fleet::Presence::*;
+        use crew::Presence::*;
         for wanted in [Working, Waiting, Gone, Unlinked] {
             assert!(
                 app.rows.iter().any(|r| r.presence == wanted),
@@ -323,8 +219,7 @@ mod tests {
     #[test]
     fn a_row_made_live_stops_claiming_its_session_ended() {
         let db = seed("/w/fleet").unwrap();
-        let mut app = App::new(db, PathBuf::from(":memory:"), None);
-        app.tmux = None;
+        let mut app = App::new(db, PathBuf::from(":memory:"), None, None);
         app.refresh();
         dress(&mut app.rows);
 
@@ -332,7 +227,7 @@ mod tests {
         // row arrives here reading "session ended". Saying that under a row
         // drawn as working is the bug this catches.
         let chief = app.rows.iter().find(|r| r.name == "chief").unwrap();
-        assert_eq!(chief.presence, fleet::Presence::Waiting);
+        assert_eq!(chief.presence, crew::Presence::Waiting);
         assert_ne!(chief.detail, "session ended");
     }
 
@@ -341,8 +236,7 @@ mod tests {
         // What inline mode needs: a preview narrower than the window must not
         // write into the columns beside it.
         let db = seed("/w/fleet").unwrap();
-        let mut app = App::new(db, PathBuf::from(":memory:"), None);
-        app.tmux = None;
+        let mut app = App::new(db, PathBuf::from(":memory:"), None, None);
         app.refresh();
 
         let mut term = ratatui::Terminal::new(TestBackend::new(120, 20)).unwrap();

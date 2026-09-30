@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Redraw the fleet on every save.
 #
-# `fleet preview` invents its own board and its own tmux server, so this can
-# run beside a real fleet without touching it — and a layout change is a save
+# `fleet preview` invents its own board and reaches no herdr, so this can run
+# beside a real fleet without touching it — and a layout change is a save
 # away from being on screen instead of a restart away.
 #
-#   ./dev.sh                 the session pane at 110x32
-#   ./dev.sh 140x40 graph    a size and a view (session, graph, log)
+#   ./dev.sh                 the graph at 110x32
+#   ./dev.sh 140x40 log      a size and a view (graph, log)
 #
 # Deliberately no cargo-watch or fswatch: one fewer thing to install on a
 # machine where the whole point is a fast loop.
@@ -15,7 +15,7 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SIZE="${1:-110x32}"
-VIEW="${2:-session}"
+VIEW="${2:-graph}"
 BIN="$ROOT/target/debug/fleet"
 
 # Debug, not release: this loop is about how soon the frame appears, and the

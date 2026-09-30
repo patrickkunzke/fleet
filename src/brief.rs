@@ -134,47 +134,6 @@ pub fn worker(name: &str, repo: &Path, task: Option<&Task>, body: Option<&str>) 
     }
 }
 
-/// The command line that starts the agent.
-///
-/// The opening is a positional argument rather than typed into the pane once
-/// it is up: typing means waiting for a REPL that has not said it is ready,
-/// and half a prompt delivered mid-start is worse than none. `--disallowed-tools`
-/// is variadic, so it goes last — anything after it would be eaten.
-pub fn command(brief: &Brief) -> String {
-    let mut out = format!(
-        "claude --append-system-prompt {} {}",
-        quote(&brief.role),
-        quote(&brief.opening)
-    );
-    if !brief.deny.is_empty() {
-        out.push_str(" --disallowed-tools ");
-        out.push_str(&brief.deny.join(" "));
-    }
-    out
-}
-
-/// The command line that brings an agent back into its own conversation.
-///
-/// The role again, and the chief's deny list again, because neither is kept
-/// with the conversation. No opening turn: the conversation already has one,
-/// and a new first prompt would be sent the moment the agent came up.
-///
-/// `program` is `claude` except in a test: a pane's command goes through the
-/// user's shell, whose startup can rebuild PATH, so a stand-in has to be named
-/// by its full path.
-pub fn resume_command_for(program: &str, brief: &Brief, session: &str) -> String {
-    let mut out = format!(
-        "{program} --resume {} --append-system-prompt {}",
-        quote(session),
-        quote(&brief.role)
-    );
-    if !brief.deny.is_empty() {
-        out.push_str(" --disallowed-tools ");
-        out.push_str(&brief.deny.join(" "));
-    }
-    out
-}
-
 /// Which `claude` to start, by its full path.
 ///
 /// Not whatever a new pane's shell finds first. The shell's startup rebuilds
@@ -292,7 +251,6 @@ mod tests {
         let b = chief(Path::new("/w"));
         assert!(b.deny.contains(&"Edit"), "{:?}", b.deny);
         assert!(b.deny.contains(&"Write"), "{:?}", b.deny);
-        assert!(command(&b).contains("--disallowed-tools Edit Write"), "{}", command(&b));
     }
 
     #[test]
@@ -314,11 +272,6 @@ mod tests {
         assert!(b.role.contains("You are the chief"));
         assert!(!b.opening.contains("You are the chief"));
         assert!(b.opening.contains("fleet board ls"));
-
-        let cmd = command(&b);
-        let role_at = cmd.find("You are the chief").unwrap();
-        let flag_at = cmd.find("--append-system-prompt").unwrap();
-        assert!(flag_at < role_at, "the role is the appended system prompt");
     }
 
     #[test]
@@ -431,37 +384,10 @@ mod tests {
     }
 
     #[test]
-    fn a_resumed_agent_is_given_back_its_role_and_not_a_new_first_prompt() {
-        // The conversation has its opening already; a new one would be sent
-        // the moment the agent came back up.
-        let b = worker("billing-svc", Path::new("/w"), None, None);
-        let cmd = resume_command_for("claude", &b, "sess-123");
-        assert!(cmd.starts_with("claude --resume 'sess-123' --append-system-prompt '"), "{cmd}");
-        assert!(!cmd.contains(&b.opening), "no opening turn: {cmd}");
-        assert!(!cmd.contains("--disallowed-tools"), "a worker keeps its tools: {cmd}");
-    }
-
-    #[test]
-    fn a_resumed_chief_still_cannot_edit() {
-        // The deny list is set at launch and not kept with the conversation:
-        // a resume that dropped it would be a chief that could write code.
-        let cmd = resume_command_for("claude", &chief(Path::new("/w")), "sess-1");
-        assert!(cmd.ends_with("--disallowed-tools Edit Write NotebookEdit"), "{cmd}");
-    }
-
-    #[test]
     fn a_brief_with_quotes_in_it_survives_the_shell() {
         // Apostrophes are ordinary in prose and fatal in a single-quoted
         // shell word; the rest of the brief would be read as commands.
         assert_eq!(quote("don't stop; rm -rf /"), r"'don'\''t stop; rm -rf /'");
-    }
-
-    #[test]
-    fn the_deny_list_goes_last_because_it_swallows_what_follows_it() {
-        // --disallowed-tools is variadic: anything after it is read as
-        // another tool name rather than as the prompt.
-        let cmd = command(&chief(Path::new("/w")));
-        assert!(cmd.ends_with("--disallowed-tools Edit Write NotebookEdit"), "{cmd}");
     }
 
     #[test]
@@ -475,63 +401,6 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout), b.role);
-    }
-
-    #[test]
-    fn the_brief_arrives_at_the_agent_through_tmux_intact() {
-        use crate::tmux::Tmux;
-        use std::time::Duration;
-
-        // The whole path this rests on: our quoting, tmux's parsing of the
-        // command it is handed, and the shell in the pane. Three layers,
-        // each of which would happily eat an apostrophe.
-        let name = format!("fleet-brief-{}", std::process::id());
-        let Ok(tmux) = Tmux::detect(Some(&name)) else { return };
-        let tmux = tmux.on_socket(&name);
-
-        let dir = tempfile::tempdir().unwrap();
-        let landed = dir.path().join("argv");
-        let fake = dir.path().join("claude");
-        // A stand-in for Claude Code that records what it was given: the
-        // appended system prompt, then the opening, then the deny list.
-        std::fs::write(
-            &fake,
-            format!(
-                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\000' \"$a\"; done > {}\n",
-                landed.display()
-            ),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        let t = task("ENG-2553-2", &["ENG-2553-1"]);
-        let expected = worker("billing-svc", dir.path(), Some(&t), Some("the old header is the fallback"));
-        let line = format!(
-            "PATH={}:$PATH {}",
-            dir.path().display(),
-            command(&expected)
-        );
-
-        assert!(tmux.spawn("briefed", dir.path(), &line).is_ok());
-        for _ in 0..40 {
-            if landed.is_file() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        let got = std::fs::read_to_string(&landed).unwrap_or_default();
-        let _ = tmux.kill_server();
-
-        // NUL-separated, because a role runs to several lines and a newline
-        // would not tell one argument from the next.
-        let args: Vec<&str> = got.split('\0').filter(|a| !a.is_empty()).collect();
-        assert_eq!(args.first(), Some(&"--append-system-prompt"), "{args:?}");
-        assert_eq!(args.get(1), Some(&expected.role.as_str()), "the role, intact");
-        assert_eq!(args.get(2), Some(&expected.opening.as_str()), "then the opening");
     }
 
     /// A stand-in for Claude Code that writes its arguments, NUL-separated,
@@ -590,6 +459,20 @@ mod tests {
         assert_eq!(args[2], "--append-system-prompt");
         assert_eq!(args[3], b.role);
         assert_eq!(&args[4..], ["--disallowed-tools", "Edit", "Write", "NotebookEdit"]);
+    }
+
+    #[test]
+    fn a_resumed_worker_keeps_its_tools_and_gets_no_new_first_prompt() {
+        // The conversation has its opening already; a new one would be sent
+        // the moment the agent came back up.
+        let dir = tempfile::tempdir().unwrap();
+        let program = recorder(dir.path());
+        let b = worker("billing-svc", Path::new("/w"), None, None);
+        let line = resume_line(&program.to_string_lossy(), &b, "sess-123", &dir.path().join("b"), "billing-svc").unwrap();
+        let args = landed(&line, dir.path());
+        assert_eq!(&args[..2], ["--resume", "sess-123"]);
+        assert_eq!(args[3], b.role);
+        assert_eq!(args.len(), 4, "no opening, no deny list: {args:?}");
     }
 
     #[test]
