@@ -418,8 +418,14 @@ impl Traffic {
 }
 
 fn draw_chief(canvas: &mut Canvas, l: &Layout, chief: &Row, t: &Traffic, selected: Option<&str>) {
-    let is_selected = selected == Some(chief.name.as_str());
-    canvas.card(l.chief_x, 0, l.chief_w, CHIEF_H, theme::accent(), is_selected);
+    // The chief's name is always in the accent; its border takes the accent
+    // only when selected, the same as a worker's.
+    let border = if selected == Some(chief.name.as_str()) {
+        theme::accent()
+    } else {
+        Style::default().fg(theme::FAINT)
+    };
+    canvas.card(l.chief_x, 0, l.chief_w, CHIEF_H, border);
 
     let inner = l.chief_w.saturating_sub(4);
     canvas.spread(
@@ -529,7 +535,7 @@ fn draw_card(canvas: &mut Canvas, l: &Layout, i: usize, w: &Row, selected: Optio
     } else {
         Style::default().fg(theme::FAINT)
     };
-    canvas.card(x, y, l.card_w, CARD_H, border, is_selected);
+    canvas.card(x, y, l.card_w, CARD_H, border);
     if l.chief {
         // The line comes in through the top of the card.
         canvas.put(l.card_centre(i), y, "┴", border);
@@ -856,9 +862,9 @@ impl Canvas {
         self.text(x, y, left, width, ls);
     }
 
-    /// A rounded card. Filled when selected, the way the rail fills the
-    /// selected agent.
-    fn card(&mut self, x: u16, y: u16, w: u16, h: u16, border: Style, filled: bool) {
+    /// A rounded card. It paints only its border; the pane's background shows
+    /// through.
+    fn card(&mut self, x: u16, y: u16, w: u16, h: u16, border: Style) {
         if w < 2 || h < 2 {
             return;
         }
@@ -876,15 +882,6 @@ impl Canvas {
         self.put(right, y, "╮", border);
         self.put(x, bottom, "╰", border);
         self.put(right, bottom, "╯", border);
-        if filled {
-            for cy in y..=bottom {
-                for cx in x..=right {
-                    if let Some(cell) = self.buf.cell_mut((cx, cy)) {
-                        cell.set_bg(theme::SELECTED_BG);
-                    }
-                }
-            }
-        }
     }
 
     /// Copy the part of the canvas that fits into `area`, from row `from`.
@@ -1152,12 +1149,19 @@ mod tests {
     }
 
     #[test]
-    fn the_selected_card_is_filled_like_the_rail() {
+    fn cards_paint_no_background() {
+        let (buf, _) = drawn(&fleet(), &[], &[], 70, 20, Some("eng-2155-review"));
+        for cell in buf.content() {
+            assert_eq!(cell.bg, Color::Reset);
+        }
+    }
+
+    #[test]
+    fn the_selected_card_takes_the_accent_border() {
         let (buf, _) = drawn(&fleet(), &[], &[], 70, 20, Some("eng-2155-review"));
         let l = Layout::new(70, true, 2);
-        let x = l.card_x(1) + 3;
-        assert_eq!(buf.cell((x, CARDS_Y + 2)).unwrap().bg, theme::SELECTED_BG);
-        assert_ne!(buf.cell((l.card_x(0) + 3, CARDS_Y + 2)).unwrap().bg, theme::SELECTED_BG);
+        assert_eq!(buf.cell((l.card_x(1), CARDS_Y + 2)).unwrap().fg, theme::ACCENT);
+        assert_eq!(buf.cell((l.card_x(0), CARDS_Y + 2)).unwrap().fg, theme::FAINT);
     }
 
     #[test]
