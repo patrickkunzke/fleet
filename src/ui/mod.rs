@@ -1122,24 +1122,37 @@ impl App {
         // Folded away, the terminal is the window. That is the point of the
         // key: a REPL rendered into a third of the screen is a preview of a
         // terminal rather than one.
-        let (rail, centre, side) = if self.wide {
-            (Rect::ZERO, body, Rect::ZERO)
-        } else if self.hosted.is_some() {
+        let (rail, rest) = if self.wide || self.hosted.is_some() {
             // In herdr the rail says nothing the graph does not: its cards
             // are the agents, selected with ←→ and opened with ↵, and herdr's
             // own sidebar lists the live ones with what they are on. Its
             // width goes to the graph.
-            let [centre, side] = Layout::horizontal([Constraint::Min(24), Constraint::Length(36)]).areas(body);
-            (Rect::ZERO, centre, side)
+            (Rect::ZERO, body)
         } else {
-            let [rail, centre, side] = Layout::horizontal([
-                Constraint::Length(28),
-                Constraint::Min(24),
-                Constraint::Length(36),
-            ])
-            .areas(body);
-            (rail, centre, side)
+            let [rail, rest] = Layout::horizontal([Constraint::Length(28), Constraint::Min(0)]).areas(body);
+            (rail, rest)
         };
+        // A side column of tasks needs a wide window. In a split pane it
+        // leaves the graph a sliver and clips every title, so there the
+        // board goes along the foot and has the whole width instead.
+        let stacked = !self.wide && rest.width < STACK_BELOW && rest.height >= 20;
+        let (centre, side, side_rule) = if self.wide {
+            (rest, Rect::ZERO, Rect::ZERO)
+        } else if stacked {
+            let height = board::stacked_height(&self.tasks, &self.background)
+                .min(rest.height / 2)
+                .max(6);
+            let [centre, rule, side] =
+                Layout::vertical([Constraint::Min(0), Constraint::Length(1), Constraint::Length(height)])
+                    .areas(rest);
+            (centre, side, rule)
+        } else {
+            let [centre, side] = Layout::horizontal([Constraint::Min(24), Constraint::Length(36)]).areas(rest);
+            (centre, side, Rect::ZERO)
+        };
+        // Nothing to the centre's right to rule it off from, once the board
+        // is below it.
+        let bordered = !self.wide && !stacked;
 
         self.rail_at = rail;
         self.centre_at = centre;
@@ -1163,16 +1176,25 @@ impl App {
                     &self.rows,
                     self.event_selected,
                     agent.as_deref(),
-                    !self.wide,
+                    bordered,
                 )
             }
             None => {
                 let row = self.rows.get(self.selected).cloned();
                 let typing = self.focus == Focus::Session;
-                self.centre.render(frame, centre, row.as_ref(), typing, !self.wide);
+                self.centre.render(frame, centre, row.as_ref(), typing, bordered);
             }
         }
-        if !self.wide {
+        if stacked {
+            theme::rule(frame, side_rule);
+            board::render_stacked(
+                frame,
+                side,
+                &self.tasks,
+                &self.background,
+                self.selected().map(|r| r.name.as_str()),
+            );
+        } else if !self.wide {
             self.draw_side(frame, side);
         }
         self.draw_keys(frame, keys);
@@ -1180,7 +1202,7 @@ impl App {
         // After everything, so that every rule and divider is on the buffer
         // to be joined up.
         if !self.wide {
-            let columns: Vec<u16> = [rail, centre]
+            let columns: Vec<u16> = [rail, if stacked { Rect::ZERO } else { centre }]
                 .iter()
                 .filter(|r| !r.is_empty())
                 .map(|r| r.x + r.width - 1)
@@ -1693,6 +1715,10 @@ fn unix_now() -> f64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |d| d.as_secs_f64())
 }
+
+/// Below this many columns beside the rail, the board goes under the centre
+/// rather than beside it: what a graph or a session needs, and the board's 36.
+const STACK_BELOW: u16 = 80 + 36;
 
 /// An event's identity, for remembering when it was first seen. The log has
 /// no id column to read, and these four together do not repeat.

@@ -84,6 +84,65 @@ pub fn render(
     );
 }
 
+/// What the board along the foot shows under the tasks: only while
+/// something is running. A pane in a split has no rows to spare for an
+/// empty heading, or for last hour's finished build.
+fn running_now(background: &[BgTask]) -> Vec<BgTask> {
+    background.iter().filter(|b| b.state == "running").cloned().collect()
+}
+
+/// Rows the background section takes under the tasks: its divider, its
+/// heading and blank line, and each entry.
+fn stacked_bg_height(background: &[BgTask]) -> u16 {
+    let running = running_now(background).len();
+    if running == 0 {
+        return 0;
+    }
+    3 + BG_LINES * running.min(6) as u16
+}
+
+/// Rows the board would like along the foot of a narrow pane: every open
+/// task, and under them what is running.
+pub fn stacked_height(tasks: &[Task], background: &[BgTask]) -> u16 {
+    let open = unfinished(tasks);
+    let mut epics: Vec<Option<&str>> = open.iter().map(|t| t.epic_key.as_deref()).collect();
+    epics.dedup();
+    let notes = open
+        .iter()
+        .filter(|t| t.blocked_on.is_some() || !t.waiting_on.is_empty())
+        .count();
+    let tasks = if open.is_empty() { 2 } else { open.len() + notes + 2 * epics.len() };
+    // The heading and its blank line.
+    (2 + tasks) as u16 + stacked_bg_height(background)
+}
+
+/// The board along the foot of the window rather than down its side: a pane
+/// in a split is tall and narrow, and a column of 36 there both starves the
+/// graph and clips every title. The tasks get the whole width, and what is
+/// running goes under them, while anything is.
+pub fn render_stacked(
+    frame: &mut Frame,
+    area: Rect,
+    tasks: &[Task],
+    background: &[BgTask],
+    selected_agent: Option<&str>,
+) {
+    let open = unfinished(tasks);
+    // The tasks keep at least half: they are what the board is for.
+    let bg_height = stacked_bg_height(background).min(area.height / 2);
+    let [top, bottom] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(bg_height)]).areas(area);
+    render_tasks(frame, top, &open, selected_agent);
+    if bg_height > 0 {
+        let divider = Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(theme::BORDER));
+        let inner = divider.inner(bottom);
+        frame.render_widget(divider, bottom);
+        render_background(frame, inner, &running_now(background));
+    }
+}
+
 fn render_tasks(frame: &mut Frame, area: Rect, tasks: &[Task], selected_agent: Option<&str>) {
     let open = tasks.iter().filter(|t| t.state != State::Done).count();
     let width = area.width.saturating_sub(theme::GUTTER * 2);
@@ -322,6 +381,29 @@ mod tests {
         term.draw(|f| render(f, f.area(), tasks, background, agent, "^a l"))
             .unwrap();
         format!("{}", term.backend())
+    }
+
+    #[test]
+    fn along_the_foot_only_what_is_running_is_shown_under_the_tasks() {
+        let tasks = vec![task("ENG-1-1", "ENG-1", State::Running, None, "the work")];
+        let stacked = |background: &[BgTask]| {
+            let mut term = Terminal::new(TestBackend::new(80, 16)).unwrap();
+            term.draw(|f| render_stacked(f, f.area(), &tasks, background, None)).unwrap();
+            format!("{}", term.backend())
+        };
+
+        // A finished build is no reason to spend rows on the section.
+        let finished = stacked(&[bg(1, "./gradlew test", "passed", 30)]);
+        assert!(finished.contains("the work"));
+        assert!(!finished.contains("BACKGROUND"));
+
+        let out = stacked(&[bg(1, "./gradlew test", "passed", 30), bg(2, "pnpm dev", "running", 5)]);
+        assert!(out.contains("BACKGROUND"));
+        assert!(out.contains("pnpm dev"));
+        assert!(!out.contains("gradlew"));
+        // Under the tasks, not beside them.
+        let row = |needle: &str| out.lines().position(|l| l.contains(needle)).unwrap();
+        assert!(row("BACKGROUND") > row("the work"));
     }
 
     #[test]
