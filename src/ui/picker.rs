@@ -212,19 +212,19 @@ mod tests {
     #[test]
     fn a_name_starting_with_the_filter_outranks_a_loose_match() {
         let mut p = picker();
-        p.push('r');
+        p.push('s');
         let names: Vec<_> = p.matches().iter().map(|c| c.name.clone()).collect();
         assert_eq!(
             names.first().map(String::as_str),
             Some("storefront"),
-            "every one of these contains an r somewhere: {names:?}"
+            "every one of these contains an s somewhere: {names:?}"
         );
     }
 
     #[test]
     fn filtering_matches_a_subsequence_not_just_a_prefix() {
         let mut p = picker();
-        for c in "cosv".chars() {
+        for c in "bisv".chars() {
             p.push(c);
         }
         let names: Vec<_> = p.matches().iter().map(|c| c.name.clone()).collect();
@@ -243,7 +243,7 @@ mod tests {
         p.move_by(3);
         assert_eq!(p.chosen().unwrap().name, "gateway");
 
-        p.push('r');
+        p.push('s');
         assert_eq!(
             p.chosen().map(|c| c.name.clone()),
             Some("storefront".into()),

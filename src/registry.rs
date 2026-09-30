@@ -160,7 +160,7 @@ impl Session {
 /// Claude Code's project-directory name for a working directory: every
 /// character that is not a letter, digit or dash becomes a dash.
 ///
-/// `/Users/p/.claude-mem/obs` becomes `-Users-p--claude-mem-obs` — note the
+/// `/Users/me/.cache/obs` becomes `-Users-me--cache-obs` — note the
 /// doubled dash where the dot was. That collision is in Claude Code's scheme,
 /// not ours, which is why a lookup checks the file is there before trusting
 /// the result.
@@ -336,12 +336,12 @@ mod tests {
     fn slug_matches_claude_codes_scheme() {
         assert_eq!(
             project_slug(Path::new("/Users/me/Code/acme")),
-            "-Users-me-Documents-Code-acme"
+            "-Users-me-Code-acme"
         );
         // The dot in a hidden directory becomes a second dash.
         assert_eq!(
-            project_slug(Path::new("/Users/me/.claude-mem/observer-sessions")),
-            "-Users-me--claude-mem-observer-sessions"
+            project_slug(Path::new("/Users/me/.cache/observer-sessions")),
+            "-Users-me--cache-observer-sessions"
         );
         // Spaces and tildes go the same way.
         assert_eq!(

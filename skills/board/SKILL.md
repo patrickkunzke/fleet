@@ -73,7 +73,7 @@ Planning an epic:
 ```bash
 fleet board epic ENG-2553 "shared settings flag"
 fleet board add ENG-2553-1 ~/Code/acme/service/accounts-service "shared column + migration" \
-  --epic ENG-2553 --body "Add the shared column and an optional service param. the old header stays as fallback."
+  --epic ENG-2553 --body "Add the shared column and an optional service param. The old header stays as fallback."
 fleet board add ENG-2553-2 ~/Code/acme/service/billing-service "consume the service param" \
   --epic ENG-2553 --dep ENG-2553-1
 ```

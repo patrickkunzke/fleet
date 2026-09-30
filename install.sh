@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Development install: build the binary, link it, link the skill, create the
-# database. Replaced by `brew install me/tap/fleet` once there is a tap.
+# database.
 
 set -euo pipefail
 

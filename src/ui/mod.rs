@@ -1056,8 +1056,8 @@ pub fn run(db: Db, db_path: PathBuf, root: Option<PathBuf>, host: Host) -> Resul
 
 /// A path as the design writes it: home as `~`, and the whole of the rest.
 ///
-/// It says which workspace you are in, and a leaf name does not — three
-/// checkouts on this machine are called `acme`. Too long for the bar, it
+/// It says which workspace you are in, and a leaf name does not: two
+/// checkouts of one project share it. Too long for the bar, it
 /// gives up leading directories rather than its tail: the end of a path is
 /// the part that identifies it.
 fn shorten(path: &Path, width: usize) -> String {
@@ -1507,8 +1507,8 @@ mod tests {
 
     #[test]
     fn the_header_carries_the_whole_path_not_just_the_leaf() {
-        // Three checkouts on this machine are called acme; the leaf does
-        // not say which workspace you are in.
+        // Two checkouts of one project share a leaf name; the leaf does not
+        // say which workspace you are in.
         let db = Db::open_in_memory().unwrap();
         let mut app = App::new(
             db,
