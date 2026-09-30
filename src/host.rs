@@ -71,14 +71,19 @@ impl Host {
         Host::from_env().context("fleet runs inside herdr: start it from a herdr pane, or with the plugin's fleet.open")
     }
 
-    /// The command line for `what`, with the brief read from files: see
-    /// `brief::launch_line`.
+    /// The command line for `what`, with the brief read from files and the
+    /// `/board` skill loaded: see `brief::launch_line`. An agent is still
+    /// worth starting without the skill, if it cannot be written; its brief
+    /// says how to use the board.
     pub fn line(&self, what: &What, stem: &str) -> Result<String> {
+        let plugin = || brief::write_plugin(&brief::plugin_dir()).ok();
         Ok(match what {
             What::Command(c) => c.to_string(),
-            What::Brief { brief, program } => brief::launch_line(program, brief, &brief::default_dir(), stem)?,
+            What::Brief { brief, program } => {
+                brief::launch_line(program, brief, &brief::default_dir(), stem, plugin().as_deref())?
+            }
             What::Resume { brief, session, program } => {
-                brief::resume_line(program, brief, session, &brief::default_dir(), stem)?
+                brief::resume_line(program, brief, session, &brief::default_dir(), stem, plugin().as_deref())?
             }
         })
     }

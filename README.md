@@ -27,7 +27,9 @@ herdr sidebar      tabs in the workspace
 - **One agent per repository**, each in a herdr tab named after it, briefed
   on its task, its repo, what it waits on and how to report.
 - **A shared board** of epics, tasks, dependencies and background processes,
-  in SQLite, that every agent reads and writes through `fleet board`.
+  in SQLite, that every agent reads and writes through `fleet board`, with a
+  `/board` skill that teaches it. Nothing to install: every agent starts with
+  the skill loaded.
 - **Messages that arrive.** `fleet board msg` records a message on the board
   and puts it in front of the recipient, marked as coming from a peer.
 - **A live graph** of the crew: lines weighted by traffic, coloured by state,
@@ -86,16 +88,17 @@ found with `herdr plugin log list --plugin fleet`. It checks herdr's server
 version, which `claude` fleet will start, and the two settings above, and
 says what to change.
 
-### Optional: `fleet` on your PATH, and the `/board` skill
+### The `/board` skill, and `fleet` on your PATH
 
-The agents fleet starts can always run `fleet`: it puts itself first on their
-PATH. To run it from your own shell as well, and to give Claude Code the
-`/board` skill that teaches a session the board in full:
+Nothing to install for either. Every agent fleet starts has the `/board`
+skill loaded (as `fleet:board`, through Claude Code's `--plugin-dir`, for that
+session only) and fleet first on its PATH. Your own Claude Code sessions are
+left as they were: the board is for the crew.
+
+To run `fleet` from your own shell as well:
 
 ```bash
-FLEET_DIR=$(ls -d ~/.config/herdr/plugins/github/fleet-* | head -1)
-ln -s "$FLEET_DIR/target/release/fleet" ~/.local/bin/fleet
-ln -s "$FLEET_DIR/skills/board" ~/.claude/skills/board
+ln -s "$(ls -d ~/.config/herdr/plugins/github/fleet-* | head -1)/target/release/fleet" ~/.local/bin/fleet
 ```
 
 Reinstalling the plugin can move that directory; run it again after one.
@@ -255,7 +258,8 @@ resumed into an empty session.
 | `FLEET_JSON=1` | JSON from `fleet board` reads |
 
 fleet keeps everything under `~/.claude-fleet`: each fleet's board, and the
-briefs each agent was started with (`briefs/`), which are what it was told.
+briefs each agent was started with (`briefs/`), which are what it was told,
+and the Claude Code plugin that carries the `/board` skill (`claude-plugin/`).
 It reads Claude Code's session registry (`~/.claude/sessions`) to see who is
 alive, and sends nothing anywhere.
 
@@ -284,7 +288,7 @@ at `herdr plugin log list --plugin fleet`.
 git clone https://github.com/patrickkunzke/fleet && cd fleet
 cargo build --release
 herdr plugin link .         # herdr runs your working tree
-./install.sh                # fleet on your PATH, and the /board skill
+./install.sh                # fleet on your PATH
 cargo test
 ```
 

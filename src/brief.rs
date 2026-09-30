@@ -156,6 +156,47 @@ pub fn claude_program() -> String {
     "claude".into()
 }
 
+/// The `/board` skill, in the binary, so an agent always gets the one that
+/// matches the fleet that started it.
+const SKILL: &str = include_str!("../skills/board/SKILL.md");
+
+/// Where fleet keeps the Claude Code plugin its agents are started with.
+pub fn plugin_dir() -> std::path::PathBuf {
+    crate::scope::home().join("claude-plugin")
+}
+
+/// Write the Claude Code plugin that carries the `/board` skill, and say
+/// where it is.
+///
+/// Every agent is started with it by `--plugin-dir`, for that session only:
+/// nothing is installed into the user's own Claude Code, and a session fleet
+/// did not start, which the board would refuse anyway, never sees it. Written
+/// on every launch, so an updated fleet hands out its updated skill.
+pub fn write_plugin(dir: &Path) -> std::io::Result<std::path::PathBuf> {
+    let manifest = serde_json::json!({
+        "name": "fleet",
+        "version": env!("CARGO_PKG_VERSION"),
+        "description": "The fleet board, for the agents a fleet starts.",
+        "author": { "name": "Patrick Kunzke" },
+    });
+    put(&dir.join(".claude-plugin/plugin.json"), &format!("{manifest:#}\n"))?;
+    put(&dir.join("skills/board/SKILL.md"), SKILL)?;
+    Ok(dir.to_path_buf())
+}
+
+/// Replace a file whole, so an agent starting at the same moment reads the
+/// old one or the new one and never half of each.
+fn put(path: &Path, text: &str) -> std::io::Result<()> {
+    if std::fs::read_to_string(path).is_ok_and(|t| t == text) {
+        return Ok(());
+    }
+    let dir = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let tmp = dir.join(format!(".{}.{}", std::process::id(), path.file_name().unwrap_or_default().to_string_lossy()));
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, path)
+}
+
 /// Where a brief is written for a launch line to read.
 pub fn default_dir() -> std::path::PathBuf {
     crate::scope::home().join("briefs")
@@ -167,11 +208,18 @@ pub fn default_dir() -> std::path::PathBuf {
 /// A page of prose with newlines in it, typed at a prompt, is one stray
 /// quote from a shell waiting on `quote>`; a line that says `$(cat file)`
 /// is not. The files are kept: they are what the agent was told.
-pub fn launch_line(program: &str, brief: &Brief, dir: &Path, stem: &str) -> std::io::Result<String> {
+pub fn launch_line(
+    program: &str,
+    brief: &Brief,
+    dir: &Path,
+    stem: &str,
+    plugin: Option<&Path>,
+) -> std::io::Result<String> {
     let (role, opening) = write_brief(brief, dir, stem)?;
     let mut out = format!(
-        "{} --append-system-prompt \"$(cat {})\" \"$(cat {})\"",
+        "{}{} --append-system-prompt \"$(cat {})\" \"$(cat {})\"",
         quote(program),
+        plugin_arg(plugin),
         quote(&role.to_string_lossy()),
         quote(&opening.to_string_lossy())
     );
@@ -181,11 +229,19 @@ pub fn launch_line(program: &str, brief: &Brief, dir: &Path, stem: &str) -> std:
 
 /// `launch_line` for coming back into a conversation: the role and the deny
 /// list again, no opening turn.
-pub fn resume_line(program: &str, brief: &Brief, session: &str, dir: &Path, stem: &str) -> std::io::Result<String> {
+pub fn resume_line(
+    program: &str,
+    brief: &Brief,
+    session: &str,
+    dir: &Path,
+    stem: &str,
+    plugin: Option<&Path>,
+) -> std::io::Result<String> {
     let (role, _) = write_brief(brief, dir, stem)?;
     let mut out = format!(
-        "{} --resume {} --append-system-prompt \"$(cat {})\"",
+        "{}{} --resume {} --append-system-prompt \"$(cat {})\"",
         quote(program),
+        plugin_arg(plugin),
         quote(session),
         quote(&role.to_string_lossy())
     );
@@ -204,6 +260,10 @@ fn write_brief(brief: &Brief, dir: &Path, stem: &str) -> std::io::Result<(std::p
     std::fs::write(&role, &brief.role)?;
     std::fs::write(&opening, &brief.opening)?;
     Ok((role, opening))
+}
+
+fn plugin_arg(plugin: Option<&Path>) -> String {
+    plugin.map(|p| format!(" --plugin-dir {}", quote(&p.to_string_lossy()))).unwrap_or_default()
 }
 
 fn push_deny(out: &mut String, brief: &Brief) {
@@ -438,7 +498,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let program = recorder(dir.path());
         let b = chief(Path::new("/w/it's here"));
-        let line = launch_line(&program.to_string_lossy(), &b, &dir.path().join("briefs"), "chief").unwrap();
+        let line = launch_line(&program.to_string_lossy(), &b, &dir.path().join("briefs"), "chief", None).unwrap();
         assert!(!line.contains('\n'), "one line, to type at a prompt: {line}");
 
         let args = landed(&line, dir.path());
@@ -453,7 +513,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let program = recorder(dir.path());
         let b = chief(Path::new("/w"));
-        let line = resume_line(&program.to_string_lossy(), &b, "sid-1", &dir.path().join("b"), "chief").unwrap();
+        let line = resume_line(&program.to_string_lossy(), &b, "sid-1", &dir.path().join("b"), "chief", None).unwrap();
         let args = landed(&line, dir.path());
         assert_eq!(&args[..2], ["--resume", "sid-1"]);
         assert_eq!(args[2], "--append-system-prompt");
@@ -468,7 +528,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let program = recorder(dir.path());
         let b = worker("billing-svc", Path::new("/w"), None, None);
-        let line = resume_line(&program.to_string_lossy(), &b, "sess-123", &dir.path().join("b"), "billing-svc").unwrap();
+        let line = resume_line(&program.to_string_lossy(), &b, "sess-123", &dir.path().join("b"), "billing-svc", None).unwrap();
         let args = landed(&line, dir.path());
         assert_eq!(&args[..2], ["--resume", "sess-123"]);
         assert_eq!(args[3], b.role);
@@ -479,8 +539,41 @@ mod tests {
     fn a_name_cannot_walk_the_brief_out_of_its_folder() {
         let dir = tempfile::tempdir().unwrap();
         let b = worker("x", Path::new("/w"), None, None);
-        let line = launch_line("claude", &b, dir.path(), "../../etc/x").unwrap();
+        let line = launch_line("claude", &b, dir.path(), "../../etc/x", None).unwrap();
         assert!(!line.contains("/../"), "{line}");
         assert!(std::fs::read_dir(dir.path()).unwrap().count() == 2);
+    }
+
+    #[test]
+    fn every_agent_is_started_with_the_board_skill_loaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = recorder(dir.path());
+        let plugin = write_plugin(&dir.path().join("it's plugin")).unwrap();
+        let b = chief(Path::new("/w"));
+        let line = launch_line(&program.to_string_lossy(), &b, &dir.path().join("b"), "chief", Some(&plugin)).unwrap();
+        let args = landed(&line, dir.path());
+        assert_eq!(args[..2], ["--plugin-dir".to_string(), plugin.to_string_lossy().to_string()]);
+        assert_eq!(&args[args.len() - 4..], ["--disallowed-tools", "Edit", "Write", "NotebookEdit"], "still last");
+
+        let line = resume_line(&program.to_string_lossy(), &b, "s", &dir.path().join("b"), "chief", Some(&plugin)).unwrap();
+        assert_eq!(landed(&line, dir.path())[..2], args[..2], "and when it comes back");
+    }
+
+    #[test]
+    fn the_plugin_carries_the_skill_this_fleet_was_built_with() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin = write_plugin(dir.path()).unwrap();
+        let skill = std::fs::read_to_string(plugin.join("skills/board/SKILL.md")).unwrap();
+        assert!(skill.starts_with("---\nname: board\n"), "{skill}");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(plugin.join(".claude-plugin/plugin.json")).unwrap()).unwrap();
+        assert_eq!(manifest["name"], "fleet");
+        assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"));
+
+        std::fs::write(plugin.join("skills/board/SKILL.md"), "stale").unwrap();
+        write_plugin(dir.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(plugin.join("skills/board/SKILL.md")).unwrap(), SKILL, "rewritten");
+        let strays: Vec<_> = std::fs::read_dir(plugin.join("skills/board")).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(strays.len(), 1, "no temporary files left behind: {strays:?}");
     }
 }
