@@ -403,6 +403,30 @@ pub fn resumes_agents_itself() -> bool {
     !setting_is_false(&text, "session", "resume_agents_on_restore")
 }
 
+/// The running server's version, which is not the client's: an update
+/// replaces the binary and leaves the server that was running as it was,
+/// until herdr is restarted.
+pub fn server_version() -> Option<String> {
+    let bin = std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".into());
+    let out = Command::new(bin).args(["status", "server"]).output().ok()?;
+    version_in(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn version_in(status: &str) -> Option<String> {
+    status
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("version:"))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Whether `version` is at least `wanted`, both as `major.minor.patch`.
+pub fn at_least(version: &str, wanted: (u64, u64, u64)) -> bool {
+    let mut parts = version.split(['.', '-', '+']).map(|p| p.parse::<u64>().unwrap_or(0));
+    let got = (parts.next().unwrap_or(0), parts.next().unwrap_or(0), parts.next().unwrap_or(0));
+    got >= wanted
+}
+
 /// herdr's config file, where `herdr --default-config` says it is.
 pub fn config_path() -> PathBuf {
     if let Some(p) = std::env::var_os("HERDR_CONFIG_PATH") {
@@ -497,6 +521,21 @@ fn run(mut cmd: Command, timeout: Duration) -> Result<Output> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_server_version_is_read_from_its_status() {
+        let status = "status: running\nversion: 0.9.0\nendpoint_compatible: yes\n";
+        assert_eq!(version_in(status).as_deref(), Some("0.9.0"));
+        assert_eq!(version_in("status: stopped\n"), None);
+    }
+
+    #[test]
+    fn versions_compare_by_number_not_by_text() {
+        assert!(!at_least("0.9.0", (0, 9, 1)), "the server without the focus fix");
+        assert!(at_least("0.9.1", (0, 9, 1)));
+        assert!(at_least("0.10.0", (0, 9, 1)), "10 is more than 9");
+        assert!(at_least("1.0.0-rc1", (0, 9, 1)));
+    }
     use std::os::unix::fs::PermissionsExt;
 
     /// A herdr that answers every call with the given reply, and writes the

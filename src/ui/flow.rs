@@ -35,7 +35,7 @@ pub fn render(
     selected: usize,
     agent: Option<&str>,
     bordered: bool,
-) {
+) -> Rect {
     let block = Block::default()
         .borders(if bordered { Borders::RIGHT } else { Borders::NONE })
         .border_style(Style::default().fg(theme::BORDER));
@@ -78,9 +78,18 @@ pub fn render(
     );
     theme::rule(frame, head_rule);
 
+    // Where the graph went, for a click to be read against. Nothing in the
+    // log is clicked.
     match view {
-        View::Graph => graph::render(frame.buffer_mut(), theme::pad(body), rows, events, ages, agent),
-        View::Log => log(frame, body, events, selected),
+        View::Graph => {
+            let at = theme::pad(body);
+            graph::render(frame.buffer_mut(), at, rows, events, ages, agent);
+            at
+        }
+        View::Log => {
+            log(frame, body, events, selected);
+            Rect::ZERO
+        }
     }
 }
 
@@ -301,7 +310,7 @@ mod tests {
         let rows = rows();
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         let ages = vec![f64::MAX; events.len()];
-        term.draw(|f| render(f, f.area(), view, events, &ages, &rows, selected, None, true))
+        term.draw(|f| { render(f, f.area(), view, events, &ages, &rows, selected, None, true); })
             .unwrap();
         format!("{}", term.backend())
     }

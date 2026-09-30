@@ -2,9 +2,9 @@
 //!
 //! herdr draws every agent's terminal, in a tab of its own, and owns
 //! everything about it — typing, the mouse, the clipboard. This is the view
-//! of the crew: who is doing what, the board, the graph. `↵` goes to an
-//! agent's own tab rather than drawing it here, and no key belongs to an
-//! agent, so none needs a prefix.
+//! of the crew: who is doing what, the board, the graph. `↵`, or a click on
+//! a card, goes to an agent's own tab rather than drawing it here, and no
+//! key belongs to an agent, so none needs a prefix.
 //!
 //! Redraws are event-driven, not polled. Four sources feed one channel:
 //! keystrokes, the session registry moving, herdr's agents changing, and a
@@ -26,7 +26,9 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Paragraph};
 
@@ -52,6 +54,7 @@ enum Msg {
     /// A paste, whole. Only arrives because bracketed paste is on: without
     /// it the terminal types the text out, and every letter would be a key.
     Paste,
+    Mouse(MouseEvent),
     Registry,
     /// herdr's agents, as they are now: after one of them changed.
     Agents(Vec<crate::herdr::Agent>),
@@ -81,6 +84,9 @@ pub struct App {
     noticed: Option<std::collections::HashSet<String>>,
     rows: Vec<Row>,
     selected: usize,
+    /// Where the graph was last drawn, so a click can be read against it.
+    /// Empty while the log is up.
+    graph_at: Rect,
     /// When fleet first saw each event, in seconds since the epoch. The graph
     /// shows a message travelling from the moment it appears here, which can
     /// be a beat after it was written: a pulse timed from the write alone
@@ -131,6 +137,7 @@ impl App {
             noticed: None,
             rows: Vec::new(),
             selected: 0,
+            graph_at: Rect::ZERO,
             first_seen: std::collections::HashMap::new(),
             picker: None,
             run: None,
@@ -331,6 +338,31 @@ impl App {
             (KeyCode::Enter, _) => self.go_to_selected(),
             _ => {}
         }
+    }
+
+    /// A click on a card goes to that agent, as selecting it and pressing
+    /// `↵` would. Anything else is not a click on anything.
+    fn on_mouse(&mut self, ev: MouseEvent) -> bool {
+        if ev.kind != MouseEventKind::Down(MouseButton::Left) || self.picker.is_some() || self.resume_picker.is_some() {
+            return false;
+        }
+        let ages = self.ages();
+        let current = self.selected().map(|r| r.name.clone());
+        let hit = graph::card_at(
+            self.graph_at,
+            &self.rows,
+            &self.events,
+            &ages,
+            current.as_deref(),
+            (ev.column, ev.row),
+        )
+        .map(String::from);
+        let Some(at) = hit.and_then(|name| self.rows.iter().position(|r| r.name == name)) else {
+            return false;
+        };
+        self.selected = at;
+        self.go_to_selected();
+        true
     }
 
     /// Nothing in the view takes text, and a paste typed out a key at a
@@ -772,7 +804,7 @@ impl App {
 
         let ages = self.ages();
         let agent = self.rows.get(self.selected).map(|r| r.name.clone());
-        flow::render(
+        self.graph_at = flow::render(
             frame,
             centre,
             self.view,
@@ -957,8 +989,9 @@ pub fn run(db: Db, db_path: PathBuf, root: Option<PathBuf>, host: Host) -> Resul
 
     let mut term = ratatui::init();
     // Bracketed paste, so a paste arrives whole instead of as a burst of
-    // keys, each of them a command here.
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
+    // keys, each of them a command here. And clicks, so a card can be
+    // clicked.
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste, Clicks);
     let result = (|| -> Result<()> {
         term.draw(|f| app.draw(f))?;
         while let Ok(first) = rx.recv() {
@@ -978,6 +1011,7 @@ pub fn run(db: Db, db_path: PathBuf, root: Option<PathBuf>, host: Host) -> Resul
                         app.on_paste();
                         dirty = true;
                     }
+                    Msg::Mouse(ev) => dirty |= app.on_mouse(ev),
                     // Several of these in one batch are one re-read.
                     Msg::Registry | Msg::Tick => refresh = true,
                     Msg::Agents(agents) => {
@@ -1010,7 +1044,11 @@ pub fn run(db: Db, db_path: PathBuf, root: Option<PathBuf>, host: Host) -> Resul
         Ok(())
     })();
     // A shell left in bracketed paste misreads the next thing typed into it.
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::DisableBracketedPaste,
+        crossterm::event::DisableMouseCapture
+    );
     ratatui::restore();
     crate::plugin::close_own_tab();
     result
@@ -1070,12 +1108,31 @@ fn event_key(e: &db::Event) -> String {
     )
 }
 
+/// Presses and releases, in SGR coordinates — and not every movement of
+/// the pointer, or a drag. crossterm's EnableMouseCapture also asks for
+/// any-motion tracking, which reports the pointer each time it crosses a
+/// cell: a message for nothing, dozens a second.
+struct Clicks;
+
+impl crossterm::Command for Clicks {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        f.write_str(concat!(
+            "\x1b[?1000h", // presses and releases
+            "\x1b[?1006h", // SGR coordinates, with no 223-column limit
+        ))
+    }
+}
+
 fn spawn_input(tx: Sender<Msg>) {
     std::thread::spawn(move || {
         loop {
             let msg = match event::read() {
                 Ok(Event::Key(key)) => Msg::Key(key),
                 Ok(Event::Paste(_)) => Msg::Paste,
+                // Only a press is worth a message: a release or the wheel
+                // is not a click on anything.
+                Ok(Event::Mouse(ev)) if ev.kind == MouseEventKind::Down(MouseButton::Left) => Msg::Mouse(ev),
+                Ok(Event::Mouse(_)) => continue,
                 // A resize still wants a redraw.
                 Ok(_) => Msg::Tick,
                 Err(_) => return,
@@ -1574,5 +1631,37 @@ mod tests {
         for (w, h) in [(40, 8), (60, 10), (200, 60)] {
             let _ = drawn(&mut app(), w, h);
         }
+    }
+
+    #[test]
+    fn clicking_a_workers_card_goes_to_its_tab() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = hosted_app(dir.path());
+        let out = drawn(&mut app, 130, 30);
+        assert_eq!(app.selected().unwrap().name, "chief", "the chief to begin with");
+
+        let (y, line) = out.lines().enumerate().find(|(_, l)| l.contains(" billing-svc ")).expect("its card");
+        let x = line[..line.find("billing-svc").unwrap()].chars().count() as u16;
+        let click = |x, y| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(app.on_mouse(click(x, y as u16)));
+        assert_eq!(app.selected().unwrap().name, "billing-svc");
+        let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap_or_default();
+        assert!(calls.contains("agent focus billing-svc"), "{calls}");
+
+        assert!(!app.on_mouse(click(0, 0)), "a click on nothing does nothing");
+        assert_eq!(app.selected().unwrap().name, "billing-svc");
+    }
+
+    #[test]
+    fn the_mouse_is_asked_for_clicks_and_not_every_movement() {
+        let mut ansi = String::new();
+        crossterm::Command::write_ansi(&Clicks, &mut ansi).unwrap();
+        assert!(ansi.contains("?1000h") && ansi.contains("?1006h"), "{ansi:?}");
+        assert!(!ansi.contains("?1003h") && !ansi.contains("?1002h"), "{ansi:?}");
     }
 }

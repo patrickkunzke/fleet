@@ -319,6 +319,23 @@ pub fn doctor() -> Result<()> {
         version.unwrap_or_else(|| "not found on PATH".into()),
     );
 
+    // herdr before 0.9.1 moves its own focus on `agent focus` but not the
+    // client's screen: ↵ on an agent in another tab does nothing you can
+    // see. An update leaves the old server running until herdr restarts.
+    let server = herdr::server_version();
+    let current = server.as_deref().is_some_and(|v| herdr::at_least(v, (0, 9, 1)));
+    say(
+        current,
+        "herdr server",
+        match &server {
+            Some(v) if current => v.clone(),
+            Some(v) => format!(
+                "{v}, which cannot switch your screen to an agent's tab. Restart herdr to run the updated server"
+            ),
+            None => "not running".into(),
+        },
+    );
+
     let inside = herdr::inside();
     say(
         inside,

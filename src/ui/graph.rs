@@ -64,10 +64,7 @@ pub fn render(
     }
     let chief = rows.iter().find(|r| r.role == Role::Chief);
     let workers: Vec<&Row> = rows.iter().filter(|r| r.role != Role::Chief).collect();
-
-    let traffic = Traffic::count(events, ages, chief.map(|c| c.name.as_str()), &workers);
-    let grid = Layout::new(area.width, chief.is_some(), workers.len());
-    let layout = grid.placed(&traffic);
+    let (layout, traffic, view_y) = arrange(area, chief, &workers, events, ages, selected);
     let mut canvas = Canvas::new(layout.width, layout.height);
 
     if let Some(chief) = chief {
@@ -94,6 +91,31 @@ pub fn render(
         draw_legend(&mut canvas, &layout);
     }
 
+    canvas.blit(buf, area, view_y);
+
+    // Say that there is more, and which way.
+    let right = area.x + area.width - 1;
+    if view_y > 0 {
+        put(buf, right, area.y, "▴", theme::accent());
+    }
+    if view_y + area.height < layout.height {
+        put(buf, right, area.y + area.height - 1, "▾", theme::accent());
+    }
+}
+
+/// Where everything goes, and how far down the canvas the pane shows: what
+/// `render` draws from, and what `card_at` reads a click against.
+fn arrange(
+    area: Rect,
+    chief: Option<&Row>,
+    workers: &[&Row],
+    events: &[Event],
+    ages: &[f64],
+    selected: Option<&str>,
+) -> (Layout, Traffic, u16) {
+    let traffic = Traffic::count(events, ages, chief.map(|c| c.name.as_str()), workers);
+    let layout = Layout::new(area.width, chief.is_some(), workers.len()).placed(&traffic);
+
     // Keep the selected card on screen. Cards wrap rather than run off to the
     // side, so the only way out of the pane is down, and the camera follows
     // the selection there — the way zoetrope's follows the active agent.
@@ -107,16 +129,39 @@ pub fn render(
         }
         _ => 0,
     };
-    canvas.blit(buf, area, view_y);
+    (layout, traffic, view_y)
+}
 
-    // Say that there is more, and which way.
-    let right = area.x + area.width - 1;
-    if view_y > 0 {
-        put(buf, right, area.y, "▴", theme::accent());
+/// The agent whose card `render` drew at `(x, y)`, given the same `area`
+/// and the same arguments.
+pub fn card_at<'a>(
+    area: Rect,
+    rows: &'a [Row],
+    events: &[Event],
+    ages: &[f64],
+    selected: Option<&str>,
+    (x, y): (u16, u16),
+) -> Option<&'a str> {
+    let inside = x >= area.x && x < area.x + area.width && y >= area.y && y < area.y + area.height;
+    if !inside {
+        return None;
     }
-    if view_y + area.height < layout.height {
-        put(buf, right, area.y + area.height - 1, "▾", theme::accent());
+    let chief = rows.iter().find(|r| r.role == Role::Chief);
+    let workers: Vec<&Row> = rows.iter().filter(|r| r.role != Role::Chief).collect();
+    let (l, _, view_y) = arrange(area, chief, &workers, events, ages, selected);
+    let (cx, cy) = (x - area.x, y - area.y + view_y);
+    let hit = |x0: u16, y0: u16, w: u16, h: u16| cx >= x0 && cx < x0 + w && cy >= y0 && cy < y0 + h;
+
+    if let Some(chief) = chief
+        && hit(l.chief_x, 0, l.chief_w, CHIEF_H)
+    {
+        return Some(&chief.name);
     }
+    workers
+        .iter()
+        .enumerate()
+        .find(|&(i, _)| hit(l.card_x(i), l.card_y(i), l.card_w, CARD_H))
+        .map(|(_, w)| w.name.as_str())
 }
 
 /// Where everything goes on the canvas.
@@ -1179,5 +1224,24 @@ mod tests {
         let b = epoch("2026-09-24T10:00:01.500Z").unwrap();
         assert!((b - a - 1.5).abs() < 1e-6);
         assert_eq!(epoch("not a time"), None);
+    }
+
+    #[test]
+    fn a_click_lands_on_the_card_drawn_under_it() {
+        let rows = fleet();
+        let (_, out) = drawn(&rows, &[], &[], 100, 20, None);
+        let area = Rect::new(0, 0, 100, 20);
+        // Where the name is written, in cells: the name is inside its card.
+        let at = |name: &str| -> (u16, u16) {
+            let word = format!(" {name} ");
+            let (y, line) = out.lines().enumerate().find(|(_, l)| l.contains(&word)).expect(name);
+            let byte = line.find(&word).unwrap() + 1;
+            (line[..byte].chars().count() as u16, y as u16)
+        };
+        for name in ["chief", "eng-2155", "eng-2155-review"] {
+            assert_eq!(card_at(area, &rows, &[], &[], None, at(name)), Some(name), "{out}");
+        }
+        assert_eq!(card_at(area, &rows, &[], &[], None, (0, 19)), None, "nothing there");
+        assert_eq!(card_at(area, &rows, &[], &[], None, (100, 0)), None, "outside the pane");
     }
 }

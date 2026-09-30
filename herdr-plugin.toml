@@ -11,8 +11,9 @@ id = "fleet"
 name = "fleet"
 version = "0.1.0"
 description = "A chief of staff that delegates to Claude Code agents across repositories, with a task board and a live graph of the crew."
-# 0.9.0 is what this was built and checked against.
-min_herdr_version = "0.9.0"
+# 0.9.1 is the first whose `agent focus` moves the screen to the agent, which
+# ↵ in the view relies on.
+min_herdr_version = "0.9.1"
 platforms = ["macos", "linux"]
 
 [[build]]
