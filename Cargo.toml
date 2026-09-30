@@ -2,7 +2,7 @@
 name = "fleet"
 version = "0.1.0"
 edition = "2024"
-description = "A herdr plugin that orchestrates Claude Code sessions across several repos"
+description = "A chief of staff for Claude Code, as a herdr plugin: one agent per repository, a shared task board, and a live graph of the crew."
 license = "MIT"
 repository = "https://github.com/patrickkunzke/fleet"
 readme = "README.md"

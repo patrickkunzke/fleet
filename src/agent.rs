@@ -73,7 +73,8 @@ pub fn start(
         Naming::Unique => unique_name(db, &wanted)?,
         Naming::Exact => wanted,
     };
-    let command = format!("{}{}", environment(run, db.path()), host.line(what, &name)?);
+    let bin = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf));
+    let command = format!("{}{}", environment(run, db.path(), bin.as_deref()), host.line(what, &name)?);
     let placed = host.open(&name, &repo, &command, role == "chief")?;
     if let Some(id) = run {
         db.join_run(id, &name, role, &repo.to_string_lossy())?;
@@ -101,8 +102,15 @@ pub fn start(
 /// session without one is refused by the board, which is how a session
 /// fleet did not start is kept off it. A new pane gets its environment from
 /// herdr's server, not from fleet, so it has to be said here.
-fn environment(run: Option<i64>, board: Option<&Path>) -> String {
+///
+/// And where fleet itself is, first on PATH: an agent reports with `fleet
+/// board` and the chief delegates with `fleet spawn`, and a plugin installed
+/// by herdr lives in herdr's own directory, not on anybody's PATH.
+fn environment(run: Option<i64>, board: Option<&Path>, bin: Option<&Path>) -> String {
     let mut out = String::new();
+    if let Some(bin) = bin {
+        out.push_str(&format!("PATH={}:\"$PATH\" ", brief::quote(&bin.to_string_lossy())));
+    }
     if let Some(id) = run {
         out.push_str(&format!("FLEET_RUN={id} "));
     }
@@ -427,6 +435,19 @@ mod tests {
         let me = std::process::id() as i32;
         assert!(owns(me, me), "a pane owns its own process");
         assert!(!owns(me, 1), "and not launchd");
+    }
+
+    #[test]
+    fn an_agent_can_run_the_fleet_that_started_it() {
+        // The line is typed at the pane's shell, so the shell is the check.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("it's bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let line = format!("{}sh -c 'printf %s \"$PATH\"'", environment(Some(4), None, Some(&bin)));
+        let out = Command::new("sh").arg("-c").arg(&line).output().unwrap();
+        let path = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(path.starts_with(&format!("{}:", bin.display())), "fleet first: {path}");
+        assert!(path.len() > bin.to_string_lossy().len() + 1, "and the rest of PATH kept: {path}");
     }
 
     #[test]
