@@ -12,15 +12,7 @@ It is for work that crosses repositories — a backend change, the service that
 consumes it, the UI on top — where one agent per repo keeps each one's
 context small, and something has to keep track of what waits on what.
 
-```
-herdr sidebar      tabs in the workspace
-─────────────      ───────────────────────────────────────────────────
-▾ acme          fleet · billing-service · accounts-service
-    ● chief
-    ○ content-…    ┌ chief ──────────┬ fleet ─────────────────────────┐
-    ● setting-…    │ claude          │ the graph         │ the board  │
-                   └─────────────────┴────────────────────────────────┘
-```
+![The fleet tab in herdr: the chief on the left, the crew's graph and the board on the right](docs/screenshot.png)
 
 - **A chief that delegates.** It plans and dispatches, and starts without
   Claude Code's editing tools, so it does not quietly do the work itself.
