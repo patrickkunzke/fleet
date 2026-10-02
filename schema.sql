@@ -200,6 +200,30 @@ CREATE INDEX IF NOT EXISTS idx_bg_state ON bg_tasks(state);
 CREATE INDEX IF NOT EXISTS idx_bg_agent ON bg_tasks(agent_id);
 
 
+-- --------------------------------------------------------------- inbox ---
+-- Messages waiting for the recipient's own session to pick them up.
+--
+-- An agent fleet starts carries a Claude Code mod that checks in here every
+-- few seconds (mailboxes) and, once its session is idle, takes what is
+-- waiting (inbox) and submits it as a prompt of its own. A message to an
+-- agent whose mailbox has gone quiet is typed into its pane instead, as
+-- before, and never gets a row here. A row is deleted when it is taken: the
+-- message itself stays in events.
+
+CREATE TABLE IF NOT EXISTS mailboxes (
+  agent      TEXT PRIMARY KEY,              -- agents.name
+  session_id TEXT NOT NULL,
+  polled_at  INTEGER NOT NULL               -- unix seconds
+);
+
+CREATE TABLE IF NOT EXISTS inbox (
+  event_id   INTEGER PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,
+  agent      TEXT NOT NULL                  -- events.to_agent
+);
+
+CREATE INDEX IF NOT EXISTS idx_inbox_agent ON inbox(agent, event_id);
+
+
 -- ------------------------------------------------------------------- kv ---
 -- Fleet-wide scratch state the TUI and the chief both read.
 -- Known keys: focus_epic, last_dispatch_at.

@@ -23,7 +23,10 @@ context small, and something has to keep track of what waits on what.
   `/board` skill that teaches it. Nothing to install: every agent starts with
   the skill loaded.
 - **Messages that arrive.** `fleet board msg` records a message on the board
-  and puts it in front of the recipient, marked as coming from a peer.
+  and puts it in front of the recipient, marked as coming from a peer. A
+  Claude Code mod in each agent picks it up once the agent's turn has ended,
+  whole; without mods (Claude Code before v2.1.287, or mods turned off) it is
+  typed into the agent's pane instead.
 - **A live graph** of the crew: lines weighted by traffic, coloured by state,
   messages drawn in flight. `↵` or a click goes to an agent's tab.
 - **herdr's sidebar and notifications** carry each agent's task, the board at
@@ -81,7 +84,8 @@ description = "new workspace in fleet mode"
 To check the setup, run the **fleet: check the setup** action from herdr's
 action list (`herdr plugin action invoke fleet.doctor`), and read what it
 found with `herdr plugin log list --plugin fleet`. It checks herdr's server
-version, which `claude` fleet will start, and the two settings above, and
+version, which `claude` fleet will start and whether it loads mods (v2.1.287
+or newer, and `disableAllHooks` not set), and the two settings above, and
 says what to change.
 
 ### The `/board` skill, and `fleet` on your PATH
@@ -240,16 +244,26 @@ From a shell, `fleet fleets` lists the fleets and `--fleet <name>` picks one.
 ```
 $ fleet board msg accounts-svc chief "the column is in" --task ENG-2553-1
 accounts-svc -> chief: the column is in
-      delivered to chief in herdr:acme-chief
+      queued for chief: it arrives when chief is next idle
 ```
 
-The message is written to the board first, then typed at the recipient's
-prompt through herdr, on one line and marked, so the agent does not take a
-peer for the person at the keyboard:
-`[fleet · accounts-svc · ENG-2553-1] the column is in`. Delivery never costs the
-record: a message to an agent that has gone is still on the board, and one to
-an agent sitting at a permission dialog is held there rather than typed into
-it.
+The message is written to the board first, then delivered, marked so the
+agent does not take a peer for the person at the keyboard:
+`[fleet · accounts-svc · ENG-2553-1] the column is in`.
+
+Every agent fleet starts carries a small Claude Code mod beside the `/board`
+skill. It checks the board every few seconds, and once its session's turn has
+ended it takes what is waiting and submits it as a prompt of its own: the
+whole body, its line breaks kept, several messages in one prompt. While a
+turn runs, the line under the prompt says how many are waiting. Nothing
+is typed into a prompt the agent is busy at.
+
+An agent whose mod is not checking in — Claude Code older than v2.1.287, mods
+turned off with `disableAllHooks` or `--safe-mode`, or a session that is not
+running — gets the old delivery instead: the message typed at its prompt
+through herdr, on one line, cut at 1500 characters, and held at a permission
+dialog rather than typed into it. Neither delivery ever costs the record: a
+message to an agent that has gone is still on the board.
 
 A message an agent sends some other way and never logs does not appear in
 the graph. The board is the record, by design.
