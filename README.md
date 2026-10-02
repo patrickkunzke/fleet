@@ -314,15 +314,31 @@ cargo test
 `herdr plugin link` does not build; rebuild after a change, then reopen the
 view with `q` and `prefix+f`. The agents keep running across both.
 
-To release, bump `version` in both `Cargo.toml` and `herdr-plugin.toml` (a
-test checks that they match), then tag the commit and push the tag:
+### Pull requests and commits
 
-```bash
-git tag v0.2.0 && git push origin v0.2.0
-```
+Every change reaches `main` through a pull request, merged with a merge
+commit; nothing is pushed to `main` directly. Each commit in a pull request is
+a [conventional commit](https://www.conventionalcommits.org) — `feat: …`,
+`fix(board): …`, `docs: …` — and CI checks that they are
+(`sh scripts/check-commits.sh origin/main` does the same locally).
 
-`fleet update` only moves to a `vX.Y.Z` tag, so a push to `main` without a
-tag reaches only someone who installs again by hand.
+### Releases
+
+Merging is releasing. When a pull request is merged, the release job reads
+the commits since the last `vX.Y.Z` tag and picks the version:
+
+| Commits | Release |
+|---|---|
+| `feat!: …`, `fix!: …`, or a `BREAKING CHANGE:` footer | major (minor before 1.0) |
+| `feat: …` | minor |
+| `fix: …`, `perf: …` | patch |
+| only `docs`, `ci`, `chore`, `refactor`, `test`, … | none |
+
+It raises the version in `Cargo.toml`, `Cargo.lock` and `herdr-plugin.toml`,
+adds the release's section to [CHANGELOG.md](CHANGELOG.md) from the commits
+([git-cliff](https://git-cliff.org), `cliff.toml`), commits that as
+`chore(release): vX.Y.Z`, tags it, and publishes the GitHub Release.
+`fleet update` moves users to it.
 
 For layout work there is a fixture fleet that needs neither herdr nor a real
 board:

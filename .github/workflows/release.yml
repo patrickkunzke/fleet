@@ -1,0 +1,81 @@
+name: release
+
+# A merge to main is released when its commits call for it (see
+# scripts/next-version.sh): the version is raised in Cargo.toml, Cargo.lock
+# and herdr-plugin.toml, the section is added to CHANGELOG.md, and the commit
+# is tagged and published as a GitHub Release.
+#
+# The version has to be in the files at the tagged commit, since that is what
+# herdr installs and what `fleet update` compares, so this job commits to
+# main. It pushes with RELEASE_DEPLOY_KEY, a deploy key the ruleset on main
+# lets through; nothing else may push there.
+
+on:
+  push:
+    branches: [main]
+
+# One release at a time, and none dropped: a second merge waits its turn.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # Its own commit comes back through here.
+    if: ${{ !startsWith(github.event.head_commit.message, 'chore(release):') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # main as it is now, not as it was at this push: a release that
+          # waited behind another must build on that one's commit.
+          ref: main
+          fetch-depth: 0
+          ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
+
+      - id: next
+        run: echo "version=$(sh scripts/next-version.sh)" >> "$GITHUB_OUTPUT"
+
+      - if: steps.next.outputs.version == ''
+        run: echo "nothing to release since $(git describe --tags --abbrev=0)"
+
+      - if: steps.next.outputs.version != ''
+        uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff
+
+      - if: steps.next.outputs.version != ''
+        uses: dtolnay/rust-toolchain@stable
+
+      - if: steps.next.outputs.version != ''
+        env:
+          VERSION: ${{ steps.next.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          tag="v$VERSION"
+
+          # The first `version =` in each is the package's own.
+          sed -i "0,/^version = \".*\"/s//version = \"$VERSION\"/" Cargo.toml herdr-plugin.toml
+          cargo update --workspace
+
+          git cliff --unreleased --tag "$tag" --strip all > notes.md
+          # The new section goes above the newest one, under the file's header.
+          awk -v notes=notes.md '
+            !done && /^## / { while ((getline line < notes) > 0) print line; print ""; done = 1 }
+            { print }
+          ' CHANGELOG.md > CHANGELOG.new
+          mv CHANGELOG.new CHANGELOG.md
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock herdr-plugin.toml CHANGELOG.md
+          git commit -m "chore(release): $tag"
+          git tag "$tag"
+          git push origin HEAD:main "$tag"
+
+          # The notes without their heading: the release page has its own.
+          tail -n +2 notes.md | gh release create "$tag" --title "$tag" --notes-file -
