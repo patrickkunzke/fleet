@@ -298,6 +298,39 @@ fn view_line(exe: &Path, root: &Path) -> String {
     )
 }
 
+/// The first Claude Code that loads mods.
+const MODS_SINCE: (u64, u64, u64) = (2, 1, 287);
+
+/// Whether the agents' sessions will load fleet's mod, from what `claude
+/// --version` printed and the user's Claude Code settings, and what to say.
+fn mods(version: &str, settings: &str) -> (bool, String) {
+    let (major, minor, patch) = MODS_SINCE;
+    // `2.1.287 (Claude Code)`: the number is the first word.
+    let number = version.split_whitespace().next().unwrap_or("");
+    if !herdr::at_least(number, MODS_SINCE) {
+        return (
+            false,
+            format!(
+                "Claude Code {number} has none, so messages are typed into the agent's pane on one line. Update Claude Code to {major}.{minor}.{patch} or newer"
+            ),
+        );
+    }
+    let off = serde_json::from_str::<serde_json::Value>(settings)
+        .ok()
+        .and_then(|s| s.get("disableAllHooks")?.as_bool())
+        .unwrap_or(false);
+    if off {
+        return (
+            false,
+            format!(
+                "turned off by disableAllHooks in {}, so messages are typed into the agent's pane on one line",
+                crate::registry::claude_home().join("settings.json").display()
+            ),
+        );
+    }
+    (true, "on — messages arrive when an agent's turn has ended".into())
+}
+
 /// What in this machine's setup would stop fleet working inside herdr.
 pub fn doctor() -> Result<()> {
     let mut problems = 0;
@@ -353,11 +386,20 @@ pub fn doctor() -> Result<()> {
     say(
         claude.is_some(),
         "claude",
-        match claude {
+        match &claude {
             Some(v) => format!("{program} ({v})"),
             None => format!("{program} does not run; set FLEET_CLAUDE to the claude you use"),
         },
     );
+
+    // The mod that hands an agent its messages once its turn has ended.
+    // Without it they are still delivered, typed into the pane on one line,
+    // so this is worth fixing rather than fatal.
+    if let Some(v) = &claude {
+        let settings = std::fs::read_to_string(crate::registry::claude_home().join("settings.json")).unwrap_or_default();
+        let (ok, detail) = mods(v, &settings);
+        say(ok, "mods", detail);
+    }
 
     // herdr's own resume starts plain `claude --resume <id>` in each pane:
     // the chief would come back able to edit, and every agent without the
@@ -490,6 +532,22 @@ mod tests {
         std::fs::create_dir(&inner).unwrap();
         assert!(same_dir(&inner, &dir.path().join("a/../a")));
         assert!(!same_dir(&inner, dir.path()));
+    }
+
+    #[test]
+    fn mods_need_a_claude_code_new_enough_to_load_them() {
+        assert!(mods("2.1.287 (Claude Code)", "").0);
+        assert!(mods("2.2.0 (Claude Code)", "{}").0);
+        let (ok, detail) = mods("2.1.286 (Claude Code)", "");
+        assert!(!ok);
+        assert!(detail.contains("2.1.286") && detail.contains("2.1.287 or newer"), "{detail}");
+    }
+
+    #[test]
+    fn mods_turned_off_in_the_settings_are_off() {
+        assert!(!mods("2.1.287 (Claude Code)", r#"{ "disableAllHooks": true }"#).0);
+        assert!(mods("2.1.287 (Claude Code)", r#"{ "disableAllHooks": false }"#).0);
+        assert!(mods("2.1.287 (Claude Code)", "not json").0, "a settings file it cannot read says nothing");
     }
 
     #[test]

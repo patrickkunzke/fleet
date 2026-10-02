@@ -34,7 +34,7 @@ pub fn default_projects_dir() -> PathBuf {
     claude_home().join("projects")
 }
 
-fn claude_home() -> PathBuf {
+pub fn claude_home() -> PathBuf {
     if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
         return PathBuf::from(dir);
     }

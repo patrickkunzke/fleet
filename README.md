@@ -84,7 +84,8 @@ description = "new workspace in fleet mode"
 To check the setup, run the **fleet: check the setup** action from herdr's
 action list (`herdr plugin action invoke fleet.doctor`), and read what it
 found with `herdr plugin log list --plugin fleet`. It checks herdr's server
-version, which `claude` fleet will start, and the two settings above, and
+version, which `claude` fleet will start and whether it loads mods (v2.1.287
+or newer, and `disableAllHooks` not set), and the two settings above, and
 says what to change.
 
 ### The `/board` skill, and `fleet` on your PATH
