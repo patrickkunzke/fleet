@@ -224,6 +224,20 @@ CREATE TABLE IF NOT EXISTS inbox (
 CREATE INDEX IF NOT EXISTS idx_inbox_agent ON inbox(agent, event_id);
 
 
+-- ------------------------------------------------------------ approvals ---
+-- A worker's go-ahead on a task. fleet's mod in the worker's session holds
+-- back Edit and Write until the task it works on has one. Given by the chief
+-- with `fleet board go`, or by the person at the keyboard typing a prompt in
+-- the worker's own pane. Its own table rather than a column on tasks, so an
+-- older board needs no migration.
+
+CREATE TABLE IF NOT EXISTS approvals (
+  task_key    TEXT PRIMARY KEY,             -- tasks.key
+  by          TEXT NOT NULL,                -- 'user', or the agent that gave it
+  approved_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+
 -- ------------------------------------------------------------------- kv ---
 -- Fleet-wide scratch state the TUI and the chief both read.
 -- Known keys: focus_epic, last_dispatch_at.

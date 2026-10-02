@@ -56,9 +56,11 @@ pub fn chief(root: &Path) -> Brief {
              agent on its task for you, and interrupt one with \
              `fleet board msg chief <name> '...'`.\n\n\
              An agent you dispatch reads its task, sends you what it intends, and \
-             waits for your go-ahead — yours counts as the user's. Answer with \
-             `fleet board msg chief <name> 'go'` when the plan is right, or say \
-             what to change. When a plan turns on a decision that is the user's to \
+             waits for your go-ahead — yours counts as the user's. Give it with \
+             `fleet board go <task>` when the plan is right, adding a message if \
+             there is more to say: until a task has one, its agent cannot change \
+             files. Anything short of a go, such as what to change first, is \
+             `fleet board msg`. When a plan turns on a decision that is the user's to \
              make — scope, a trade-off, anything that cannot be undone — ask the \
              user rather than deciding for them."
         ),
@@ -123,7 +125,8 @@ pub fn worker(name: &str, repo: &Path, task: Option<&Task>, body: Option<&str>) 
          Start by reading enough of the repository to say what you intend to \
          do. Say it here, and send the chief the short version with \
          `fleet board msg {} chief '...'`. Then wait for a go-ahead, from the \
-         chief or from me. Be brief.",
+         chief or from me: until there is one, fleet holds back your edits. \
+         Be brief.",
         task.key, task.key, task.key, name
     ));
 
@@ -430,7 +433,7 @@ mod tests {
     fn the_chief_knows_it_is_waited_on() {
         let b = chief(Path::new("/w"));
         assert!(b.role.contains("waits for your go-ahead"), "{}", b.role);
-        assert!(b.role.contains("fleet board msg chief <name> 'go'"), "{}", b.role);
+        assert!(b.role.contains("fleet board go <task>"), "{}", b.role);
         // And what is not its call.
         assert!(b.role.contains("ask the user"), "{}", b.role);
     }

@@ -240,6 +240,29 @@ enum BoardCmd {
         #[arg(long)]
         task: Option<String>,
     },
+    /// Give a worker the go-ahead on its task, and tell it. Until a task has
+    /// one, fleet's mod keeps its worker from editing.
+    Go {
+        task: String,
+        /// What to send with it.
+        #[arg(default_value = "go")]
+        summary: String,
+        #[arg(long)]
+        body: Option<String>,
+        /// Who gives it.
+        #[arg(long, default_value = "chief")]
+        from: String,
+    },
+    /// What fleet's mod asks before an edit: who this session is, its open
+    /// tasks, and whether one has a go-ahead. With --user-approves, the
+    /// person typed a prompt in this pane, which is a go-ahead. Always JSON.
+    #[command(hide = true)]
+    Gate {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        user_approves: bool,
+    },
     /// What fleet's Claude Code mod checks every few seconds: who this
     /// session is on the board, and, with --take, the messages waiting for
     /// it. Always JSON.
@@ -766,6 +789,26 @@ fn board(cmd: BoardCmd, path: Option<PathBuf>, fleet: Option<String>) -> Result<
             let id = db.log_message(&from, &to, task.as_deref(), &summary, body.as_deref())?;
             println!("{from} -> {to}: {summary}");
             println!("      {}", knock(&db, id, &from, &to, task.as_deref(), &summary, body.as_deref()));
+        }
+
+        BoardCmd::Go { task, summary, body, from } => {
+            let owner = db.approve(&task, &from)?;
+            println!("{task}: go from {from}");
+            match owner {
+                Some(to) => {
+                    let id = db.log_message(&from, &to, Some(&task), &summary, body.as_deref())?;
+                    println!("      {}", knock(&db, id, &from, &to, Some(&task), &summary, body.as_deref()));
+                }
+                // Approved ahead of time: whoever claims it may start at once.
+                None => {
+                    db.log_event("note", Some(&from), None, Some(&task), "go, before anyone claimed it", None, None)?;
+                    println!("      nobody has claimed it yet; whoever does may start at once");
+                }
+            }
+        }
+
+        BoardCmd::Gate { session, user_approves } => {
+            println!("{}", serde_json::to_string(&db.gate(&session, user_approves)?)?);
         }
 
         BoardCmd::Inbox { session, take } => {
