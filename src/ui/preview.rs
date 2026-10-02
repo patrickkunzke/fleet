@@ -27,7 +27,7 @@ use crate::ui::{App, crew};
 /// Build the fixture board. Every presence and every task state appears
 /// once, so a palette change shows up here rather than in production.
 fn seed(repo: &str) -> Result<Db> {
-    let db = Db::open_in_memory()?;
+    let mut db = Db::open_in_memory()?;
 
     db.upsert_epic("ENG-2553", "shared settings flag")?;
     db.upsert_epic("ENG-2610", "node 24")?;
@@ -65,6 +65,13 @@ fn seed(repo: &str) -> Result<Db> {
     db.transition("ENG-2610-1", State::Running, None)?;
     db.claim("ENG-2553-2", "billing-svc")?;
     db.transition("ENG-2553-2", State::Blocked, Some("waits on ENG-2553-1"))?;
+
+    // Their mods checking in, so the go-ahead is enforced: accounts-svc has
+    // its go, storefront has sent its plan and waits for one.
+    for session in ["s-set", "s-ren", "s-con"] {
+        db.check_inbox(session, false)?;
+    }
+    db.approve("ENG-2553-1", "chief")?;
 
     // Two agents talking is what the flow graph is for, and nothing else in
     // the fixture produces an edge between them.
@@ -115,7 +122,7 @@ fn dress(rows: &mut [crew::Row]) {
         let (presence, uptime) = match row.name.as_str() {
             "chief" => (Waiting, Some("2h14m")),
             "accounts-svc" => (Working, Some("41m")),
-            "storefront" => (Working, Some("18m")),
+            "storefront" => (Waiting, Some("18m")),
             "billing-svc" => (Waiting, Some("6m")),
             "admin" => (Gone, None),
             _ => (Unlinked, None),

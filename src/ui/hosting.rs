@@ -213,7 +213,11 @@ pub fn chief_label(tasks: &[Task]) -> String {
 }
 
 /// A worker's label: its task, and where that stands.
-pub fn worker_label(name: &str, tasks: &[Task]) -> String {
+pub fn worker_label(name: &str, tasks: &[Task], awaiting_go: Option<&str>) -> String {
+    // Said before anything else: nothing moves until someone answers it.
+    if let Some(key) = awaiting_go {
+        return clip(&format!("{key} · needs a go"), 72);
+    }
     // The one it is on, before one it has finished.
     let mine = tasks
         .iter()
@@ -235,6 +239,11 @@ pub fn worker_label(name: &str, tasks: &[Task]) -> String {
         _ => t.title.clone(),
     };
     clip(&format!("{} · {tail}", t.key), 72)
+}
+
+/// The notification for a worker that has stopped to wait for its go.
+pub fn go_notice(agent: &str, task: &str) -> (String, String) {
+    (format!("fleet · {agent} needs a go"), format!("{task}: its plan is in, and it cannot change files until the chief or you say go"))
 }
 
 /// A notification for a board event worth interrupting someone for.
@@ -297,24 +306,30 @@ mod tests {
     }
 
     #[test]
+    fn a_worker_waiting_for_its_go_says_so_first() {
+        let t = task("ENG-2553-2", State::Running, "billing-svc");
+        assert_eq!(worker_label("billing-svc", &[t], Some("ENG-2553-2")), "ENG-2553-2 · needs a go");
+    }
+
+    #[test]
     fn a_workers_label_says_what_it_is_on_and_where_that_stands() {
         let mut t = task("ENG-2553-2", State::Running, "billing-svc");
-        assert_eq!(worker_label("billing-svc", &[t.clone()]), "ENG-2553-2 · consume the parameter");
+        assert_eq!(worker_label("billing-svc", &[t.clone()], None), "ENG-2553-2 · consume the parameter");
         t.state = State::Blocked;
         t.blocked_on = Some("needs the flag".into());
-        assert_eq!(worker_label("billing-svc", &[t.clone()]), "ENG-2553-2 · blocked: needs the flag");
+        assert_eq!(worker_label("billing-svc", &[t.clone()], None), "ENG-2553-2 · blocked: needs the flag");
         t.state = State::Queued;
         t.waiting_on = vec!["ENG-2553-1".into()];
-        assert_eq!(worker_label("billing-svc", &[t]), "ENG-2553-2 · waits on ENG-2553-1");
+        assert_eq!(worker_label("billing-svc", &[t], None), "ENG-2553-2 · waits on ENG-2553-1");
     }
 
     #[test]
     fn a_finished_task_is_not_what_an_agent_is_on() {
         let done = task("ENG-1-1", State::Done, "x");
-        assert_eq!(worker_label("x", &[done.clone()]), "no task");
+        assert_eq!(worker_label("x", &[done.clone()], None), "no task");
         let next = task("ENG-1-2", State::Queued, "x");
-        assert_eq!(worker_label("x", &[done, next]), "ENG-1-2 · queued");
-        assert_eq!(worker_label("y", &[task("ENG-1-3", State::Running, "x")]), "no task", "only its own");
+        assert_eq!(worker_label("x", &[done, next], None), "ENG-1-2 · queued");
+        assert_eq!(worker_label("y", &[task("ENG-1-3", State::Running, "x")], None), "no task", "only its own");
     }
 
     #[test]

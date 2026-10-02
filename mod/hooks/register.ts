@@ -28,6 +28,8 @@ type Inbox = {
   agent: string | null
   text: string | null
   waiting: number
+  /** The task this worker cannot change files for until it has a go. */
+  awaiting_go?: string | null
 }
 
 /** What `fleet board gate` prints. */
@@ -124,11 +126,12 @@ export const register: Register = on => {
             () => { pending = false },
           )
         }
-        $.ui.status(
-          inbox.waiting > 0
-            ? `${inbox.waiting} ${inbox.waiting === 1 ? 'message' : 'messages'} waiting for this turn to end`
-            : undefined,
-        )
+        const parts: string[] = []
+        if (inbox.awaiting_go) parts.push(`waiting for a go on ${inbox.awaiting_go}`)
+        if (inbox.waiting > 0) {
+          parts.push(`${inbox.waiting} ${inbox.waiting === 1 ? 'message' : 'messages'} waiting for this turn to end`)
+        }
+        $.ui.status(parts.length ? parts.join(' · ') : undefined)
       } catch {
         // fleet not on PATH, a board locked past the timeout, output that is
         // not JSON: the next check tries again, and while none succeeds the

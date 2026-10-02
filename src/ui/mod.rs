@@ -82,6 +82,9 @@ pub struct App {
     /// read, which marks everything already on the board as seen: starting
     /// fleet must not replay yesterday's blockers as news.
     noticed: Option<std::collections::HashSet<String>>,
+    /// The workers already announced as waiting for their go, with the task.
+    /// None until the first read, for the same reason as `noticed`.
+    go_noticed: Option<std::collections::HashSet<(String, String)>>,
     rows: Vec<Row>,
     selected: usize,
     /// Where the graph was last drawn, so a click can be read against it.
@@ -135,6 +138,7 @@ impl App {
             jobs: None,
             labels: Vec::new(),
             noticed: None,
+            go_noticed: None,
             rows: Vec::new(),
             selected: 0,
             graph_at: Rect::ZERO,
@@ -280,7 +284,7 @@ impl App {
                 let pane = self.herdr_agent(r.target.as_deref())?.pane_id.clone();
                 let text = match r.role {
                     crew::Role::Chief => hosting::chief_label(&self.tasks),
-                    crew::Role::Worker => hosting::worker_label(&r.name, &self.tasks),
+                    crew::Role::Worker => hosting::worker_label(&r.name, &self.tasks, r.awaiting_go.as_deref()),
                 };
                 Some((pane, text))
             })
@@ -298,6 +302,35 @@ impl App {
                     if seen.insert(key)
                         && let Some((title, body)) = hosting::notice(e)
                     {
+                        let _ = jobs.send(hosting::Job::Notify { title, body });
+                    }
+                }
+            }
+        }
+
+        // A worker that has stopped to wait for its go, once per task: when
+        // it goes idle, since mid-turn it is still writing the plan, and not
+        // again for answering a question and going idle once more.
+        let awaiting: std::collections::HashSet<(String, String)> = self
+            .rows
+            .iter()
+            .filter_map(|r| Some((r.name.clone(), r.awaiting_go.clone()?)))
+            .collect();
+        let idle: Vec<(String, String)> = self
+            .rows
+            .iter()
+            .filter(|r| r.presence == crew::Presence::Waiting)
+            .filter_map(|r| Some((r.name.clone(), r.awaiting_go.clone()?)))
+            .collect();
+        match self.go_noticed.as_mut() {
+            None => self.go_noticed = Some(idle.into_iter().collect()),
+            Some(seen) => {
+                // Forget one that got its go or moved on, so a later wait
+                // is news again.
+                seen.retain(|k| awaiting.contains(k));
+                for (agent, task) in idle {
+                    if seen.insert((agent.clone(), task.clone())) {
+                        let (title, body) = hosting::go_notice(&agent, &task);
                         let _ = jobs.send(hosting::Job::Notify { title, body });
                     }
                 }
@@ -857,7 +890,14 @@ impl App {
     fn draw_top(&self, frame: &mut Frame, area: Rect) {
         let count = |p: crew::Presence| self.rows.iter().filter(|r| r.presence == p).count();
         let working = count(crew::Presence::Working);
-        let waiting = count(crew::Presence::Waiting);
+        // Idle and waiting for a go is its own count: answering it is the
+        // chief's or yours, and until then nothing in that repo changes.
+        let needs_go = self
+            .rows
+            .iter()
+            .filter(|r| r.presence == crew::Presence::Waiting && r.awaiting_go.is_some())
+            .count();
+        let waiting = count(crew::Presence::Waiting) - needs_go;
         let blocked = self
             .tasks
             .iter()
@@ -873,6 +913,9 @@ impl App {
         };
         if working > 0 {
             push(&mut right, format!("{working} working"), Style::default().fg(theme::BUSY));
+        }
+        if needs_go > 0 {
+            push(&mut right, format!("{needs_go} need{} a go", if needs_go == 1 { "s" } else { "" }), theme::accent());
         }
         if waiting > 0 {
             push(&mut right, format!("{waiting} waiting on you"), Style::default().fg(theme::OK));
@@ -1426,6 +1469,53 @@ mod tests {
         assert_eq!(notes(&rx), ["fleet · ENG-1-2 is blocked"]);
         app.refresh();
         assert!(notes(&rx).is_empty(), "and once");
+    }
+
+    #[test]
+    fn a_worker_waiting_for_its_go_is_shown_and_announced_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = hosted_app(dir.path());
+        let (tx, rx) = channel();
+        app.jobs = Some(tx);
+        app.db
+            .add_task(&db::NewTask { key: "ENG-1-1", title: "consume the parameter", repo: "/repo/content", ..Default::default() })
+            .unwrap();
+        app.db.claim("ENG-1-1", "billing-svc").unwrap();
+        app.db.upsert_agent("billing-svc", None, None, Some("sid-2"), None, None).unwrap();
+        // Its mod checking in is what says the go is enforced here.
+        app.db.check_inbox("sid-2", false).unwrap();
+        let notes = |rx: &Receiver<hosting::Job>| -> Vec<String> {
+            rx.try_iter()
+                .filter_map(|j| match j {
+                    hosting::Job::Notify { title, .. } => Some(title),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        app.herdr_agents = vec![herdr_agent("chief", "w1:p1", "idle"), herdr_agent("billing-svc", "w1:p2", "working")];
+        app.refresh();
+        assert!(drawn(&mut app, 120, 30).contains("● planning"), "mid-turn: reading, not changing");
+        assert!(notes(&rx).is_empty(), "still writing its plan");
+
+        app.herdr_agents[1].agent_status = "idle".into();
+        app.refresh();
+        let shown = drawn(&mut app, 120, 30);
+        assert!(shown.contains("◇ needs a go"), "{shown}");
+        assert!(shown.contains("1 needs a go"), "and the header counts it: {shown}");
+        assert_eq!(notes(&rx), ["fleet · billing-svc needs a go"]);
+
+        // It answers a question and goes idle again: not news twice.
+        app.herdr_agents[1].agent_status = "working".into();
+        app.refresh();
+        app.herdr_agents[1].agent_status = "idle".into();
+        app.refresh();
+        assert!(notes(&rx).is_empty());
+
+        app.db.approve("ENG-1-1", "chief").unwrap();
+        app.refresh();
+        let shown = drawn(&mut app, 120, 30);
+        assert!(!shown.contains("needs a go") && !shown.contains("planning"), "{shown}");
     }
 
     #[test]

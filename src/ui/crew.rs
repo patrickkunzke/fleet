@@ -48,6 +48,8 @@ pub struct Row {
     /// on you in the strongest sense, since nothing moves until it is
     /// answered. Only herdr can tell; the registry cannot.
     pub asking: bool,
+    /// The task it cannot start until the chief or the user gives it a go.
+    pub awaiting_go: Option<String>,
 }
 
 /// Join what the board knows to what is actually running.
@@ -103,6 +105,7 @@ pub fn merge(agents: &[db::Agent], sessions: &[registry::Session]) -> Vec<Row> {
             target: a.target.clone(),
             pid: live.map(|s| s.pid),
             asking: false,
+            awaiting_go: a.awaiting_go.clone(),
         });
     }
 
@@ -156,6 +159,7 @@ mod tests {
             task_key: task.map(str::to_string),
             task_title: task.map(|_| "consume the param".to_string()),
             bg_running: 0,
+            awaiting_go: None,
         }
     }
 
