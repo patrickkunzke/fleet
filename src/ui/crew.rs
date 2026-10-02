@@ -50,6 +50,9 @@ pub struct Row {
     pub asking: bool,
     /// The task it cannot start until the chief or the user gives it a go.
     pub awaiting_go: Option<String>,
+    /// The tool it is running and how full its context is, from its mod.
+    pub tool: Option<String>,
+    pub context: Option<i64>,
 }
 
 /// Join what the board knows to what is actually running.
@@ -106,6 +109,8 @@ pub fn merge(agents: &[db::Agent], sessions: &[registry::Session]) -> Vec<Row> {
             pid: live.map(|s| s.pid),
             asking: false,
             awaiting_go: a.awaiting_go.clone(),
+            tool: a.tool.clone(),
+            context: a.context,
         });
     }
 
@@ -160,6 +165,8 @@ mod tests {
             task_title: task.map(|_| "consume the param".to_string()),
             bg_running: 0,
             awaiting_go: None,
+            tool: None,
+            context: None,
         }
     }
 

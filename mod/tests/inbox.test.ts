@@ -14,8 +14,9 @@ function board(on: On, held: string[], awaiting_go: string | null = null) {
   return runs
 }
 
-function session(on: On) {
+function session(on: On, percent?: number) {
   on('session.id', () => ({ value: 'sid-1' }))
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200_000, percent }, rateLimits: [] } }))
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   const submitted: string[] = []
   on('prompt.submit', ($, e) => {
@@ -104,6 +105,26 @@ test('a worker held back from editing says what it waits for under its prompt', 
   held.push('[fleet · chief] what is the plan?')
   await clock.advance(3_000)
   expect(status.at(-1)).toBe('waiting for a go on ENG-1-1 · 1 message waiting for this turn to end')
+})
+
+test('the check-in says which tool is running and how full the context is', async ($, on) => {
+  mock.env(on, { FLEET_DB: '/tmp/fleet.db' })
+  const clock = mock.clock(on)
+  const runs = board(on, [])
+  session(on, 71.4)
+  // A tool that runs until the test lets it finish.
+  let finish = () => {}
+  on('tool.call', () => new Promise(resolve => { finish = () => resolve({ result: 'ok' }) }))
+
+  await $.session.start(start)
+  const call = $.tool.call({ tool: 'Bash', command: 'cargo test' })
+  await clock.advance(3_000)
+  expect(runs.at(-1)).toEqual(['fleet', 'board', 'inbox', '--session', 'sid-1', '--take', '--tool', 'Bash', '--context', '71'])
+
+  finish()
+  await call
+  await clock.advance(3_000)
+  expect(runs.at(-1)).toEqual(['fleet', 'board', 'inbox', '--session', 'sid-1', '--take', '--context', '71'])
 })
 
 test('a session fleet did not start leaves the board alone', async ($, on) => {

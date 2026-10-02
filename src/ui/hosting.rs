@@ -246,6 +246,16 @@ pub fn go_notice(agent: &str, task: &str) -> (String, String) {
     (format!("fleet · {agent} needs a go"), format!("{task}: its plan is in, and it cannot change files until the chief or you say go"))
 }
 
+/// The notification for an agent close to compacting.
+pub fn full_notice(agent: &str, percent: i64) -> (String, String) {
+    (
+        format!("fleet · {agent} is at {percent}% context"),
+        "it compacts soon, and keeps a summary of its brief rather than the brief: \
+         a fresh agent may be the better one to finish"
+            .into(),
+    )
+}
+
 /// A notification for a board event worth interrupting someone for.
 pub fn notice(e: &Event) -> Option<(String, String)> {
     if e.kind != "task" {

@@ -479,8 +479,8 @@ fn draw_chief(canvas: &mut Canvas, l: &Layout, chief: &Row, t: &Traffic, selecte
         inner,
         &format!("◆ {}", chief.name),
         theme::accent().add_modifier(Modifier::BOLD),
-        &chief.uptime.clone().unwrap_or_default(),
-        theme::faint(),
+        &corner(chief, room(inner, &format!("◆ {}", chief.name))),
+        corner_style(chief),
     );
     let (state, colour) = state_of(chief);
     let line = if t.chief_sent > 0 {
@@ -598,8 +598,8 @@ fn draw_card(canvas: &mut Canvas, l: &Layout, i: usize, w: &Row, selected: Optio
         inner,
         &format!("{glyph} {}", w.name),
         name_style,
-        &w.uptime.clone().unwrap_or_default(),
-        theme::faint(),
+        &corner(w, room(inner, &format!("{glyph} {}", w.name))),
+        corner_style(w),
     );
     let (state, colour) = state_of(w);
     let bg = if w.bg_running > 0 {
@@ -611,7 +611,7 @@ fn draw_card(canvas: &mut Canvas, l: &Layout, i: usize, w: &Row, selected: Optio
         x + 2,
         y + 2,
         inner,
-        state,
+        &state,
         Style::default().fg(colour),
         &bg,
         Style::default().fg(theme::BUSY),
@@ -794,27 +794,75 @@ fn draw_legend(canvas: &mut Canvas, l: &Layout) {
     canvas.text(0, l.legend_y, &parts.join("   "), l.width, theme::faint());
 }
 
-fn state_of(r: &Row) -> (&'static str, Color) {
+/// From here a context window is close enough to full to say so: the agent
+/// compacts soon after, and loses the detail of its brief.
+pub const CONTEXT_HIGH: i64 = 80;
+
+/// The top right of a card: how long it has been up, and how full its
+/// context is when its mod says, in the `room` left beside its name. The
+/// uptime gives way first: a long name still leaves the context showing.
+fn corner(r: &Row, room: usize) -> String {
+    let up = r.uptime.clone().unwrap_or_default();
+    let both = match r.context {
+        Some(c) if up.is_empty() => format!("{c}%"),
+        Some(c) => format!("{up} · {c}%"),
+        None => up.clone(),
+    };
+    match r.context {
+        Some(c) if both.chars().count() > room => format!("{c}%"),
+        _ => both,
+    }
+}
+
+/// What is left on a card's first line beside `left`, and the space that
+/// keeps them apart.
+fn room(inner: u16, left: &str) -> usize {
+    (inner as usize).saturating_sub(left.chars().count() + 1)
+}
+
+fn corner_style(r: &Row) -> Style {
+    if r.context.is_some_and(|c| c >= CONTEXT_HIGH) {
+        theme::accent()
+    } else {
+        theme::faint()
+    }
+}
+
+/// A tool's name as a card has room for: an MCP tool's own name without its
+/// server, `mcp__claude_ai_Slack__slack_send_message` as `slack_send_message`.
+fn tool_name(tool: &str) -> &str {
+    match tool.strip_prefix("mcp__") {
+        Some(rest) => rest.split_once("__").map_or(rest, |(_, name)| name),
+        None => tool,
+    }
+}
+
+fn state_of(r: &Row) -> (String, Color) {
     // Short, because a card is narrow and the line under it already says why.
     if r.asking {
-        return ("! needs you", theme::ACCENT);
+        return ("! needs you".into(), theme::ACCENT);
     }
     // Held back from editing until the chief or the user says go: idle, it
     // is waiting on that; mid-turn, it can read and plan but not change.
     if r.awaiting_go.is_some() {
         match r.presence {
-            Presence::Waiting => return ("◇ needs a go", theme::ACCENT),
-            Presence::Working => return ("● planning", theme::BUSY),
+            Presence::Waiting => return ("◇ needs a go".into(), theme::ACCENT),
+            Presence::Working => return ("● planning".into(), theme::BUSY),
             _ => {}
         }
     }
-    match (r.role, r.presence) {
-        (_, Presence::Working) => ("● working", theme::BUSY),
+    let (s, c) = match (r.role, r.presence) {
+        // What it is doing, when its mod says, says more than that it is.
+        (_, Presence::Working) => match r.tool.as_deref() {
+            Some(tool) => return (format!("● {}", tool_name(tool)), theme::BUSY),
+            None => ("● working", theme::BUSY),
+        },
         (Role::Chief, Presence::Waiting) => ("○ waiting on you", theme::OK),
         (_, Presence::Waiting) => ("○ waiting", theme::OK),
         (_, Presence::Gone) => ("× ended", theme::FAINT),
         (_, Presence::Unlinked) => ("· not started", theme::FAINT),
-    }
+    };
+    (s.into(), c)
 }
 
 fn glyph_of(p: Presence) -> (&'static str, Color) {
@@ -1002,6 +1050,8 @@ mod tests {
             pid: None,
             asking: false,
             awaiting_go: None,
+            tool: None,
+            context: None,
         }
     }
 
@@ -1034,6 +1084,37 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         (buf, text)
+    }
+
+    #[test]
+    fn a_card_says_which_tool_is_running_and_how_full_the_context_is() {
+        let mut busy = row("eng-2155", Role::Worker, Presence::Working);
+        busy.tool = Some("mcp__claude_ai_Slack__slack_send_message".into());
+        busy.context = Some(41);
+        let mut full = row("eng-2155-review", Role::Worker, Presence::Waiting);
+        full.context = Some(87);
+        let rows = vec![row("chief", Role::Chief, Presence::Waiting), busy, full];
+        let (buf, out) = drawn(&rows, &[], &[], 90, 20, None);
+        assert!(out.contains("● slack_send_message"), "the tool, without its server:\n{out}");
+        assert!(out.contains("12m · 41%"), "{out}");
+        assert!(out.contains("eng-2155-review  87%"), "a long name keeps the context and drops the uptime:\n{out}");
+
+        // Near full is said in the accent colour; the rest stays faint.
+        let colour_of = |needle: &str| {
+            let (y, line) = out.lines().enumerate().find(|(_, l)| l.contains(needle)).unwrap();
+            let x = line[..line.find(needle).unwrap()].chars().count() as u16;
+            buf[(x, y as u16)].fg
+        };
+        assert_eq!(colour_of("87%"), theme::ACCENT);
+        assert_eq!(colour_of("12m · 41%"), theme::FAINT);
+    }
+
+    #[test]
+    fn a_working_agent_without_a_mod_is_only_working() {
+        let rows = vec![row("chief", Role::Chief, Presence::Waiting), row("eng-2155", Role::Worker, Presence::Working)];
+        let (_, out) = drawn(&rows, &[], &[], 70, 20, None);
+        assert!(out.contains("● working"), "{out}");
+        assert!(!out.contains('%'), "{out}");
     }
 
     #[test]

@@ -85,6 +85,9 @@ pub struct App {
     /// The workers already announced as waiting for their go, with the task.
     /// None until the first read, for the same reason as `noticed`.
     go_noticed: Option<std::collections::HashSet<(String, String)>>,
+    /// The agents already announced as nearly out of context. One that
+    /// compacts and drops back under is forgotten, so the next climb is news.
+    full_noticed: Option<std::collections::HashSet<String>>,
     rows: Vec<Row>,
     selected: usize,
     /// Where the graph was last drawn, so a click can be read against it.
@@ -139,6 +142,7 @@ impl App {
             labels: Vec::new(),
             noticed: None,
             go_noticed: None,
+            full_noticed: None,
             rows: Vec::new(),
             selected: 0,
             graph_at: Rect::ZERO,
@@ -331,6 +335,27 @@ impl App {
                 for (agent, task) in idle {
                     if seen.insert((agent.clone(), task.clone())) {
                         let (title, body) = hosting::go_notice(&agent, &task);
+                        let _ = jobs.send(hosting::Job::Notify { title, body });
+                    }
+                }
+            }
+        }
+
+        // An agent nearly out of context compacts soon, and comes back with
+        // a summary of its brief rather than the brief: worth handing the
+        // rest of its task to a fresh one first.
+        let full: Vec<(String, i64)> = self
+            .rows
+            .iter()
+            .filter_map(|r| Some((r.name.clone(), r.context.filter(|c| *c >= graph::CONTEXT_HIGH)?)))
+            .collect();
+        match self.full_noticed.as_mut() {
+            None => self.full_noticed = Some(full.into_iter().map(|(n, _)| n).collect()),
+            Some(seen) => {
+                seen.retain(|n| full.iter().any(|(f, _)| f == n));
+                for (agent, percent) in full {
+                    if seen.insert(agent.clone()) {
+                        let (title, body) = hosting::full_notice(&agent, percent);
                         let _ = jobs.send(hosting::Job::Notify { title, body });
                     }
                 }
@@ -1483,7 +1508,7 @@ mod tests {
         app.db.claim("ENG-1-1", "billing-svc").unwrap();
         app.db.upsert_agent("billing-svc", None, None, Some("sid-2"), None, None).unwrap();
         // Its mod checking in is what says the go is enforced here.
-        app.db.check_inbox("sid-2", false).unwrap();
+        app.db.check_in("sid-2", false, &db::Vitals::default()).unwrap();
         let notes = |rx: &Receiver<hosting::Job>| -> Vec<String> {
             rx.try_iter()
                 .filter_map(|j| match j {
@@ -1516,6 +1541,37 @@ mod tests {
         app.refresh();
         let shown = drawn(&mut app, 120, 30);
         assert!(!shown.contains("needs a go") && !shown.contains("planning"), "{shown}");
+    }
+
+    #[test]
+    fn an_agent_nearly_out_of_context_is_announced_once_a_climb() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = hosted_app(dir.path());
+        let (tx, rx) = channel();
+        app.jobs = Some(tx);
+        app.db.upsert_agent("billing-svc", None, None, Some("sid-2"), None, None).unwrap();
+        let report = |app: &mut App, context: i64| {
+            app.db.check_in("sid-2", false, &db::Vitals { tool: None, context: Some(context) }).unwrap();
+            app.refresh();
+        };
+        let notes = |rx: &Receiver<hosting::Job>| -> Vec<String> {
+            rx.try_iter()
+                .filter_map(|j| match j {
+                    hosting::Job::Notify { title, .. } => Some(title),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        report(&mut app, 60);
+        assert!(notes(&rx).is_empty());
+        report(&mut app, 82);
+        assert_eq!(notes(&rx), ["fleet · billing-svc is at 82% context"]);
+        report(&mut app, 88);
+        assert!(notes(&rx).is_empty(), "once a climb");
+        report(&mut app, 20);
+        report(&mut app, 81);
+        assert_eq!(notes(&rx), ["fleet · billing-svc is at 81% context"], "compacted, then full again");
     }
 
     #[test]
