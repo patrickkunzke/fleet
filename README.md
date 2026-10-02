@@ -93,7 +93,34 @@ To run `fleet` from your own shell as well:
 ln -s "$(ls -d ~/.config/herdr/plugins/github/fleet-* | head -1)/target/release/fleet" ~/.local/bin/fleet
 ```
 
-Reinstalling the plugin can move that directory; run it again after one.
+herdr keeps the plugin in the same directory across updates, so the link
+keeps working.
+
+### Updating
+
+herdr has no update command of its own, so fleet has one:
+
+```bash
+fleet update --check   # the installed version and the newest release
+fleet update           # install the newest release
+```
+
+It installs again through herdr at the newest release tag (`vX.Y.Z`), so
+herdr shows what it is about to run, as on the first install. herdr builds
+the new version beside the old one and swaps it in only when the build
+passes: a failed update leaves the fleet you had. For a checkout linked with
+`herdr plugin link`, it pulls `main` and builds instead, and stops if the
+checkout is on another branch or has uncommitted changes.
+
+Without `fleet` on your PATH, the same thing by hand:
+
+```bash
+herdr plugin install patrickkunzke/fleet
+```
+
+After an update, a fleet view that is already open still runs the old
+version: press `q` in it, then `prefix+f`. The agents use the new `fleet` from
+their next command. The doctor action says when a newer release is out.
 
 ## Quick start
 
@@ -286,6 +313,16 @@ cargo test
 
 `herdr plugin link` does not build; rebuild after a change, then reopen the
 view with `q` and `prefix+f`. The agents keep running across both.
+
+To release, bump `version` in both `Cargo.toml` and `herdr-plugin.toml` (a
+test checks that they match), then tag the commit and push the tag:
+
+```bash
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+`fleet update` only moves to a `vX.Y.Z` tag, so a push to `main` without a
+tag reaches only someone who installs again by hand.
 
 For layout work there is a fixture fleet that needs neither herdr nor a real
 board:

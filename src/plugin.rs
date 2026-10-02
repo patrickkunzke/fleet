@@ -415,6 +415,11 @@ pub fn doctor() -> Result<()> {
         },
     );
 
+    // Not a problem to fix: a check of what is out.
+    if let Some((installed, newest)) = crate::update::newer() {
+        println!("note {:<18} fleet {newest} is out, and this is {installed}: run `fleet update`", "update");
+    }
+
     println!(
         "\nTo open fleet with a key, and a new workspace in fleet mode with another, add to {}:\n\n  [[keys.command]]\n  key = \"prefix+f\"\n  type = \"plugin_action\"\n  command = \"fleet.open\"\n  description = \"fleet\"\n\n  [[keys.command]]\n  key = \"prefix+shift+f\"\n  type = \"plugin_action\"\n  command = \"fleet.new\"\n  description = \"new workspace in fleet mode\"",
         herdr::config_path().display()

@@ -473,18 +473,18 @@ pub fn toast_delivery() -> String {
         .unwrap_or_else(|| "off".into())
 }
 
-struct Output {
-    success: bool,
-    stdout: String,
-    stderr: String,
-    timed_out: bool,
+pub(crate) struct Output {
+    pub success: bool,
+    pub stdout: String,
+    pub stderr: String,
+    pub timed_out: bool,
 }
 
 /// Run to completion or the deadline, whichever is first. The pipes are read
 /// on their own threads so a full one cannot deadlock against the wait.
-fn run(mut cmd: Command, timeout: Duration) -> Result<Output> {
+pub(crate) fn run(mut cmd: Command, timeout: Duration) -> Result<Output> {
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd.spawn().context("could not run herdr")?;
+    let mut child = cmd.spawn().with_context(|| format!("could not run {}", cmd.get_program().to_string_lossy()))?;
     let read = |pipe: Option<Box<dyn Read + Send>>| {
         std::thread::spawn(move || {
             let mut text = String::new();
