@@ -1,6 +1,7 @@
 fleet includes code adapted from herdr-projects
 (https://github.com/eliasstravik/herdr-projects): the herdr CLI client in
-src/herdr.rs, from its src/herdr.rs and src/runner.rs.
+src/herdr.rs, from its src/herdr.rs and src/runner.rs, and `fleet update` in
+src/update.rs, from its src/update.rs.
 
 MIT License
 

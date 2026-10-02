@@ -93,7 +93,34 @@ To run `fleet` from your own shell as well:
 ln -s "$(ls -d ~/.config/herdr/plugins/github/fleet-* | head -1)/target/release/fleet" ~/.local/bin/fleet
 ```
 
-Reinstalling the plugin can move that directory; run it again after one.
+herdr keeps the plugin in the same directory across updates, so the link
+keeps working.
+
+### Updating
+
+herdr has no update command of its own, so fleet has one:
+
+```bash
+fleet update --check   # the installed version and the newest release
+fleet update           # install the newest release
+```
+
+It installs again through herdr at the newest release tag (`vX.Y.Z`), so
+herdr shows what it is about to run, as on the first install. herdr builds
+the new version beside the old one and swaps it in only when the build
+passes: a failed update leaves the fleet you had. For a checkout linked with
+`herdr plugin link`, it pulls `main` and builds instead, and stops if the
+checkout is on another branch or has uncommitted changes.
+
+Without `fleet` on your PATH, the same thing by hand:
+
+```bash
+herdr plugin install patrickkunzke/fleet
+```
+
+After an update, a fleet view that is already open still runs the old
+version: press `q` in it, then `prefix+f`. The agents use the new `fleet` from
+their next command. The doctor action says when a newer release is out.
 
 ## Quick start
 
@@ -286,6 +313,32 @@ cargo test
 
 `herdr plugin link` does not build; rebuild after a change, then reopen the
 view with `q` and `prefix+f`. The agents keep running across both.
+
+### Pull requests and commits
+
+Every change reaches `main` through a pull request, merged with a merge
+commit; nothing is pushed to `main` directly. Each commit in a pull request is
+a [conventional commit](https://www.conventionalcommits.org) — `feat: …`,
+`fix(board): …`, `docs: …` — and CI checks that they are
+(`sh scripts/check-commits.sh origin/main` does the same locally).
+
+### Releases
+
+Merging is releasing. When a pull request is merged, the release job reads
+the commits since the last `vX.Y.Z` tag and picks the version:
+
+| Commits | Release |
+|---|---|
+| `feat!: …`, `fix!: …`, or a `BREAKING CHANGE:` footer | major (minor before 1.0) |
+| `feat: …` | minor |
+| `fix: …`, `perf: …` | patch |
+| only `docs`, `ci`, `chore`, `refactor`, `test`, … | none |
+
+It raises the version in `Cargo.toml`, `Cargo.lock` and `herdr-plugin.toml`,
+adds the release's section to [CHANGELOG.md](CHANGELOG.md) from the commits
+([git-cliff](https://git-cliff.org), `cliff.toml`), commits that as
+`chore(release): vX.Y.Z`, tags it, and publishes the GitHub Release.
+`fleet update` moves users to it.
 
 For layout work there is a fixture fleet that needs neither herdr nor a real
 board:

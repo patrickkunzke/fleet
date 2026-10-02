@@ -12,6 +12,7 @@ mod plugin;
 mod registry;
 mod scope;
 mod ui;
+mod update;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -100,6 +101,16 @@ enum Command {
     },
     /// Every fleet there is, and the directory each one covers.
     Fleets,
+    /// Install the newest release of fleet. herdr has no update command;
+    /// this installs again, at the newest release, through herdr.
+    Update {
+        /// Only say which version is installed and which is the newest.
+        #[arg(long)]
+        check: bool,
+        /// Skip herdr's look at what it is about to run.
+        #[arg(long, short)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -358,6 +369,7 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Update { check, yes } => update::update(check, yes),
         Command::Spawn {
             name,
             repo,
