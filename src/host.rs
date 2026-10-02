@@ -125,6 +125,56 @@ impl Host {
         self.herdr.agent_focus(name)?;
         Ok(())
     }
+
+    /// Close the terminal of the agent at `target`, which has been retired:
+    /// its tab, or only its pane when the tab holds something else of the
+    /// crew's. Says what it did, or why it left the terminal open.
+    pub fn close(&self, target: &str) -> Result<String> {
+        let name = herdr_name(target).context("not a herdr agent")?;
+        let Some(agent) = self.herdr.agent(name) else {
+            return Ok("nothing was running in its tab".into());
+        };
+        let own = std::env::var("HERDR_PANE_ID").ok();
+        let panes = self.herdr.panes(&agent.workspace_id).unwrap_or_default();
+        let agents = self.herdr.agents().unwrap_or_default();
+        let shared = agents.iter().any(|a| a.tab_id == agent.tab_id && a.pane_id != agent.pane_id)
+            || panes.iter().any(|p| p.tab_id == agent.tab_id && p.label == crate::plugin::TAB);
+        Ok(match closing(&agent.pane_id, &agent.agent_status, own.as_deref(), shared) {
+            Closing::Tab => {
+                self.herdr.tab_close(&agent.tab_id)?;
+                "closed its tab".into()
+            }
+            Closing::Pane => {
+                self.herdr.pane_close(&agent.pane_id)?;
+                "closed its pane; the rest of the tab is still in use".into()
+            }
+            Closing::Leave(why) => format!("its tab is left open: {why}"),
+        })
+    }
+}
+
+/// What to close of a retired agent's terminal.
+#[derive(Debug, PartialEq)]
+enum Closing {
+    Tab,
+    /// The tab holds another agent, or the fleet view: the chief's does.
+    Pane,
+    Leave(&'static str),
+}
+
+fn closing(pane: &str, status: &str, own_pane: Option<&str>, shared: bool) -> Closing {
+    if own_pane == Some(pane) {
+        // An agent retiring itself would end the command doing it.
+        Closing::Leave("it is the session retiring it")
+    } else if status == "working" {
+        // Mid-turn, with whatever it is doing half done. Its conversation
+        // would survive, its edit in progress might not.
+        Closing::Leave("it is still working; close it when it stops")
+    } else if shared {
+        Closing::Pane
+    } else {
+        Closing::Tab
+    }
 }
 
 impl Host {
@@ -273,6 +323,24 @@ pub fn herdr_safe(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_retired_agent_takes_its_tab_with_it() {
+        assert_eq!(closing("p2", "idle", Some("p1"), false), Closing::Tab);
+        assert_eq!(closing("p2", "done", None, false), Closing::Tab);
+        assert_eq!(closing("p2", "blocked", Some("p1"), false), Closing::Tab);
+    }
+
+    #[test]
+    fn a_tab_the_crew_shares_loses_only_the_agents_pane() {
+        assert_eq!(closing("p2", "idle", Some("p1"), true), Closing::Pane);
+    }
+
+    #[test]
+    fn a_working_agent_and_the_one_retiring_are_left_open() {
+        assert!(matches!(closing("p2", "working", Some("p1"), false), Closing::Leave(_)));
+        assert!(matches!(closing("p1", "idle", Some("p1"), false), Closing::Leave(_)));
+    }
 
     #[test]
     fn a_target_says_which_host_holds_it() {

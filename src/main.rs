@@ -195,8 +195,16 @@ enum BoardCmd {
     },
     /// Live agents and what each holds.
     Agents,
-    /// Mark an agent ended.
-    Retire { name: String },
+    /// Take an agent off the board, and close its herdr tab.
+    ///
+    /// Only its pane, when the tab holds the fleet view or another agent.
+    /// A working agent's tab is left open, as is the one retiring it.
+    Retire {
+        name: String,
+        /// Leave its tab open.
+        #[arg(long)]
+        keep_tab: bool,
+    },
     /// Assign a task.
     Claim { task: String, agent: String },
     /// Pick a task up.
@@ -656,9 +664,23 @@ fn board(cmd: BoardCmd, path: Option<PathBuf>, fleet: Option<String>) -> Result<
             }
         }
 
-        BoardCmd::Retire { name } => {
+        BoardCmd::Retire { name, keep_tab } => {
+            // Before the row is ended: an ended agent is off the list.
+            let target = db.agents()?.into_iter().find(|a| a.name == name).and_then(|a| a.target);
             db.retire_agent(&name)?;
-            println!("retired {name}");
+            // Its tab is going, so a resumed run must not bring it back.
+            if let Some(run) = std::env::var("FLEET_RUN").ok().and_then(|v| v.parse::<i64>().ok()) {
+                db.retire_in_run(run, &name)?;
+            }
+            let tab = match (keep_tab, target.as_deref()) {
+                (true, _) => "its tab is left open".to_string(),
+                (false, Some(t)) if host::is_herdr(t) => match Host::from_env() {
+                    Some(host) => host.close(t).unwrap_or_else(|e| format!("its tab could not be closed: {e}")),
+                    None => "its tab is left open: this is not herdr".into(),
+                },
+                (false, _) => "it had no herdr tab".into(),
+            };
+            println!("retired {name}; {tab}");
         }
 
         BoardCmd::Claim { task, agent } => {

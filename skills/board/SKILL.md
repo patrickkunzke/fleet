@@ -142,6 +142,17 @@ done ENG-2553-1
 unblocked: ENG-2553-2
 ```
 
+When an agent's work is finished and nothing more is coming its way, retire
+it. That takes it off the board, keeps it out of a resumed run, and closes
+its herdr tab:
+
+```bash
+fleet board retire accounts-svc
+```
+
+A working agent's tab is left open, so do it once the agent has stopped.
+`--keep-tab` retires it and leaves the tab for the user to look through.
+
 ## As a worker
 
 You were handed a task key — in your opening brief if the chief dispatched you

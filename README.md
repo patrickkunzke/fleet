@@ -200,6 +200,11 @@ dispatched twice:
 fleet spawn billing-svc --repo ~/Code/acme/service/billing-service --task ENG-2553-2
 ```
 
+When an agent is finished with, the chief retires it with `fleet board retire
+billing-svc`, which takes it off the board and closes its tab. A working
+agent's tab is left open, and `--keep-tab` leaves it either way. `x` in the
+fleet view only takes an agent off the board.
+
 Each agent is briefed in two halves. Who it is goes into the system prompt,
 with `--append-system-prompt`, where it outranks whatever a hook injects later
 and survives compaction. What to do now is its first turn: the task, its
