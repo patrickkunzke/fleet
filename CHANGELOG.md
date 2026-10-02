@@ -4,6 +4,12 @@ Every release of fleet. Each section is written when a pull request with a
 `feat`, `fix` or `perf` commit is merged; see
 [Releases](README.md#releases).
 
+## [0.2.0](https://github.com/patrickkunzke/fleet/releases/tag/v0.2.0) — 2026-10-02
+
+### Features
+
+- Update fleet to its newest release with `fleet update`
+
 ## [0.1.0](https://github.com/patrickkunzke/fleet/releases/tag/v0.1.0) — 2026-10-01
 
 The first release: fleet as a herdr plugin anyone can install.
