@@ -272,6 +272,12 @@ enum BoardCmd {
         session: String,
         #[arg(long)]
         take: bool,
+        /// The tool the session is running now.
+        #[arg(long)]
+        tool: Option<String>,
+        /// How full its context window is, in percent.
+        #[arg(long)]
+        context: Option<i64>,
     },
     /// Log something that is not a message.
     Note {
@@ -806,8 +812,8 @@ fn board(cmd: BoardCmd, path: Option<PathBuf>, fleet: Option<String>) -> Result<
             println!("{}", serde_json::to_string(&db.gate(&session, user_approves)?)?);
         }
 
-        BoardCmd::Inbox { session, take } => {
-            let inbox = db.check_inbox(&session, take)?;
+        BoardCmd::Inbox { session, take, tool, context } => {
+            let inbox = db.check_in(&session, take, &db::Vitals { tool, context })?;
             let text = (!inbox.messages.is_empty()).then(|| msg::prompt(&inbox.messages));
             // The mod says this under the prompt, so the agent's own tab
             // shows what it is waiting for as well as the fleet view.

@@ -30,7 +30,8 @@ context small, and something has to keep track of what waits on what.
   whole; without mods (Claude Code before v2.1.287, or mods turned off) it is
   typed into the agent's pane instead.
 - **A live graph** of the crew: lines weighted by traffic, coloured by state,
-  messages drawn in flight. `↵` or a click goes to an agent's tab.
+  messages drawn in flight, and on each card the tool the agent is running
+  and how full its context is. `↵` or a click goes to an agent's tab.
 - **herdr's sidebar and notifications** carry each agent's task, the board at
   a glance on the chief, and a notice when a task is blocked, in review or
   done.
@@ -225,6 +226,15 @@ writing its plan), the header counts it, its herdr sidebar label says
 wait. In the worker's own tab, the line under its prompt says `waiting for a
 go on ENG-2553-2`. A task that is blocked, or waits on another, is waiting on
 that instead, and is not shown as needing a go.
+
+The mod also reports what its session is doing each time it checks in. A
+working agent's card names the tool it is running (`● Bash`, an MCP tool by
+its own name without the server's), and the top right gives how full its
+context window is beside its uptime, `41m · 63%`, with the uptime dropped
+when a long name leaves no room. From 80% the figure turns to the accent
+colour and herdr notifies you once: an agent that compacts keeps a summary
+of its brief rather than the brief, and a fresh agent may be the better one
+to finish its task. An agent without the mod shows only `● working`.
 
 It delegates with `fleet spawn`, which opens a tab in the repository, briefs
 the agent, and claims the task on the board in the same step, so it cannot be

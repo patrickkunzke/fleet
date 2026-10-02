@@ -68,8 +68,11 @@ fn seed(repo: &str) -> Result<Db> {
 
     // Their mods checking in, so the go-ahead is enforced: accounts-svc has
     // its go, storefront has sent its plan and waits for one.
-    for session in ["s-set", "s-ren", "s-con"] {
-        db.check_inbox(session, false)?;
+    // What their mods report: a tool running, and how full each context is,
+    // one of them close enough to compacting to be said in the accent.
+    for (session, tool, context) in [("s-set", Some("Bash"), 41), ("s-ren", None, 84), ("s-con", None, 23)] {
+        let vitals = crate::db::Vitals { tool: tool.map(str::to_string), context: Some(context) };
+        db.check_in(session, false, &vitals)?;
     }
     db.approve("ENG-2553-1", "chief")?;
 

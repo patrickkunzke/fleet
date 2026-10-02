@@ -303,6 +303,8 @@ mod tests {
                 pid: None,
                 asking: false,
                 awaiting_go: None,
+                tool: None,
+                context: None,
             })
             .collect()
     }

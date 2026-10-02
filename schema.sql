@@ -223,6 +223,15 @@ CREATE TABLE IF NOT EXISTS inbox (
 
 CREATE INDEX IF NOT EXISTS idx_inbox_agent ON inbox(agent, event_id);
 
+-- What the mod saw at its last check-in: the tool the session was running,
+-- and how full its context window was. The graph shows both while the
+-- mailbox is fresh; a stale row means nothing.
+CREATE TABLE IF NOT EXISTS vitals (
+  agent      TEXT PRIMARY KEY,              -- agents.name
+  tool       TEXT,                          -- NULL between tool calls
+  context    INTEGER                        -- percent, NULL before the first answer
+);
+
 
 -- ------------------------------------------------------------ approvals ---
 -- A worker's go-ahead on a task. fleet's mod in the worker's session holds

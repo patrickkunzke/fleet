@@ -119,6 +119,10 @@ pub struct Agent {
     /// is there to enforce that. Without the mod nothing records the user's
     /// go, so nothing is said.
     pub awaiting_go: Option<String>,
+    /// The tool it is running, and how full its context window is, as its
+    /// mod last said. None without a mod checking in.
+    pub tool: Option<String>,
+    pub context: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -285,6 +289,8 @@ impl Db {
                     task_title: r.get(7)?,
                     bg_running: r.get(8)?,
                     awaiting_go: None,
+                    tool: None,
+                    context: None,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -295,6 +301,26 @@ impl Db {
                 a.awaiting_go = Some(task);
             }
         }
+        for (agent, tool, context) in self.vitals()? {
+            if let Some(a) = rows.iter_mut().find(|a| a.name == agent) {
+                a.tool = tool;
+                a.context = context;
+            }
+        }
+        Ok(rows)
+    }
+
+    /// What each agent's mod last reported, for the mods still checking in:
+    /// the agent, its tool and its context.
+    fn vitals(&self) -> Result<Vec<Reported>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT v.agent, v.tool, v.context FROM vitals v
+             JOIN mailboxes m ON m.agent = v.agent
+             WHERE m.polled_at >= CAST(strftime('%s', 'now') AS INTEGER) - ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![MAILBOX_QUIET], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
@@ -844,6 +870,16 @@ impl Db {
     }
 }
 
+/// An agent, the tool it is running and how full its context is.
+type Reported = (String, Option<String>, Option<i64>);
+
+/// What a session's mod says about it when it checks in.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Vitals {
+    pub tool: Option<String>,
+    pub context: Option<i64>,
+}
+
 /// What a session's mod is told when it checks its mailbox.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Inbox {
@@ -970,7 +1006,9 @@ impl Db {
     ///
     /// One transaction, so two checks at the same instant cannot both take
     /// the same message.
-    pub fn check_inbox(&mut self, session_id: &str, take: bool) -> Result<Inbox> {
+    ///
+    /// `vitals` is what the session is doing, for the fleet view.
+    pub fn check_in(&mut self, session_id: &str, take: bool, vitals: &Vitals) -> Result<Inbox> {
         let tx = self.conn.transaction()?;
         let agent: Option<String> = tx
             .query_row(
@@ -988,6 +1026,11 @@ impl Db {
              ON CONFLICT (agent) DO UPDATE
                SET session_id = excluded.session_id, polled_at = excluded.polled_at",
             params![agent, session_id],
+        )?;
+        tx.execute(
+            "INSERT INTO vitals (agent, tool, context) VALUES (?1, ?2, ?3)
+             ON CONFLICT (agent) DO UPDATE SET tool = excluded.tool, context = excluded.context",
+            params![agent, vitals.tool, vitals.context],
         )?;
         let mut messages = Vec::new();
         if take {
@@ -1835,7 +1878,7 @@ mod tests {
         // An agent's session is linked a few seconds after it starts; until
         // then its mod checks in as nobody, and nothing may be handed to it.
         let mut db = Db::open_in_memory().unwrap();
-        assert_eq!(db.check_inbox("sid-unknown", true).unwrap(), Inbox::default());
+        assert_eq!(db.check_in("sid-unknown", true, &Vitals::default()).unwrap(), Inbox::default());
     }
 
     #[test]
@@ -1844,7 +1887,7 @@ mod tests {
         db.upsert_agent("accounts-svc", None, Some("/r"), Some("sid-1"), None, None).unwrap();
         assert!(!db.mailbox_open("accounts-svc", 15).unwrap(), "never checked in");
 
-        let first = db.check_inbox("sid-1", false).unwrap();
+        let first = db.check_in("sid-1", false, &Vitals::default()).unwrap();
         assert_eq!(first.agent.as_deref(), Some("accounts-svc"));
         assert!(db.mailbox_open("accounts-svc", 15).unwrap());
 
@@ -1854,15 +1897,15 @@ mod tests {
         db.queue_message(b, "accounts-svc").unwrap();
 
         // Busy: it checks in without taking, and learns how many wait.
-        let busy = db.check_inbox("sid-1", false).unwrap();
+        let busy = db.check_in("sid-1", false, &Vitals::default()).unwrap();
         assert!(busy.messages.is_empty());
         assert_eq!(busy.waiting, 2);
 
-        let idle = db.check_inbox("sid-1", true).unwrap();
+        let idle = db.check_in("sid-1", true, &Vitals::default()).unwrap();
         let summaries: Vec<_> = idle.messages.iter().map(|m| m.summary.as_str()).collect();
         assert_eq!(summaries, ["go", "column is in"], "oldest first");
         assert_eq!(idle.waiting, 0);
-        assert!(db.check_inbox("sid-1", true).unwrap().messages.is_empty(), "taken once");
+        assert!(db.check_in("sid-1", true, &Vitals::default()).unwrap().messages.is_empty(), "taken once");
         assert_eq!(db.events(10).unwrap().iter().filter(|e| e.kind == "message").count(), 2, "the record stays");
     }
 
@@ -1870,7 +1913,7 @@ mod tests {
     fn a_mailbox_that_went_quiet_is_closed() {
         let mut db = Db::open_in_memory().unwrap();
         db.upsert_agent("accounts-svc", None, Some("/r"), Some("sid-1"), None, None).unwrap();
-        db.check_inbox("sid-1", false).unwrap();
+        db.check_in("sid-1", false, &Vitals::default()).unwrap();
         db.conn.execute("UPDATE mailboxes SET polled_at = polled_at - 60", []).unwrap();
         assert!(!db.mailbox_open("accounts-svc", 15).unwrap());
     }
@@ -1880,7 +1923,7 @@ mod tests {
         let mut db = Db::open_in_memory().unwrap();
         db.upsert_agent("accounts-svc", None, Some("/r"), Some("sid-1"), None, None).unwrap();
         db.conn.execute("UPDATE agents SET ended_at = 'now'", []).unwrap();
-        assert_eq!(db.check_inbox("sid-1", true).unwrap().agent, None);
+        assert_eq!(db.check_in("sid-1", true, &Vitals::default()).unwrap().agent, None);
     }
 
     fn assigned(db: &Db) {
@@ -1943,7 +1986,7 @@ mod tests {
         };
         assert_eq!(awaiting(&db), None, "no mod checking in: nothing holds it, so nothing is said");
 
-        db.check_inbox("sid-1", false).unwrap();
+        db.check_in("sid-1", false, &Vitals::default()).unwrap();
         assert_eq!(awaiting(&db).as_deref(), Some("ENG-1-1"));
 
         db.transition("ENG-1-1", State::Blocked, Some("needs the flag")).unwrap();
@@ -1953,5 +1996,25 @@ mod tests {
 
         db.approve("ENG-1-1", "chief").unwrap();
         assert_eq!(awaiting(&db), None);
+    }
+
+    #[test]
+    fn what_a_mod_reports_is_shown_while_it_keeps_checking_in() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.upsert_agent("accounts-svc", None, Some("/r"), Some("sid-1"), None, None).unwrap();
+        let vitals = |db: &Db| {
+            let a = db.agents().unwrap().into_iter().find(|a| a.name == "accounts-svc").unwrap();
+            (a.tool, a.context)
+        };
+        assert_eq!(vitals(&db), (None, None));
+
+        db.check_in("sid-1", false, &Vitals { tool: Some("Bash".into()), context: Some(71) }).unwrap();
+        assert_eq!(vitals(&db), (Some("Bash".into()), Some(71)));
+
+        db.check_in("sid-1", false, &Vitals { tool: None, context: Some(72) }).unwrap();
+        assert_eq!(vitals(&db), (None, Some(72)), "between tools");
+
+        db.conn.execute("UPDATE mailboxes SET polled_at = polled_at - 60", []).unwrap();
+        assert_eq!(vitals(&db), (None, None), "a mod gone quiet says nothing");
     }
 }

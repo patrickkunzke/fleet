@@ -99,6 +99,10 @@ export const register: Register = on => {
   let pending = false
   // A check is still running. The timer does not wait for one to finish.
   let checking = false
+  // The main loop's tools running now, newest last: what the fleet view
+  // shows the agent doing. Several run at once when Claude calls them in
+  // parallel.
+  const running: string[] = []
 
   on('session.start', async ($, e, next) => {
     // Only a session fleet started has a board. The plugin is handed to no
@@ -114,6 +118,14 @@ export const register: Register = on => {
         const take = !busy && !pending
         const argv = ['fleet', 'board', 'inbox', '--session', id]
         if (take) argv.push('--take')
+        const tool = running.at(-1)
+        if (tool) argv.push('--tool', tool)
+        try {
+          const { context } = await $.session.usage()
+          if (context.percent !== undefined) argv.push('--context', String(Math.round(context.percent)))
+        } catch {
+          // No reading yet, before the first answer: nothing to say.
+        }
         const out = await $.process.run(argv, { timeoutMs: 10_000 })
         if (out.exitCode !== 0) return
         const inbox = JSON.parse(out.stdout) as Inbox
@@ -164,35 +176,43 @@ export const register: Register = on => {
   })
 
   on('tool.call', async ($, e, next) => {
-    const edit = EDITS.has(e.tool)
-    const command = e.tool === 'Bash' && typeof e.command === 'string' ? e.command : undefined
-    if (!session || (!edit && command === undefined)) return next(e)
-    if (command !== undefined && !writes(command) && !SELF_APPROVAL.test(command)) return next(e)
+    // The main loop's tool, not a subagent's: those run under the main
+    // loop's Agent call, which is what the fleet view says it is doing.
+    const main = session !== undefined && e.agentId === undefined
+    if (main) running.push(e.tool)
+    try {
+      const edit = EDITS.has(e.tool)
+      const command = e.tool === 'Bash' && typeof e.command === 'string' ? e.command : undefined
+      if (!session || (!edit && command === undefined)) return await next(e)
+      if (command !== undefined && !writes(command) && !SELF_APPROVAL.test(command)) return await next(e)
 
-    const g = await gate($, session)
-    if (!g?.agent) return next(e)
+      const g = await gate($, session)
+      if (!g?.agent) return await next(e)
 
-    if (g.role === 'chief') {
-      if (edit || (command !== undefined && writes(command))) {
-        return {
-          deny:
-            'fleet: the chief of staff does not change files, through Bash either. ' +
-            'Put the work on the board and give it to the agent for that repository.',
+      if (g.role === 'chief') {
+        if (edit || (command !== undefined && writes(command))) {
+          return {
+            deny:
+              'fleet: the chief of staff does not change files, through Bash either. ' +
+              'Put the work on the board and give it to the agent for that repository.',
+          }
         }
+        return await next(e)
       }
-      return next(e)
-    }
 
-    if (command !== undefined && SELF_APPROVAL.test(command)) {
-      return { deny: `fleet: a go-ahead comes from the chief or the user, not from ${g.agent}.` }
-    }
-    if (g.approved) return next(e)
-    const task = g.tasks.join(', ')
-    return {
-      deny:
-        `fleet: ${task} has no go-ahead yet, so ${g.agent} does not change files. ` +
-        `Send the chief your plan with \`fleet board msg ${g.agent} chief '...'\` and wait for its go, ` +
-        'or for the user to answer you here.',
+      if (command !== undefined && SELF_APPROVAL.test(command)) {
+        return { deny: `fleet: a go-ahead comes from the chief or the user, not from ${g.agent}.` }
+      }
+      if (g.approved) return await next(e)
+      const task = g.tasks.join(', ')
+      return {
+        deny:
+          `fleet: ${task} has no go-ahead yet, so ${g.agent} does not change files. ` +
+          `Send the chief your plan with \`fleet board msg ${g.agent} chief '...'\` and wait for its go, ` +
+          'or for the user to answer you here.',
+      }
+    } finally {
+      if (main) running.splice(running.lastIndexOf(e.tool), 1)
     }
   })
 
