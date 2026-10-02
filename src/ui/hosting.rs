@@ -250,9 +250,10 @@ pub fn go_notice(agent: &str, task: &str) -> (String, String) {
 pub fn full_notice(agent: &str, percent: i64) -> (String, String) {
     (
         format!("fleet · {agent} is at {percent}% context"),
-        "it compacts soon, and keeps a summary of its brief rather than the brief: \
-         a fresh agent may be the better one to finish"
-            .into(),
+        format!(
+            "it compacts soon, and keeps a summary of its brief rather than the brief: \
+             `fleet handoff {agent}` gives its task to a fresh session"
+        ),
     )
 }
 

@@ -64,9 +64,11 @@ pub fn prompt(messages: &[crate::db::Event]) -> String {
         .iter()
         .map(|m| {
             let from = m.from_agent.as_deref().unwrap_or("someone");
-            let who = match m.task_key.as_deref() {
-                Some(key) => format!("[fleet · {from} · {key}]"),
-                None => format!("[fleet · {from}]"),
+            let who = match (from, m.task_key.as_deref()) {
+                // From the board itself rather than an agent.
+                ("fleet", _) => "[fleet]".to_string(),
+                (_, Some(key)) => format!("[fleet · {from} · {key}]"),
+                (_, None) => format!("[fleet · {from}]"),
             };
             match m.body.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
                 Some(body) => format!("{who} {}\n\n{body}", m.summary.trim()),

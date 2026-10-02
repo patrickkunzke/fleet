@@ -60,7 +60,10 @@ pub fn chief(root: &Path) -> Brief {
              `fleet board go <task>` when the plan is right, adding a message if \
              there is more to say: until a task has one, its agent cannot change \
              files. Anything short of a go, such as what to change first, is \
-             `fleet board msg`. When a plan turns on a decision that is the user's to \
+             `fleet board msg`.\n\n\
+             When fleet tells you an agent is nearly out of context and its task \
+             has a way to go, `fleet handoff <name>` gives the task to a fresh \
+             session of it, briefed on where the old one stopped. When a plan turns on a decision that is the user's to \
              make — scope, a trade-off, anything that cannot be undone — ask the \
              user rather than deciding for them."
         ),
@@ -135,6 +138,86 @@ pub fn worker(name: &str, repo: &Path, task: Option<&Task>, body: Option<&str>) 
         opening,
         deny: &[],
     }
+}
+
+/// What a fresh session taking over from an earlier one of the same agent
+/// is told about it.
+pub struct Takeover<'a> {
+    /// The earlier session's final reply.
+    pub last_words: Option<&'a str>,
+    /// The messages it sent and was sent, oldest first.
+    pub messages: &'a [crate::db::Event],
+    /// What whoever handed it over adds.
+    pub note: Option<&'a str>,
+    /// Whether the task already has its go-ahead.
+    pub approved: bool,
+}
+
+/// A worker taking over from an earlier session of itself, whose context
+/// was nearly full. Who it is is the same as any worker's; what to do first
+/// is to find out where the last one stopped, not to start over.
+pub fn handoff(name: &str, repo: &Path, task: Option<&Task>, body: Option<&str>, from: &Takeover) -> Brief {
+    let Brief { role, .. } = worker(name, repo, task, body);
+
+    let mut opening = format!(
+        "You are taking over from an earlier session of `{name}`, whose context \
+         was nearly full. It worked in this repository: before anything else, \
+         look at the branch, `git status` and `git log` to see what it got done.\n"
+    );
+    if let Some(task) = task {
+        opening.push_str(&format!("\nThe task is {} — {}.\n", task.key, task.title));
+        if let Some(body) = body.map(str::trim).filter(|b| !b.is_empty()) {
+            opening.push_str(&format!("\n{body}\n"));
+        }
+    }
+    if !from.messages.is_empty() {
+        opening.push_str("\nIts messages on the board, oldest first:\n");
+        for m in from.messages {
+            let who = format!(
+                "{} → {}",
+                m.from_agent.as_deref().unwrap_or("?"),
+                m.to_agent.as_deref().unwrap_or("?")
+            );
+            let mut line = m.summary.trim().to_string();
+            if let Some(b) = m.body.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
+                line.push_str(" — ");
+                line.push_str(b);
+            }
+            opening.push_str(&format!("- {who}: {}\n", clip(&line, 400)));
+        }
+    }
+    if let Some(words) = from.last_words.map(str::trim).filter(|w| !w.is_empty()) {
+        opening.push_str("\nWhere it left off, in its last reply:\n\n");
+        for l in clip(words, 3000).lines() {
+            opening.push_str(&format!("> {l}\n"));
+        }
+    }
+    if let Some(note) = from.note.map(str::trim).filter(|n| !n.is_empty()) {
+        opening.push_str(&format!("\nWhoever handed it over adds: {note}\n"));
+    }
+    if from.approved {
+        opening.push_str(&format!(
+            "\nThe go-ahead it had stands. Once you know where things are, tell the \
+             chief in one line that you have taken over, with `fleet board msg {name} \
+             chief '...'`, and carry on. Be brief."
+        ));
+    } else {
+        opening.push_str(&format!(
+            "\nIt had no go-ahead yet. Once you know where things are, say what you \
+             intend to do, send the chief the short version with `fleet board msg \
+             {name} chief '...'`, and wait for a go-ahead. Be brief."
+        ));
+    }
+    Brief { role, opening, deny: &[] }
+}
+
+/// The first `width` characters of `s`, with an ellipsis when cut.
+fn clip(s: &str, width: usize) -> String {
+    if s.chars().count() <= width {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(width.saturating_sub(1)).collect();
+    format!("{cut}…")
 }
 
 /// Which `claude` to start, by its full path.
@@ -598,5 +681,40 @@ mod tests {
         let register = std::fs::read_to_string(plugin.join("hooks").join(module)).unwrap();
         assert_eq!(register, MOD_REGISTER);
         assert!(register.contains("'board', 'inbox'"), "it checks the mailbox fleet answers");
+    }
+
+    fn said(from: &str, to: &str, summary: &str) -> crate::db::Event {
+        crate::db::Event {
+            ts: String::new(),
+            kind: "message".into(),
+            from_agent: Some(from.into()),
+            to_agent: Some(to.into()),
+            task_key: None,
+            summary: summary.into(),
+            body: None,
+        }
+    }
+
+    #[test]
+    fn a_session_taking_over_is_told_where_the_last_one_stopped() {
+        let messages = [said("billing-svc", "chief", "plan: add the column"), said("chief", "billing-svc", "go")];
+        let from = Takeover { last_words: Some("Column added.\nTests next."), messages: &messages, note: Some("mind the flaky test"), approved: true };
+        let b = handoff("billing-svc", Path::new("/w/billing"), Some(&task("ENG-1-1", &[])), Some("the body"), &from);
+        assert!(b.opening.contains("taking over from an earlier session of `billing-svc`"), "{}", b.opening);
+        assert!(b.opening.contains("git status"), "it checks the repository first");
+        assert!(b.opening.contains("ENG-1-1"));
+        assert!(b.opening.contains("- billing-svc → chief: plan: add the column\n- chief → billing-svc: go"), "{}", b.opening);
+        assert!(b.opening.contains("> Column added.\n> Tests next."), "{}", b.opening);
+        assert!(b.opening.contains("mind the flaky test"));
+        assert!(b.opening.contains("go-ahead it had stands"));
+        assert_eq!(b.role, worker("billing-svc", Path::new("/w/billing"), None, None).role, "who it is does not change");
+    }
+
+    #[test]
+    fn a_session_taking_over_without_a_go_still_waits_for_one() {
+        let from = Takeover { last_words: None, messages: &[], note: None, approved: false };
+        let b = handoff("billing-svc", Path::new("/w/billing"), None, None, &from);
+        assert!(b.opening.contains("no go-ahead yet"), "{}", b.opening);
+        assert!(!b.opening.contains("Where it left off"));
     }
 }

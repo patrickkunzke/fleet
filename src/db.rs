@@ -643,6 +643,13 @@ impl Db {
 
     #[allow(dead_code)]
     pub fn retire_agent(&self, name: &str) -> Result<()> {
+        // Its session may outlive the row: herdr leaves a working agent's tab
+        // open. Remembered, so the mod can hold it back and tell it to stop.
+        self.conn.execute(
+            "INSERT OR IGNORE INTO retired_sessions (session_id, agent)
+             SELECT session_id, name FROM agents WHERE name = ?1 AND session_id IS NOT NULL",
+            params![name],
+        )?;
         let n = self.conn.execute(
             "UPDATE agents SET ended_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE name = ?1",
             params![name],
@@ -651,6 +658,28 @@ impl Db {
             bail!("unknown agent '{name}'");
         }
         self.log_event("note", Some(name), None, None, "agent retired", None, None)
+    }
+
+    /// Retire `name` so that a fresh session can carry on under the same
+    /// name: its session is let go of, so the new one is the only one the
+    /// board knows by it. Returns the session it had.
+    pub fn hand_off(&self, name: &str) -> Result<Option<String>> {
+        let session: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT session_id FROM agents WHERE name = ?1 AND ended_at IS NULL",
+                params![name],
+                |r| r.get(0),
+            )
+            .optional()?
+            .with_context(|| format!("no agent '{name}' on the board"))?;
+        self.retire_agent(name)?;
+        self.conn.execute(
+            "UPDATE retired_sessions SET handed_off = 1 WHERE session_id = ?1",
+            params![session],
+        )?;
+        self.conn.execute("UPDATE agents SET session_id = NULL WHERE name = ?1", params![name])?;
+        Ok(session)
     }
 
     #[allow(dead_code)]
@@ -931,9 +960,18 @@ impl Db {
         Ok(owner)
     }
 
+    /// Whether `task` has its go-ahead.
+    pub fn approved(&self, task: &str) -> Result<bool> {
+        Ok(self.conn.prepare("SELECT 1 FROM approvals WHERE task_key = ?1")?.exists(params![task])?)
+    }
+
     /// Whether the session may edit, and, with `user_approves`, the person at
     /// the keyboard giving its agent's open tasks their go first.
     pub fn gate(&self, session_id: &str, user_approves: bool) -> Result<Gate> {
+        // A session whose agent was retired changes nothing more.
+        if let Some(agent) = self.retired(session_id)? {
+            return Ok(Gate { agent: Some(agent), role: Some("retired".into()), tasks: vec![], approved: false });
+        }
         let agent: Option<(String, String)> = self
             .conn
             .query_row(
@@ -977,6 +1015,10 @@ impl Db {
 /// mod checks every three seconds; this leaves room for a slow one.
 pub const MAILBOX_QUIET: i64 = 15;
 
+/// From here a context window is close enough to full to say so: the agent
+/// compacts soon after, and loses the detail of its brief.
+pub const CONTEXT_HIGH: i64 = 80;
+
 // ---------------------------------------------------------------- inbox ---
 
 impl Db {
@@ -1009,6 +1051,10 @@ impl Db {
     ///
     /// `vitals` is what the session is doing, for the fleet view.
     pub fn check_in(&mut self, session_id: &str, take: bool, vitals: &Vitals) -> Result<Inbox> {
+        if let Some(agent) = self.retired(session_id)? {
+            return self.tell_retired(session_id, &agent, take);
+        }
+        let crossed = self.crosses_high(session_id, vitals)?;
         let tx = self.conn.transaction()?;
         let agent: Option<String> = tx
             .query_row(
@@ -1061,7 +1107,103 @@ impl Db {
             |r| r.get(0),
         )?;
         tx.commit()?;
+        if crossed {
+            self.warn_chief(&agent, vitals.context.unwrap_or_default())?;
+        }
         Ok(Inbox { agent: Some(agent), messages, waiting })
+    }
+
+    /// The agent a retired session worked as, if it is one.
+    fn retired(&self, session_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT agent FROM retired_sessions WHERE session_id = ?1",
+                params![session_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// A retired session checking in: nothing for it but, once and when it
+    /// is idle, word to stop.
+    fn tell_retired(&self, session_id: &str, agent: &str, take: bool) -> Result<Inbox> {
+        let (handed_off, told): (bool, bool) = self.conn.query_row(
+            "SELECT handed_off, told FROM retired_sessions WHERE session_id = ?1",
+            params![session_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let mut messages = Vec::new();
+        if take && !told {
+            let summary = if handed_off {
+                format!("{agent}'s task went to a fresh session, which carries on from here. Stop: change nothing more, and say so in one line.")
+            } else {
+                format!("{agent} was retired from the fleet. Stop: change nothing more, and say so in one line.")
+            };
+            messages.push(Event {
+                ts: String::new(),
+                kind: "message".into(),
+                from_agent: Some("fleet".into()),
+                to_agent: Some(agent.into()),
+                task_key: None,
+                summary,
+                body: None,
+            });
+            self.conn.execute("UPDATE retired_sessions SET told = 1 WHERE session_id = ?1", params![session_id])?;
+        }
+        Ok(Inbox { agent: None, messages, waiting: 0 })
+    }
+
+    /// Whether this check-in takes a worker's context over [`CONTEXT_HIGH`]
+    /// from under it.
+    fn crosses_high(&self, session_id: &str, vitals: &Vitals) -> Result<bool> {
+        let Some(now) = vitals.context else { return Ok(false) };
+        let before: Option<Option<i64>> = self
+            .conn
+            .query_row(
+                "SELECT v.context FROM agents a JOIN vitals v ON v.agent = a.name
+                 WHERE a.session_id = ?1 AND a.ended_at IS NULL AND a.role = 'worker'",
+                params![session_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        // No row yet is a first check-in: a worker resumed at 85% is news
+        // as much as one that just got there.
+        let is_worker: bool = self
+            .conn
+            .prepare("SELECT 1 FROM agents WHERE session_id = ?1 AND ended_at IS NULL AND role = 'worker'")?
+            .exists(params![session_id])?;
+        Ok(is_worker && now >= CONTEXT_HIGH && before.flatten().is_none_or(|b| b < CONTEXT_HIGH))
+    }
+
+    /// Tell the chief a worker is close to compacting, and what to do about
+    /// it. Queued when the chief's mod is listening; otherwise the record is
+    /// enough, since the fleet view notifies the user as well.
+    fn warn_chief(&self, agent: &str, percent: i64) -> Result<()> {
+        let chief: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT name FROM agents WHERE role = 'chief' AND ended_at IS NULL ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(chief) = chief else { return Ok(()) };
+        let id = self.log_message(
+            "fleet",
+            &chief,
+            None,
+            &format!("{agent} is at {percent}% context"),
+            Some(&format!(
+                "It compacts soon, and keeps a summary of its brief rather than the brief. \
+                 If its task has a way to go, `fleet handoff {agent}` gives it to a fresh session, \
+                 briefed on the task, its messages and where {agent} left off."
+            )),
+        )?;
+        if self.mailbox_open(&chief, MAILBOX_QUIET)? {
+            self.queue_message(id, &chief)?;
+        }
+        Ok(())
     }
 }
 
@@ -2016,5 +2158,65 @@ mod tests {
 
         db.conn.execute("UPDATE mailboxes SET polled_at = polled_at - 60", []).unwrap();
         assert_eq!(vitals(&db), (None, None), "a mod gone quiet says nothing");
+    }
+
+    #[test]
+    fn a_handed_off_session_is_let_go_and_told_once_to_stop() {
+        let mut db = Db::open_in_memory().unwrap();
+        assigned(&db);
+        db.approve("ENG-1-1", "chief").unwrap();
+        assert_eq!(db.hand_off("accounts-svc").unwrap().as_deref(), Some("sid-1"));
+
+        let gate = db.gate("sid-1", false).unwrap();
+        assert_eq!(gate.role.as_deref(), Some("retired"));
+        assert!(!gate.approved, "it changes nothing more");
+
+        let busy = db.check_in("sid-1", false, &Vitals::default()).unwrap();
+        assert!(busy.messages.is_empty(), "told when idle, not mid-turn");
+        let told = db.check_in("sid-1", true, &Vitals::default()).unwrap();
+        assert!(told.messages[0].summary.contains("went to a fresh session"), "{:?}", told.messages);
+        assert!(db.check_in("sid-1", true, &Vitals::default()).unwrap().messages.is_empty(), "once");
+
+        // The name carries on: a fresh session under it, the go-ahead with it.
+        db.upsert_agent("accounts-svc", None, None, Some("sid-2"), None, None).unwrap();
+        assert!(db.gate("sid-2", false).unwrap().approved);
+        assert!(!db.mailbox_open("accounts-svc", 15).unwrap(), "the old session never checked in for it");
+    }
+
+    #[test]
+    fn retiring_an_agent_holds_its_session_back_too() {
+        let db = Db::open_in_memory().unwrap();
+        assigned(&db);
+        db.retire_agent("accounts-svc").unwrap();
+        assert_eq!(db.gate("sid-1", false).unwrap().role.as_deref(), Some("retired"));
+    }
+
+    #[test]
+    fn the_chief_hears_once_when_a_worker_nears_full() {
+        let mut db = Db::open_in_memory().unwrap();
+        assigned(&db);
+        db.check_in("sid-chief", false, &Vitals::default()).unwrap();
+        let at = |db: &mut Db, c: i64| db.check_in("sid-1", false, &Vitals { tool: None, context: Some(c) }).unwrap();
+
+        at(&mut db, 70);
+        at(&mut db, 83);
+        at(&mut db, 90);
+        let warned: Vec<_> = db
+            .events(50)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "message" && e.to_agent.as_deref() == Some("chief"))
+            .collect();
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert_eq!(warned[0].summary, "accounts-svc is at 83% context");
+        assert!(warned[0].body.as_deref().unwrap().contains("fleet handoff accounts-svc"));
+
+        let chief = db.check_in("sid-chief", true, &Vitals::default()).unwrap();
+        assert_eq!(chief.messages.len(), 1, "queued for the chief, whose mod is listening");
+
+        // The chief's own context is not news to itself.
+        db.check_in("sid-chief", false, &Vitals { tool: None, context: Some(95) }).unwrap();
+        let to_chief = db.events(50).unwrap().into_iter().filter(|e| e.to_agent.as_deref() == Some("chief")).count();
+        assert_eq!(to_chief, 1);
     }
 }
