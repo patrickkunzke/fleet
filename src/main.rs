@@ -87,6 +87,26 @@ enum Command {
         #[arg(long, env = "FLEET_DB")]
         db: Option<PathBuf>,
     },
+    /// Hand an agent's task to a fresh session of it, for one whose context
+    /// is nearly full. The new session starts in the same repository under
+    /// the same name, briefed on the task, its messages and where the old
+    /// one left off; the old one is retired and its tab closed.
+    Handoff {
+        /// The agent to hand off.
+        agent: String,
+        /// Anything the new session should know that the board does not say.
+        #[arg(long)]
+        note: Option<String>,
+        /// Close the old session even mid-turn. Without it, an agent that is
+        /// working is left to finish its turn first.
+        #[arg(long)]
+        now: bool,
+        /// Seconds to wait for the new session to register itself.
+        #[arg(long, default_value_t = 20)]
+        timeout: u64,
+        #[arg(long, env = "FLEET_DB")]
+        db: Option<PathBuf>,
+    },
     /// Read and write the coordination database: the board of the fleet
     /// this session was started by, or the one named.
     Board {
@@ -434,12 +454,90 @@ fn main() -> Result<()> {
             command,
             timeout,
             db,
-        } => spawn(&name, &repo, task.as_deref(), &role, command.as_deref(), timeout, db),
+        } => spawn(&name, &repo, task.as_deref(), &role, command.as_deref(), timeout, db, None),
+        Command::Handoff { agent, note, now, timeout, db } => handoff(&agent, note.as_deref(), now, timeout, db),
     }
+}
+
+/// Retire an agent and start a fresh session of it on the same task.
+fn handoff(name: &str, note: Option<&str>, now: bool, timeout: u64, db_path: Option<PathBuf>) -> Result<()> {
+    let path = scope::board_for_command(db_path.clone(), None)?;
+    let host = Host::detect()?.in_fleet(Some(&path));
+    let db = Db::open(&path)?;
+
+    let agent = db
+        .agents()?
+        .into_iter()
+        .find(|a| a.name == name)
+        .with_context(|| format!("no agent '{name}' on the board"))?;
+    if agent.role == "chief" {
+        bail!("the chief is not handed off this way: restart it from the fleet tab, and it reads the board afresh");
+    }
+    let repo = PathBuf::from(agent.repo.as_deref().with_context(|| format!("{name} has no repository on the board"))?);
+    if let Some(target) = agent.target.as_deref()
+        && !now
+        && host.is_working(target)
+    {
+        bail!("{name} is mid-turn. Run this again once it stops, or with --now to close it where it is");
+    }
+
+    // Its task: the one it is on, before one queued for later.
+    let task = db
+        .board()?
+        .into_iter()
+        .filter(|t| t.agent.as_deref() == Some(name))
+        .filter(|t| !matches!(t.state, db::State::Done | db::State::Dropped))
+        .min_by_key(|t| match t.state {
+            db::State::Running | db::State::Blocked => 0,
+            db::State::Review => 1,
+            _ => 2,
+        });
+    let shown = task.as_ref().map(|t| db.show(&t.key)).transpose()?;
+    let approved = match &task {
+        Some(t) => db.approved(&t.key)?,
+        None => true,
+    };
+    // What it said and was told, oldest first: the last fifteen.
+    let mut messages: Vec<db::Event> = db
+        .events(500)?
+        .into_iter()
+        .filter(|e| e.kind == "message")
+        .filter(|e| e.from_agent.as_deref() == Some(name) || e.to_agent.as_deref() == Some(name))
+        .take(15)
+        .collect();
+    messages.reverse();
+    let words = agent.session_id.as_deref().and_then(agent::last_words);
+
+    // The old session goes before the new one comes: herdr names a tab for
+    // its agent, and two of one name is one too many.
+    let closed = match agent.target.as_deref() {
+        Some(t) if host::is_herdr(t) => {
+            let said = if now { host.close_now(t) } else { host.close(t) };
+            said.unwrap_or_else(|e| format!("its tab could not be closed: {e}"))
+        }
+        _ => "it had no herdr tab".into(),
+    };
+    if closed.contains("left open") {
+        bail!("{name}'s tab could not be closed ({closed}), so it was not handed off");
+    }
+    db.hand_off(name)?;
+    db.log_event("note", Some(name), None, task.as_ref().map(|t| t.key.as_str()), "handed off to a fresh session", note, None)?;
+    println!("{name}: old session retired; {closed}");
+
+    let brief = brief::handoff(
+        name,
+        &repo,
+        shown.as_ref().map(|(t, _, _)| t),
+        shown.as_ref().and_then(|(_, body, _)| body.as_deref()),
+        &brief::Takeover { last_words: words.as_deref(), messages: &messages, note, approved },
+    );
+    let key = task.as_ref().map(|t| t.key.clone());
+    spawn(name, &repo, key.as_deref(), "worker", None, timeout, db_path, Some(brief))
 }
 
 /// Start an agent and join the three sources back together: a herdr tab, the
 /// Claude Code session that appears inside it, and the row on the board.
+#[allow(clippy::too_many_arguments)]
 fn spawn(
     name: &str,
     repo: &Path,
@@ -448,6 +546,8 @@ fn spawn(
     command: Option<&str>,
     timeout: u64,
     db_path: Option<PathBuf>,
+    // A brief made elsewhere, for a session taking over from another.
+    takeover: Option<brief::Brief>,
 ) -> Result<()> {
     let path = scope::board_for_command(db_path, None)?;
     let host = Host::detect()?.in_fleet(Some(&path));
@@ -457,7 +557,9 @@ fn spawn(
     // is a typo worth refusing, not an agent to start and then correct.
     let assignment = task.map(|key| db.show(key)).transpose()?;
     let chief = role == "chief";
-    let brief = if chief {
+    let brief = if let Some(given) = takeover {
+        given
+    } else if chief {
         brief::chief(repo)
     } else {
         assignment.as_ref().map_or_else(

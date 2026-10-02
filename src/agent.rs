@@ -259,6 +259,39 @@ pub fn resume_from(
     Ok(spawned)
 }
 
+/// What a session said last: the text of its final reply, from its
+/// transcript. For a handoff, where it is the nearest thing to the old
+/// session's own account of where it stopped.
+pub fn last_words(session: &str) -> Option<String> {
+    last_words_in(&registry::default_projects_dir(), session)
+}
+
+fn last_words_in(projects: &Path, session: &str) -> Option<String> {
+    // Found by the session's id rather than its directory: the transcript's
+    // folder is named for where the session started, which a repo moved or
+    // reached through a link may not match.
+    let file = std::fs::read_dir(projects)
+        .ok()?
+        .flatten()
+        .map(|d| d.path().join(format!("{session}.jsonl")))
+        .find(|p| p.is_file())?;
+    let text = std::fs::read_to_string(file).ok()?;
+    text.lines().rev().find_map(|line| {
+        let entry: serde_json::Value = serde_json::from_str(line).ok()?;
+        if entry["type"] != "assistant" {
+            return None;
+        }
+        let said: Vec<&str> = entry["message"]["content"]
+            .as_array()?
+            .iter()
+            .filter(|b| b["type"] == "text")
+            .filter_map(|b| b["text"].as_str())
+            .collect();
+        let said = said.join("\n").trim().to_string();
+        (!said.is_empty()).then_some(said)
+    })
+}
+
 /// Whether Claude Code still has the conversation. `--resume` on one that is
 /// gone opens an empty session that looks, at a glance, like the old one.
 pub fn conversation_exists(repo: &Path, session: &str) -> bool {
@@ -329,6 +362,23 @@ pub fn candidates(root: &Path, existing: &[String]) -> Vec<Candidate> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sessions_last_words_are_its_last_reply_with_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("-w-billing");
+        std::fs::create_dir(&project).unwrap();
+        let lines = [
+            r#"{"type":"user","message":{"content":"go"}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Column added; tests next."}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"ok"}]}}"#,
+            "not json",
+        ];
+        std::fs::write(project.join("sid-1.jsonl"), lines.join("\n")).unwrap();
+        assert_eq!(last_words_in(dir.path(), "sid-1").as_deref(), Some("Column added; tests next."));
+        assert_eq!(last_words_in(dir.path(), "sid-2"), None);
+    }
 
     fn repo_at(root: &Path, rel: &str) {
         let dir = root.join(rel);

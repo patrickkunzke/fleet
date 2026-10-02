@@ -247,6 +247,20 @@ CREATE TABLE IF NOT EXISTS approvals (
 );
 
 
+-- ------------------------------------------------------ retired_sessions ---
+-- Sessions of agents that were retired or handed off. herdr leaves a
+-- working agent's tab open, so one may still be running: the mod refuses its
+-- edits, and tells it once, when it is next idle, to stop.
+
+CREATE TABLE IF NOT EXISTS retired_sessions (
+  session_id TEXT PRIMARY KEY,
+  agent      TEXT NOT NULL,                 -- the name it worked under
+  handed_off INTEGER NOT NULL DEFAULT 0,    -- 1: a fresh session carries on
+  told       INTEGER NOT NULL DEFAULT 0,
+  retired_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+
+
 -- ------------------------------------------------------------------- kv ---
 -- Fleet-wide scratch state the TUI and the chief both read.
 -- Known keys: focus_epic, last_dispatch_at.

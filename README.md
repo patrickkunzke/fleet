@@ -244,6 +244,24 @@ dispatched twice:
 fleet spawn billing-svc --repo ~/Code/acme/service/billing-service --task ENG-2553-2
 ```
 
+An agent nearly out of context is handed off rather than left to compact:
+
+```bash
+fleet handoff billing-svc --note "the flaky test is known; skip it"
+```
+
+A fresh session starts in the same repository under the same name, on the
+same task, briefed on the task, its messages on the board, the old session's
+last reply and the note, and told to look at the branch and `git status`
+before anything else. A go-ahead the task had stands. The old session is
+retired and its tab closed; an agent mid-turn is refused unless `--now` is
+given. The chief is told when a worker passes 80% context, with the command
+to run, and so are you, through herdr.
+
+A retired session that is still running, because its tab was left open,
+changes nothing more: fleet's mod refuses its edits, and tells it once, when
+it is next idle, to stop.
+
 When an agent is finished with, the chief retires it with `fleet board retire
 billing-svc`, which takes it off the board and closes its tab. A working
 agent's tab is left open, and `--keep-tab` leaves it either way. `x` in the

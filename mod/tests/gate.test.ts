@@ -106,6 +106,18 @@ test('the chief changes no files, and may give a go', async ($, on) => {
   expect(msg.result).toBe('ran')
 })
 
+test('a retired session changes nothing more', async ($, on) => {
+  mock.env(on, { FLEET_DB: '/tmp/fleet.db' })
+  mock.clock(on)
+  board(on, { agent: 'accounts-svc', role: 'retired', tasks: [], approved: false })
+  await $.session.start(start)
+
+  const edit = await $.tool.call({ tool: 'Write', file_path: '/repo/a.ts', content: 'x' })
+  expect(edit.deny).toContain('was retired')
+  const read = await $.tool.call({ tool: 'Bash', command: 'git status' })
+  expect(read.result).toBe('ran')
+})
+
 test('which commands write', () => {
   const yes = [
     'echo x > a.ts',

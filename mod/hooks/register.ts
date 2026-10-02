@@ -189,6 +189,16 @@ export const register: Register = on => {
       const g = await gate($, session)
       if (!g?.agent) return await next(e)
 
+      // Retired, or handed off to a fresh session that carries on: what
+      // this one changes now, the other does not know about.
+      if (g.role === 'retired') {
+        return {
+          deny:
+            `fleet: this session of ${g.agent} was retired, and changes nothing more. ` +
+            'If its task was handed off, a fresh session is carrying on with it.',
+        }
+      }
+
       if (g.role === 'chief') {
         if (edit || (command !== undefined && writes(command))) {
           return {

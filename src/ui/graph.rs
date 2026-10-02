@@ -794,9 +794,7 @@ fn draw_legend(canvas: &mut Canvas, l: &Layout) {
     canvas.text(0, l.legend_y, &parts.join("   "), l.width, theme::faint());
 }
 
-/// From here a context window is close enough to full to say so: the agent
-/// compacts soon after, and loses the detail of its brief.
-pub const CONTEXT_HIGH: i64 = 80;
+pub use crate::db::CONTEXT_HIGH;
 
 /// The top right of a card: how long it has been up, and how full its
 /// context is when its mod says, in the `room` left beside its name. The

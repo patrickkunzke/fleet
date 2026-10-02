@@ -162,6 +162,22 @@ fleet board retire accounts-svc
 A working agent's tab is left open, so do it once the agent has stopped.
 `--keep-tab` retires it and leaves the tab for the user to look through.
 
+**Hand off an agent that is nearly out of context.** fleet tells you when a
+worker passes 80%: past that it compacts, and carries on from a summary of its
+brief rather than the brief. If its task has a way to go, give it to a fresh
+session:
+
+```bash
+fleet handoff accounts-svc --note "the flaky test is known; skip it"
+```
+
+The new session starts in the same repository under the same name, on the
+same task, briefed on the task, its messages on the board and the old
+session's last reply; a go-ahead the task had stands. The old session is
+retired and its tab closed. Wait until the agent has stopped: one mid-turn is
+refused unless you pass `--now`. A task nearly finished is better left to
+finish.
+
 ## As a worker
 
 You were handed a task key — in your opening brief if the chief dispatched you

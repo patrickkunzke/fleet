@@ -130,6 +130,23 @@ impl Host {
     /// its tab, or only its pane when the tab holds something else of the
     /// crew's. Says what it did, or why it left the terminal open.
     pub fn close(&self, target: &str) -> Result<String> {
+        self.close_with(target, false)
+    }
+
+    /// [`Host::close`], working or not: for a handoff the user asked to
+    /// make now, whatever the agent is in the middle of.
+    pub fn close_now(&self, target: &str) -> Result<String> {
+        self.close_with(target, true)
+    }
+
+    /// Whether the agent at `target` is mid-turn, as herdr sees it.
+    pub fn is_working(&self, target: &str) -> bool {
+        herdr_name(target)
+            .and_then(|name| self.herdr.agent(name))
+            .is_some_and(|a| a.agent_status == "working")
+    }
+
+    fn close_with(&self, target: &str, now: bool) -> Result<String> {
         let name = herdr_name(target).context("not a herdr agent")?;
         let Some(agent) = self.herdr.agent(name) else {
             return Ok("nothing was running in its tab".into());
@@ -139,7 +156,8 @@ impl Host {
         let agents = self.herdr.agents().unwrap_or_default();
         let shared = agents.iter().any(|a| a.tab_id == agent.tab_id && a.pane_id != agent.pane_id)
             || panes.iter().any(|p| p.tab_id == agent.tab_id && p.label == crate::plugin::TAB);
-        Ok(match closing(&agent.pane_id, &agent.agent_status, own.as_deref(), shared) {
+        let status = if now { "idle" } else { agent.agent_status.as_str() };
+        Ok(match closing(&agent.pane_id, status, own.as_deref(), shared) {
             Closing::Tab => {
                 self.herdr.tab_close(&agent.tab_id)?;
                 "closed its tab".into()
