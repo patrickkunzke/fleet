@@ -87,9 +87,28 @@ fn installed_from(json: &serde_json::Value) -> Result<Installed> {
         },
         other => bail!("fleet is installed in a way update does not know: {}", other.unwrap_or("none")),
     };
+    // herdr reports the manifest it read when it loaded the plugin. A linked
+    // checkout changes under it, by a pull and a build, until herdr restarts:
+    // there the manifest on disk is the version that runs.
+    let on_disk = match &how {
+        Install::Local { root } => std::fs::read_to_string(root.join("herdr-plugin.toml"))
+            .ok()
+            .and_then(|m| manifest_version(&m)),
+        Install::Github { .. } => None,
+    };
     Ok(Installed {
         how,
-        version: text(&plugin["version"]).unwrap_or_else(|| env!("CARGO_PKG_VERSION").into()),
+        version: on_disk
+            .or_else(|| text(&plugin["version"]))
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").into()),
+    })
+}
+
+/// The `version = "…"` of a herdr-plugin.toml.
+fn manifest_version(manifest: &str) -> Option<String> {
+    manifest.lines().find_map(|l| {
+        let (key, value) = l.split_once('=')?;
+        (key.trim() == "version").then(|| value.trim().trim_matches('"').to_string())
     })
 }
 
@@ -271,6 +290,19 @@ mod tests {
             "source": {"kind": "local"},
         }]}});
         assert_eq!(installed_from(&json).unwrap().how, Install::Local { root: "/code/fleet".into() });
+    }
+
+    #[test]
+    fn a_linked_checkout_reports_the_version_on_disk_not_herdrs_old_reading() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("herdr-plugin.toml"), "id = \"fleet\"\nmin_herdr_version = \"0.9.1\"\nversion = \"0.2.0\"\n").unwrap();
+        let json = serde_json::json!({"result": {"plugins": [{
+            "plugin_id": "fleet",
+            "plugin_root": root.path(),
+            "version": "0.1.0",
+            "source": {"kind": "local"},
+        }]}});
+        assert_eq!(installed_from(&json).unwrap().version, "0.2.0");
     }
 
     #[test]
