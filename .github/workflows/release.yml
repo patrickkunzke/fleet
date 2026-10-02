@@ -3,7 +3,8 @@ name: release
 # A merge to main is released when its commits call for it (see
 # scripts/next-version.sh): the version is raised in Cargo.toml, Cargo.lock
 # and herdr-plugin.toml, the section is added to CHANGELOG.md, and the commit
-# is tagged and published as a GitHub Release.
+# is tagged and published as a GitHub Release, and binaries.yml builds the
+# prebuilt binaries for it.
 #
 # The version has to be in the files at the tagged commit, since that is what
 # herdr installs and what `fleet update` compares, so this job commits to
@@ -27,6 +28,8 @@ jobs:
     # Its own commit comes back through here.
     if: ${{ !startsWith(github.event.head_commit.message, 'chore(release):') }}
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.next.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -79,3 +82,12 @@ jobs:
 
           # The notes without their heading: the release page has its own.
           tail -n +2 notes.md | gh release create "$tag" --title "$tag" --notes-file -
+
+  # The release exists from here on; an install before its binaries are up
+  # builds from source.
+  binaries:
+    needs: release
+    if: needs.release.outputs.version != ''
+    uses: ./.github/workflows/binaries.yml
+    with:
+      tag: v${{ needs.release.outputs.version }}
