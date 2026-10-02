@@ -4,6 +4,13 @@ Every release of fleet. Each section is written when a pull request with a
 `feat`, `fix` or `perf` commit is merged; see
 [Releases](README.md#releases).
 
+## [0.5.0](https://github.com/patrickkunzke/fleet/releases/tag/v0.5.0) — 2026-10-02
+
+### Features
+
+- **msg:** Deliver board messages through a Claude Code mod
+- **doctor:** Check that Claude Code loads fleet's mod
+
 ## [0.4.0](https://github.com/patrickkunzke/fleet/releases/tag/v0.4.0) — 2026-10-02
 
 ### Features
