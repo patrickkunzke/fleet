@@ -4,6 +4,12 @@ Every release of fleet. Each section is written when a pull request with a
 `feat`, `fix` or `perf` commit is merged; see
 [Releases](README.md#releases).
 
+## [0.4.0](https://github.com/patrickkunzke/fleet/releases/tag/v0.4.0) — 2026-10-02
+
+### Features
+
+- **board:** Close an agent's herdr tab when it is retired
+
 ## [0.3.0](https://github.com/patrickkunzke/fleet/releases/tag/v0.3.0) — 2026-10-02
 
 ### Features
