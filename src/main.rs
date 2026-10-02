@@ -240,6 +240,16 @@ enum BoardCmd {
         #[arg(long)]
         task: Option<String>,
     },
+    /// What fleet's Claude Code mod checks every few seconds: who this
+    /// session is on the board, and, with --take, the messages waiting for
+    /// it. Always JSON.
+    #[command(hide = true)]
+    Inbox {
+        #[arg(long)]
+        session: String,
+        #[arg(long)]
+        take: bool,
+    },
     /// Log something that is not a message.
     Note {
         summary: String,
@@ -284,6 +294,11 @@ enum BgCmd {
     Ls,
 }
 
+/// How long a mailbox may go without a check before fleet stops trusting
+/// the mod to pick a message up, and types it into the pane instead. The mod
+/// checks every three seconds; this leaves room for a slow one.
+const MAILBOX_QUIET: i64 = 15;
+
 /// Knock at the recipient's door, and say whether anyone was in.
 ///
 /// Every outcome is reported rather than returned as an error: the message
@@ -291,6 +306,7 @@ enum BgCmd {
 /// "failed" will send it again.
 fn knock(
     db: &Db,
+    event: i64,
     from: &str,
     to: &str,
     task: Option<&str>,
@@ -308,6 +324,14 @@ fn knock(
         // message going to an agent that does not exist.
         return format!("not delivered: no agent '{to}' on the board");
     };
+    // A session whose mod is checking in takes the message itself, once it
+    // is idle, rather than having it typed into a prompt it may be busy at.
+    if db.mailbox_open(to, MAILBOX_QUIET).unwrap_or(false) {
+        return match db.queue_message(event, to) {
+            Ok(()) => format!("queued for {to}: it arrives when {to} is next idle"),
+            Err(e) => format!("not delivered: {e}"),
+        };
+    }
     let Some(target) = agent.target.as_deref() else {
         return format!("not delivered: {to} has no pane fleet can reach");
     };
@@ -490,7 +514,7 @@ fn emit<T: serde::Serialize>(value: &T) -> Result<bool> {
 
 fn board(cmd: BoardCmd, path: Option<PathBuf>, fleet: Option<String>) -> Result<()> {
     let path = scope::board_for_command(path, fleet.as_deref())?;
-    let db = Db::open(&path)?;
+    let mut db = Db::open(&path)?;
 
     match cmd {
         BoardCmd::Init => println!("fleet: ready at {}", path.display()),
@@ -739,17 +763,20 @@ fn board(cmd: BoardCmd, path: Option<PathBuf>, fleet: Option<String>) -> Result<
             // The record first. Delivery is best-effort and must never cost
             // us the event: an agent that has died still said this, and the
             // flow log is the only place that survives it.
-            db.log_event(
-                "message",
-                Some(&from),
-                Some(&to),
-                task.as_deref(),
-                &summary,
-                body.as_deref(),
-                None,
-            )?;
+            let id = db.log_message(&from, &to, task.as_deref(), &summary, body.as_deref())?;
             println!("{from} -> {to}: {summary}");
-            println!("      {}", knock(&db, &from, &to, task.as_deref(), &summary, body.as_deref()));
+            println!("      {}", knock(&db, id, &from, &to, task.as_deref(), &summary, body.as_deref()));
+        }
+
+        BoardCmd::Inbox { session, take } => {
+            let inbox = db.check_inbox(&session, take)?;
+            let text = (!inbox.messages.is_empty()).then(|| msg::prompt(&inbox.messages));
+            let out = serde_json::json!({
+                "agent": inbox.agent,
+                "text": text,
+                "waiting": inbox.waiting,
+            });
+            println!("{out}");
         }
 
         BoardCmd::Note {

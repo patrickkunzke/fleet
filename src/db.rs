@@ -784,6 +784,117 @@ impl Db {
         )?;
         Ok(())
     }
+
+    /// Record a message, and return its event id, which is what queueing it
+    /// for the recipient's mailbox needs.
+    pub fn log_message(
+        &self,
+        from: &str,
+        to: &str,
+        task: Option<&str>,
+        summary: &str,
+        body: Option<&str>,
+    ) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "INSERT INTO events (kind, from_agent, to_agent, task_key, summary, body)
+             VALUES ('message', ?1, ?2, ?3, ?4, ?5) RETURNING id",
+            params![from, to, task, summary, body],
+            |r| r.get(0),
+        )?)
+    }
+}
+
+/// What a session's mod is told when it checks its mailbox.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Inbox {
+    /// The agent the session is, or None for a session the board does not
+    /// know (yet: an agent's session is linked a few seconds after it starts).
+    pub agent: Option<String>,
+    /// The messages taken, oldest first. Empty unless asked to take them.
+    pub messages: Vec<Event>,
+    /// How many are still waiting after this call.
+    pub waiting: i64,
+}
+
+// ---------------------------------------------------------------- inbox ---
+
+impl Db {
+    /// Whether `agent`'s session has checked its mailbox in the last
+    /// `within` seconds, and so will pick up a message queued for it.
+    pub fn mailbox_open(&self, agent: &str, within: i64) -> Result<bool> {
+        Ok(self
+            .conn
+            .prepare(
+                "SELECT 1 FROM mailboxes
+                 WHERE agent = ?1 AND polled_at >= CAST(strftime('%s', 'now') AS INTEGER) - ?2",
+            )?
+            .exists(params![agent, within])?)
+    }
+
+    /// Leave a recorded message for its recipient's session to take.
+    pub fn queue_message(&self, event_id: i64, agent: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO inbox (event_id, agent) VALUES (?1, ?2)",
+            params![event_id, agent],
+        )?;
+        Ok(())
+    }
+
+    /// A session checking in: say who it is, note that it is listening, and,
+    /// with `take`, hand over what is waiting for it and forget it was.
+    ///
+    /// One transaction, so two checks at the same instant cannot both take
+    /// the same message.
+    pub fn check_inbox(&mut self, session_id: &str, take: bool) -> Result<Inbox> {
+        let tx = self.conn.transaction()?;
+        let agent: Option<String> = tx
+            .query_row(
+                "SELECT name FROM agents WHERE session_id = ?1 AND ended_at IS NULL",
+                params![session_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(agent) = agent else {
+            return Ok(Inbox::default());
+        };
+        tx.execute(
+            "INSERT INTO mailboxes (agent, session_id, polled_at)
+             VALUES (?1, ?2, CAST(strftime('%s', 'now') AS INTEGER))
+             ON CONFLICT (agent) DO UPDATE
+               SET session_id = excluded.session_id, polled_at = excluded.polled_at",
+            params![agent, session_id],
+        )?;
+        let mut messages = Vec::new();
+        if take {
+            let mut stmt = tx.prepare(
+                "SELECT e.ts, e.kind, e.from_agent, e.to_agent, e.task_key, e.summary, e.body
+                 FROM inbox i JOIN events e ON e.id = i.event_id
+                 WHERE i.agent = ?1 ORDER BY e.id",
+            )?;
+            messages = stmt
+                .query_map(params![agent], |r| {
+                    Ok(Event {
+                        ts: r.get(0)?,
+                        kind: r.get(1)?,
+                        from_agent: r.get(2)?,
+                        to_agent: r.get(3)?,
+                        task_key: r.get(4)?,
+                        summary: r.get(5)?,
+                        body: r.get(6)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(stmt);
+            tx.execute("DELETE FROM inbox WHERE agent = ?1", params![agent])?;
+        }
+        let waiting = tx.query_row(
+            "SELECT count(*) FROM inbox WHERE agent = ?1",
+            params![agent],
+            |r| r.get(0),
+        )?;
+        tx.commit()?;
+        Ok(Inbox { agent: Some(agent), messages, waiting })
+    }
 }
 
 impl Db {
@@ -1592,5 +1703,58 @@ mod tests {
 
         let db = Db::open(&p).unwrap();
         assert!(db.board().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_session_the_board_does_not_know_has_no_mailbox() {
+        // An agent's session is linked a few seconds after it starts; until
+        // then its mod checks in as nobody, and nothing may be handed to it.
+        let mut db = Db::open_in_memory().unwrap();
+        assert_eq!(db.check_inbox("sid-unknown", true).unwrap(), Inbox::default());
+    }
+
+    #[test]
+    fn checking_in_opens_the_mailbox_and_taking_empties_it() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.upsert_agent("accounts-svc", None, Some("/r"), Some("sid-1"), None, None).unwrap();
+        assert!(!db.mailbox_open("accounts-svc", 15).unwrap(), "never checked in");
+
+        let first = db.check_inbox("sid-1", false).unwrap();
+        assert_eq!(first.agent.as_deref(), Some("accounts-svc"));
+        assert!(db.mailbox_open("accounts-svc", 15).unwrap());
+
+        let a = db.log_message("chief", "accounts-svc", Some("ENG-1-1"), "go", None).unwrap();
+        let b = db.log_message("billing-svc", "accounts-svc", None, "column is in", Some("x")).unwrap();
+        db.queue_message(a, "accounts-svc").unwrap();
+        db.queue_message(b, "accounts-svc").unwrap();
+
+        // Busy: it checks in without taking, and learns how many wait.
+        let busy = db.check_inbox("sid-1", false).unwrap();
+        assert!(busy.messages.is_empty());
+        assert_eq!(busy.waiting, 2);
+
+        let idle = db.check_inbox("sid-1", true).unwrap();
+        let summaries: Vec<_> = idle.messages.iter().map(|m| m.summary.as_str()).collect();
+        assert_eq!(summaries, ["go", "column is in"], "oldest first");
+        assert_eq!(idle.waiting, 0);
+        assert!(db.check_inbox("sid-1", true).unwrap().messages.is_empty(), "taken once");
+        assert_eq!(db.events(10).unwrap().iter().filter(|e| e.kind == "message").count(), 2, "the record stays");
+    }
+
+    #[test]
+    fn a_mailbox_that_went_quiet_is_closed() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.upsert_agent("accounts-svc", None, Some("/r"), Some("sid-1"), None, None).unwrap();
+        db.check_inbox("sid-1", false).unwrap();
+        db.conn.execute("UPDATE mailboxes SET polled_at = polled_at - 60", []).unwrap();
+        assert!(!db.mailbox_open("accounts-svc", 15).unwrap());
+    }
+
+    #[test]
+    fn a_retired_agents_session_is_nobody() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.upsert_agent("accounts-svc", None, Some("/r"), Some("sid-1"), None, None).unwrap();
+        db.conn.execute("UPDATE agents SET ended_at = 'now'", []).unwrap();
+        assert_eq!(db.check_inbox("sid-1", true).unwrap().agent, None);
     }
 }

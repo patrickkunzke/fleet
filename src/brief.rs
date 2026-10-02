@@ -160,13 +160,19 @@ pub fn claude_program() -> String {
 /// matches the fleet that started it.
 const SKILL: &str = include_str!("../skills/board/SKILL.md");
 
+/// The mod that delivers board messages from inside the agent's session.
+/// `mod/` is a plugin of its own, so `claude plugin test mod` runs its tests;
+/// what an agent is started with is these two files beside the skill.
+const MOD_HOOKS: &str = include_str!("../mod/hooks/hooks.json");
+const MOD_REGISTER: &str = include_str!("../mod/hooks/register.ts");
+
 /// Where fleet keeps the Claude Code plugin its agents are started with.
 pub fn plugin_dir() -> std::path::PathBuf {
     crate::scope::home().join("claude-plugin")
 }
 
-/// Write the Claude Code plugin that carries the `/board` skill, and say
-/// where it is.
+/// Write the Claude Code plugin that carries the `/board` skill and fleet's
+/// mod, and say where it is.
 ///
 /// Every agent is started with it by `--plugin-dir`, for that session only:
 /// nothing is installed into the user's own Claude Code, and a session fleet
@@ -181,6 +187,8 @@ pub fn write_plugin(dir: &Path) -> std::io::Result<std::path::PathBuf> {
     });
     put(&dir.join(".claude-plugin/plugin.json"), &format!("{manifest:#}\n"))?;
     put(&dir.join("skills/board/SKILL.md"), SKILL)?;
+    put(&dir.join("hooks/hooks.json"), MOD_HOOKS)?;
+    put(&dir.join("hooks/register.ts"), MOD_REGISTER)?;
     Ok(dir.to_path_buf())
 }
 
@@ -575,5 +583,17 @@ mod tests {
         assert_eq!(std::fs::read_to_string(plugin.join("skills/board/SKILL.md")).unwrap(), SKILL, "rewritten");
         let strays: Vec<_> = std::fs::read_dir(plugin.join("skills/board")).unwrap().flatten().map(|e| e.file_name()).collect();
         assert_eq!(strays.len(), 1, "no temporary files left behind: {strays:?}");
+    }
+
+    #[test]
+    fn the_plugin_carries_the_mod_and_names_its_module() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin = write_plugin(dir.path()).unwrap();
+        let hooks: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(plugin.join("hooks/hooks.json")).unwrap()).unwrap();
+        let module = hooks["modules"][0].as_str().unwrap();
+        let register = std::fs::read_to_string(plugin.join("hooks").join(module)).unwrap();
+        assert_eq!(register, MOD_REGISTER);
+        assert!(register.contains("'board', 'inbox'"), "it checks the mailbox fleet answers");
     }
 }
