@@ -4,6 +4,12 @@ Every release of fleet. Each section is written when a pull request with a
 `feat`, `fix` or `perf` commit is merged; see
 [Releases](README.md#releases).
 
+## [0.7.0](https://github.com/patrickkunzke/fleet/releases/tag/v0.7.0) — 2026-10-02
+
+### Features
+
+- **ui:** Show which workers are waiting for a go-ahead
+
 ## [0.6.0](https://github.com/patrickkunzke/fleet/releases/tag/v0.6.0) — 2026-10-02
 
 ### Features

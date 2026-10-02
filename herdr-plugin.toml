@@ -9,7 +9,7 @@
 
 id = "fleet"
 name = "fleet"
-version = "0.6.0"
+version = "0.7.0"
 description = "A chief of staff that delegates to Claude Code agents across repositories, with a task board and a live graph of the crew."
 # 0.9.1 is the first whose `agent focus` moves the screen to the agent, which
 # ↵ in the view relies on.
