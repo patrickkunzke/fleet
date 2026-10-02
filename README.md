@@ -38,8 +38,8 @@ context small, and something has to keep track of what waits on what.
   server running until herdr restarts, and `herdr status` shows both.
 - **[Claude Code](https://claude.com/claude-code)**, the native install
   (`~/.local/bin/claude`), or any `claude` named by `FLEET_CLAUDE`.
-- **A Rust toolchain** (`cargo`), which herdr uses to build the plugin on
-  install.
+- **A Rust toolchain** (`cargo`) only on a machine without a prebuilt
+  binary: macOS and Linux on arm64 and x86_64 have one.
 - macOS or Linux.
 
 ## Install
@@ -48,8 +48,12 @@ context small, and something has to keep track of what waits on what.
 herdr plugin install patrickkunzke/fleet
 ```
 
-herdr shows what it is about to run, clones the repository and builds it
-with `cargo build --release`. Then, in `~/.config/herdr/config.toml`:
+herdr shows what it is about to run, clones the repository and runs its
+build step, `scripts/install.sh`. That downloads the release's prebuilt
+binary for your machine and checks it against the release's `SHA256SUMS`; it
+builds with `cargo build --release --locked` instead when there is no binary
+for your machine, or when the checkout is not a release commit.
+`FLEET_BUILD=source` always builds. Then, in `~/.config/herdr/config.toml`:
 
 ```toml
 [session]
@@ -339,6 +343,12 @@ adds the release's section to [CHANGELOG.md](CHANGELOG.md) from the commits
 ([git-cliff](https://git-cliff.org), `cliff.toml`), commits that as
 `chore(release): vX.Y.Z`, tags it, and publishes the GitHub Release.
 `fleet update` moves users to it.
+
+Then `binaries.yml` builds fleet for macOS and Linux (static, musl), on arm64
+and x86_64, and uploads the four binaries and their `SHA256SUMS` to the
+release. That takes a few minutes; an install in between builds from source.
+To give an existing release its binaries, run the workflow by hand:
+`gh workflow run binaries.yml -f tag=v0.2.1`.
 
 For layout work there is a fixture fleet that needs neither herdr nor a real
 board:

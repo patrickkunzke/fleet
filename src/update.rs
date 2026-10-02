@@ -11,7 +11,8 @@
 //! - `herdr plugin install patrickkunzke/fleet`: install again, at the newest
 //!   tag, through herdr, which shows what it is about to run.
 //! - `herdr plugin link <checkout>`: `git pull --ff-only` on `main` and the
-//!   build, which herdr does not do for a linked plugin.
+//!   build step, `scripts/install.sh`, which herdr does not run for a linked
+//!   plugin.
 //!
 //! Adapted from herdr-projects (`src/update.rs`), Copyright (c) 2026 Elias
 //! Stravik, MIT licensed — see NOTICE.
@@ -225,11 +226,10 @@ pub fn update(check: bool, yes: bool) -> Result<()> {
             }
             println!("\npulling main in {}…", root.display());
             step("git pull", Command::new("git").arg("-C").arg(root).args(["pull", "--ff-only"]))?;
-            println!("building…");
-            step(
-                "cargo build",
-                Command::new("cargo").current_dir(root).args(["build", "--release", "--locked"]),
-            )?;
+            // The prebuilt binary when main is the release commit, a build
+            // otherwise; its own lines say which.
+            println!("installing the binary…");
+            step("scripts/install.sh", Command::new("sh").current_dir(root).arg("scripts/install.sh"))?;
         }
     }
 

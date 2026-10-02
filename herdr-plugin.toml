@@ -16,8 +16,10 @@ description = "A chief of staff that delegates to Claude Code agents across repo
 min_herdr_version = "0.9.1"
 platforms = ["macos", "linux"]
 
+# The release's prebuilt binary for this machine, or a build from source
+# when there is none (scripts/install.sh).
 [[build]]
-command = ["cargo", "build", "--release", "--locked"]
+command = ["sh", "scripts/install.sh"]
 
 [[actions]]
 id = "open"
