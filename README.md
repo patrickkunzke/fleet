@@ -14,8 +14,10 @@ context small, and something has to keep track of what waits on what.
 
 ![The fleet tab in herdr: the chief on the left, the crew's graph and the board on the right](docs/screenshot.png)
 
-- **A chief that delegates.** It plans and dispatches, and starts without
-  Claude Code's editing tools, so it does not quietly do the work itself.
+- **A chief that delegates.** It plans and dispatches, and cannot change
+  files, so it does not quietly do the work itself.
+- **A go-ahead that holds.** A worker cannot change files until its task has
+  a go, from the chief with `fleet board go` or from you typing in its tab.
 - **One agent per repository**, each in a herdr tab named after it, briefed
   on its task, its repo, what it waits on and how to report.
 - **A shared board** of epics, tasks, dependencies and background processes,
@@ -140,8 +142,10 @@ their next command. The doctor action says when a newer release is out.
    starts an agent in each repository involved, and answers them when they
    ask to go ahead.
 
-Every agent asks the chief before it starts changing code, and the chief
-asks you about anything that is yours to decide. You can go to any agent's
+Every agent asks the chief before it starts changing code, and fleet holds
+it to that: its edits are refused until the chief gives its task a go with
+`fleet board go`, or you answer it in its own tab. The chief asks you about
+anything that is yours to decide. You can go to any agent's
 tab and talk to it directly; it is an ordinary Claude Code session.
 
 `prefix+shift+f` opens a new workspace in fleet mode wherever the focused
@@ -192,9 +196,27 @@ pane it goes under the graph.
 The chief is briefed as a chief of staff for the workspace: plan, write the
 tasks down, delegate, and answer the agents. It starts with
 `--disallowed-tools Edit Write NotebookEdit`, because asking was not enough —
-given a ticket touching a single repository, it did the work itself. Not
-airtight, since Bash can still write a file, but it removes the path of least
-resistance.
+given a ticket touching a single repository, it did the work itself. fleet's
+mod (see [Messages](#messages)) also refuses the chief's Bash commands that
+write files: redirects, `sed -i`, `tee`, `cp`, `mv`, `rm`, `git commit` and the
+like, outside `/tmp`. Not airtight, since a pattern cannot know every way a
+command writes, but it closes the paths of least resistance.
+
+A worker does not change files until its task has a go-ahead. It reads its
+task, sends the chief its plan, and its Edit, Write and file-writing Bash
+calls are refused, with a reason that says to wait, until either the chief
+answers with
+
+```bash
+fleet board go ENG-2553-2 "go — keep the old column until billing is on it"
+```
+
+which records the go and sends the message in one step, or you type a prompt
+in the worker's own tab: talking to it there is your go. A worker cannot run
+`fleet board go` itself. Anything short of a go, such as a question or "hold
+off", is a `fleet board msg` and leaves it waiting. A task approved before
+anyone claims it is approved for whoever does. Like message delivery, this
+needs the mod: without it, the go-ahead is only asked for, as it was.
 
 It delegates with `fleet spawn`, which opens a tab in the repository, briefs
 the agent, and claims the task on the board in the same step, so it cannot be

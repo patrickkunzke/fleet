@@ -816,6 +816,86 @@ pub struct Inbox {
     pub waiting: i64,
 }
 
+/// What fleet's mod needs to decide whether a session may edit.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Gate {
+    /// The agent the session is, or None for one the board does not know.
+    pub agent: Option<String>,
+    pub role: Option<String>,
+    /// The agent's open tasks (queued, running or blocked), oldest first.
+    pub tasks: Vec<String>,
+    /// Whether one of them has a go-ahead. A worker with no open task has
+    /// nothing to wait for, and counts as approved.
+    pub approved: bool,
+}
+
+// ------------------------------------------------------------ approvals ---
+
+impl Db {
+    /// Give `task` its go-ahead, and say who works on it, so the go can be
+    /// sent to them.
+    pub fn approve(&self, task: &str, by: &str) -> Result<Option<String>> {
+        let owner: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT a.name FROM tasks t LEFT JOIN agents a ON a.id = t.agent_id WHERE t.key = ?1",
+                params![task],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(owner) = owner else {
+            bail!("unknown task '{task}'");
+        };
+        self.conn.execute(
+            "INSERT INTO approvals (task_key, by) VALUES (?1, ?2)
+             ON CONFLICT (task_key) DO UPDATE
+               SET by = excluded.by, approved_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
+            params![task, by],
+        )?;
+        Ok(owner)
+    }
+
+    /// Whether the session may edit, and, with `user_approves`, the person at
+    /// the keyboard giving its agent's open tasks their go first.
+    pub fn gate(&self, session_id: &str, user_approves: bool) -> Result<Gate> {
+        let agent: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT name, role FROM agents WHERE session_id = ?1 AND ended_at IS NULL",
+                params![session_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((agent, role)) = agent else {
+            return Ok(Gate::default());
+        };
+        let mut stmt = self.conn.prepare(
+            "SELECT t.key FROM tasks t JOIN agents a ON a.id = t.agent_id
+             WHERE a.name = ?1 AND t.state IN ('queued', 'running', 'blocked')
+             ORDER BY t.id",
+        )?;
+        let tasks = stmt
+            .query_map(params![agent], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        if user_approves && role == "worker" {
+            for task in &tasks {
+                self.approve(task, "user")?;
+            }
+        }
+        let approved = tasks.is_empty()
+            || self
+                .conn
+                .prepare(
+                    "SELECT 1 FROM approvals p JOIN tasks t ON t.key = p.task_key
+                     JOIN agents a ON a.id = t.agent_id
+                     WHERE a.name = ?1 AND t.state IN ('queued', 'running', 'blocked')",
+                )?
+                .exists(params![agent])?;
+        Ok(Gate { agent: Some(agent), role: Some(role), tasks, approved })
+    }
+}
+
 // ---------------------------------------------------------------- inbox ---
 
 impl Db {
@@ -1756,5 +1836,56 @@ mod tests {
         db.upsert_agent("accounts-svc", None, Some("/r"), Some("sid-1"), None, None).unwrap();
         db.conn.execute("UPDATE agents SET ended_at = 'now'", []).unwrap();
         assert_eq!(db.check_inbox("sid-1", true).unwrap().agent, None);
+    }
+
+    fn assigned(db: &Db) {
+        db.upsert_agent("chief", Some("chief"), None, Some("sid-chief"), None, None).unwrap();
+        db.upsert_agent("accounts-svc", None, Some("/r"), Some("sid-1"), None, None).unwrap();
+        db.add_task(&NewTask { key: "ENG-1-1", title: "t", repo: "/r", ..Default::default() })
+            .unwrap();
+        db.claim("ENG-1-1", "accounts-svc").unwrap();
+    }
+
+    #[test]
+    fn a_worker_with_an_open_task_waits_for_its_go() {
+        let db = Db::open_in_memory().unwrap();
+        assigned(&db);
+        let gate = db.gate("sid-1", false).unwrap();
+        assert_eq!(gate.tasks, ["ENG-1-1"]);
+        assert!(!gate.approved);
+
+        assert_eq!(db.approve("ENG-1-1", "chief").unwrap().as_deref(), Some("accounts-svc"));
+        assert!(db.gate("sid-1", false).unwrap().approved);
+    }
+
+    #[test]
+    fn the_person_at_the_keyboard_approves_by_typing_in_the_workers_pane() {
+        let db = Db::open_in_memory().unwrap();
+        assigned(&db);
+        assert!(db.gate("sid-1", true).unwrap().approved);
+        assert!(db.gate("sid-1", false).unwrap().approved, "and it stays given");
+    }
+
+    #[test]
+    fn typing_in_the_chiefs_pane_approves_nothing() {
+        let db = Db::open_in_memory().unwrap();
+        assigned(&db);
+        db.gate("sid-chief", true).unwrap();
+        assert!(!db.gate("sid-1", false).unwrap().approved);
+    }
+
+    #[test]
+    fn a_worker_with_no_open_task_has_nothing_to_wait_for() {
+        let db = Db::open_in_memory().unwrap();
+        assigned(&db);
+        db.transition("ENG-1-1", State::Review, None).unwrap();
+        assert!(db.gate("sid-1", false).unwrap().approved);
+        assert_eq!(db.gate("sid-unknown", false).unwrap(), Gate::default());
+    }
+
+    #[test]
+    fn a_go_on_a_task_that_does_not_exist_is_refused() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(db.approve("ENG-404", "chief").is_err());
     }
 }
