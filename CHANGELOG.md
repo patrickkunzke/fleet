@@ -4,6 +4,12 @@ Every release of fleet. Each section is written when a pull request with a
 `feat`, `fix` or `perf` commit is merged; see
 [Releases](README.md#releases).
 
+## [0.8.0](https://github.com/patrickkunzke/fleet/releases/tag/v0.8.0) — 2026-10-02
+
+### Features
+
+- **ui:** Show each agent's running tool and context fullness
+
 ## [0.7.0](https://github.com/patrickkunzke/fleet/releases/tag/v0.7.0) — 2026-10-02
 
 ### Features
