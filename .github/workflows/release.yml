@@ -15,11 +15,6 @@ on:
   push:
     branches: [main]
 
-# One release at a time, and none dropped: a second merge waits its turn.
-concurrency:
-  group: release
-  cancel-in-progress: false
-
 permissions:
   contents: write
 
@@ -27,6 +22,14 @@ jobs:
   release:
     # Its own commit comes back through here.
     if: ${{ !startsWith(github.event.head_commit.message, 'chore(release):') }}
+    # One release at a time: a second merge waits for the first's commit and
+    # tag. Only this job, not the binaries after it: GitHub keeps one run
+    # waiting per group and cancels an older one, so a group held for the
+    # builds could drop a merge that came in meanwhile. A skipped run never
+    # joins the group.
+    concurrency:
+      group: release
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.next.outputs.version }}
