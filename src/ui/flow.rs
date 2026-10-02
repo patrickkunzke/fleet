@@ -302,6 +302,7 @@ mod tests {
                 target: None,
                 pid: None,
                 asking: false,
+                awaiting_go: None,
             })
             .collect()
     }

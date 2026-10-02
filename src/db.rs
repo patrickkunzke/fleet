@@ -115,6 +115,10 @@ pub struct Agent {
     pub task_key: Option<String>,
     pub task_title: Option<String>,
     pub bg_running: i64,
+    /// The task a worker cannot start until it has a go-ahead, when its mod
+    /// is there to enforce that. Without the mod nothing records the user's
+    /// go, so nothing is said.
+    pub awaiting_go: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -280,8 +284,44 @@ impl Db {
                     task_key: r.get(6)?,
                     task_title: r.get(7)?,
                     bg_running: r.get(8)?,
+                    awaiting_go: None,
                 })
             })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        let mut rows = rows;
+        for (agent, task) in self.awaiting_go()? {
+            if let Some(a) = rows.iter_mut().find(|a| a.name == agent) {
+                a.awaiting_go = Some(task);
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Each worker whose open tasks have no go-ahead between them, with the
+    /// oldest of those tasks, among the workers whose mod checked in lately.
+    ///
+    /// Only a task it could start: one that is blocked, or waits on another
+    /// that is not done, is waiting on that, and the card already says so.
+    fn awaiting_go(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            // A bare column beside min() is SQLite's: the key of the row
+            // with the smallest id, so the oldest task.
+            "SELECT a.name, t.key, min(t.id) FROM agents a
+             JOIN tasks t ON t.agent_id = a.id AND t.state IN ('queued', 'running')
+               AND NOT EXISTS (
+                 SELECT 1 FROM task_deps d JOIN tasks p ON p.id = d.depends_on
+                 WHERE d.task_id = t.id AND p.state <> 'done')
+             JOIN mailboxes m ON m.agent = a.name
+             WHERE a.role = 'worker' AND a.ended_at IS NULL
+               AND m.polled_at >= CAST(strftime('%s', 'now') AS INTEGER) - ?1
+               AND NOT EXISTS (
+                 SELECT 1 FROM approvals p JOIN tasks o ON o.key = p.task_key
+                 WHERE o.agent_id = a.id AND o.state IN ('queued', 'running', 'blocked'))
+             GROUP BY a.name",
+        )?;
+        let rows = stmt
+            .query_map(params![MAILBOX_QUIET], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -895,6 +935,11 @@ impl Db {
         Ok(Gate { agent: Some(agent), role: Some(role), tasks, approved })
     }
 }
+
+/// How long a mailbox may go without a check before fleet stops trusting
+/// the mod to be there: to pick a message up, or to hold an edit back. The
+/// mod checks every three seconds; this leaves room for a slow one.
+pub const MAILBOX_QUIET: i64 = 15;
 
 // ---------------------------------------------------------------- inbox ---
 
@@ -1887,5 +1932,26 @@ mod tests {
     fn a_go_on_a_task_that_does_not_exist_is_refused() {
         let db = Db::open_in_memory().unwrap();
         assert!(db.approve("ENG-404", "chief").is_err());
+    }
+
+    #[test]
+    fn a_worker_whose_mod_holds_its_edits_is_awaiting_its_go() {
+        let mut db = Db::open_in_memory().unwrap();
+        assigned(&db);
+        let awaiting = |db: &Db| {
+            db.agents().unwrap().into_iter().find(|a| a.name == "accounts-svc").unwrap().awaiting_go
+        };
+        assert_eq!(awaiting(&db), None, "no mod checking in: nothing holds it, so nothing is said");
+
+        db.check_inbox("sid-1", false).unwrap();
+        assert_eq!(awaiting(&db).as_deref(), Some("ENG-1-1"));
+
+        db.transition("ENG-1-1", State::Blocked, Some("needs the flag")).unwrap();
+        assert_eq!(awaiting(&db), None, "blocked: waiting on that, not on a go");
+        db.transition("ENG-1-1", State::Running, None).unwrap();
+        assert_eq!(awaiting(&db).as_deref(), Some("ENG-1-1"));
+
+        db.approve("ENG-1-1", "chief").unwrap();
+        assert_eq!(awaiting(&db), None);
     }
 }

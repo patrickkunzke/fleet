@@ -2,13 +2,13 @@ import { test, expect, mock } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 /** A board that answers `fleet board inbox` with what it holds. */
-function board(on: On, held: string[]) {
+function board(on: On, held: string[], awaiting_go: string | null = null) {
   const runs: string[][] = []
   on('process.run', ($, e) => {
     runs.push([...e.argv])
     const take = e.argv.includes('--take')
     const text = take && held.length ? held.splice(0).join('\n\n') : null
-    const stdout = JSON.stringify({ agent: 'accounts-svc', text, waiting: take ? 0 : held.length })
+    const stdout = JSON.stringify({ agent: 'accounts-svc', text, waiting: take ? 0 : held.length, awaiting_go })
     return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   return runs
@@ -86,6 +86,24 @@ test('what waited through a turn is taken when the turn ends, not when a subagen
   await $.turn.complete(done)
   await clock.advance(3_000)
   expect(submitted).toEqual(['[fleet · chief] go'])
+})
+
+test('a worker held back from editing says what it waits for under its prompt', async ($, on) => {
+  mock.env(on, { FLEET_DB: '/tmp/fleet.db' })
+  const clock = mock.clock(on)
+  const held: string[] = []
+  board(on, held, 'ENG-1-1')
+  const { status } = session(on)
+  on('turn.start', ($, e) => ({ turnId: e.turnId }))
+
+  await $.session.start(start)
+  await clock.advance(3_000)
+  expect(status.at(-1)).toBe('waiting for a go on ENG-1-1')
+
+  await $.turn.start({ text: 'work', turnId: 't-0' })
+  held.push('[fleet · chief] what is the plan?')
+  await clock.advance(3_000)
+  expect(status.at(-1)).toBe('waiting for a go on ENG-1-1 · 1 message waiting for this turn to end')
 })
 
 test('a session fleet did not start leaves the board alone', async ($, on) => {

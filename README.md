@@ -218,6 +218,14 @@ off", is a `fleet board msg` and leaves it waiting. A task approved before
 anyone claims it is approved for whoever does. Like message delivery, this
 needs the mod: without it, the go-ahead is only asked for, as it was.
 
+A worker waiting for its go is easy to spot. Its card in the graph reads
+`◇ needs a go` once it is idle (`● planning` while it is still reading and
+writing its plan), the header counts it, its herdr sidebar label says
+`ENG-2553-2 · needs a go`, and herdr notifies you once when it stops to
+wait. In the worker's own tab, the line under its prompt says `waiting for a
+go on ENG-2553-2`. A task that is blocked, or waits on another, is waiting on
+that instead, and is not shown as needing a go.
+
 It delegates with `fleet spawn`, which opens a tab in the repository, briefs
 the agent, and claims the task on the board in the same step, so it cannot be
 dispatched twice:

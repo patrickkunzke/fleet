@@ -317,11 +317,6 @@ enum BgCmd {
     Ls,
 }
 
-/// How long a mailbox may go without a check before fleet stops trusting
-/// the mod to pick a message up, and types it into the pane instead. The mod
-/// checks every three seconds; this leaves room for a slow one.
-const MAILBOX_QUIET: i64 = 15;
-
 /// Knock at the recipient's door, and say whether anyone was in.
 ///
 /// Every outcome is reported rather than returned as an error: the message
@@ -349,7 +344,7 @@ fn knock(
     };
     // A session whose mod is checking in takes the message itself, once it
     // is idle, rather than having it typed into a prompt it may be busy at.
-    if db.mailbox_open(to, MAILBOX_QUIET).unwrap_or(false) {
+    if db.mailbox_open(to, db::MAILBOX_QUIET).unwrap_or(false) {
         return match db.queue_message(event, to) {
             Ok(()) => format!("queued for {to}: it arrives when {to} is next idle"),
             Err(e) => format!("not delivered: {e}"),
@@ -814,10 +809,17 @@ fn board(cmd: BoardCmd, path: Option<PathBuf>, fleet: Option<String>) -> Result<
         BoardCmd::Inbox { session, take } => {
             let inbox = db.check_inbox(&session, take)?;
             let text = (!inbox.messages.is_empty()).then(|| msg::prompt(&inbox.messages));
+            // The mod says this under the prompt, so the agent's own tab
+            // shows what it is waiting for as well as the fleet view.
+            let gate = db.gate(&session, false)?;
+            let awaiting_go = (gate.role.as_deref() == Some("worker") && !gate.approved)
+                .then(|| gate.tasks.first().cloned())
+                .flatten();
             let out = serde_json::json!({
                 "agent": inbox.agent,
                 "text": text,
                 "waiting": inbox.waiting,
+                "awaiting_go": awaiting_go,
             });
             println!("{out}");
         }

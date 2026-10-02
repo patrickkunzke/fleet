@@ -799,6 +799,15 @@ fn state_of(r: &Row) -> (&'static str, Color) {
     if r.asking {
         return ("! needs you", theme::ACCENT);
     }
+    // Held back from editing until the chief or the user says go: idle, it
+    // is waiting on that; mid-turn, it can read and plan but not change.
+    if r.awaiting_go.is_some() {
+        match r.presence {
+            Presence::Waiting => return ("◇ needs a go", theme::ACCENT),
+            Presence::Working => return ("● planning", theme::BUSY),
+            _ => {}
+        }
+    }
     match (r.role, r.presence) {
         (_, Presence::Working) => ("● working", theme::BUSY),
         (Role::Chief, Presence::Waiting) => ("○ waiting on you", theme::OK),
@@ -992,6 +1001,7 @@ mod tests {
             target: None,
             pid: None,
             asking: false,
+            awaiting_go: None,
         }
     }
 
