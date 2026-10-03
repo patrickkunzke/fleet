@@ -4,6 +4,12 @@ Every release of fleet. Each section is written when a pull request with a
 `feat`, `fix` or `perf` commit is merged; see
 [Releases](README.md#releases).
 
+## [0.13.0](https://github.com/patrickkunzke/fleet/releases/tag/v0.13.0) — 2026-10-03
+
+### Features
+
+- **mod:** Give agents the board as tools
+
 ## [0.12.0](https://github.com/patrickkunzke/fleet/releases/tag/v0.12.0) — 2026-10-03
 
 ### Features
