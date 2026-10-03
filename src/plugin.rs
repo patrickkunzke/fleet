@@ -369,11 +369,20 @@ pub fn doctor() -> Result<()> {
         },
     );
 
+    // Outside herdr the crew runs as Claude Code background sessions, which
+    // need a Claude Code that has them.
     let inside = herdr::inside();
+    let background = !inside && crate::background::Background::detect().available();
     say(
-        inside,
+        inside || background,
         "running in",
-        if inside { "a herdr pane".into() } else { "a plain terminal: fleet runs only inside herdr".into() },
+        if inside {
+            "a herdr pane: agents get tabs of their own".into()
+        } else if background {
+            "a plain terminal: agents run as Claude Code background sessions (`claude agents`)".into()
+        } else {
+            "a plain terminal, and `claude agents` does not answer: update Claude Code, or run fleet in herdr".into()
+        },
     );
 
     let program = brief::claude_program();

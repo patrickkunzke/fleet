@@ -1,4 +1,5 @@
-//! Where an agent's terminal lives: a herdr tab, or a pane beside the view.
+//! Where an agent's terminal lives: a herdr tab, a pane beside the view, or,
+//! outside herdr, a Claude Code background session (`background.rs`).
 //!
 //! herdr draws the agent's pane; fleet only asks it to open one, type a
 //! command into it, and knock with a message. Everything else — the board,
@@ -14,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
+use crate::background::{self, Background};
 use crate::brief::{self, Brief};
 use crate::herdr::{Herdr, Pane};
 
@@ -26,7 +28,7 @@ pub const CHIEF_SHARE: f32 = 0.5;
 /// herdr, and the workspace new agents open in: the one fleet itself runs
 /// in, so the crew sits together in one herdr sidebar entry.
 #[derive(Debug, Clone)]
-pub struct Host {
+pub struct HerdrHost {
     pub herdr: Herdr,
     pub workspace: String,
     /// The fleet the agents belong to, which their herdr names carry.
@@ -41,6 +43,127 @@ pub enum What<'a> {
     Resume { brief: &'a Brief, session: &'a str, program: &'a str },
     /// A given command line, unbriefed — the plumbing without an agent.
     Command(&'a str),
+}
+
+/// Where fleet starts and finds its agents: herdr when it runs inside it,
+/// background sessions otherwise. A board can hold agents of both, from
+/// before and after a move, so each call goes by the agent's target rather
+/// than by which host this is.
+#[derive(Debug, Clone)]
+pub enum Host {
+    Herdr(HerdrHost),
+    Background(Background),
+}
+
+impl Host {
+    /// herdr when fleet runs inside it, background sessions otherwise.
+    /// `FLEET_HOST=herdr` or `FLEET_HOST=background` decides instead.
+    pub fn detect() -> Result<Host> {
+        let wanted = std::env::var("FLEET_HOST").unwrap_or_default();
+        match wanted.as_str() {
+            "herdr" => return Ok(Host::Herdr(HerdrHost::from_env().context("FLEET_HOST=herdr, and this is not a herdr pane")?)),
+            "background" => return Host::background(),
+            "" => {}
+            other => bail!("FLEET_HOST is '{other}': herdr or background"),
+        }
+        match HerdrHost::from_env() {
+            Some(h) => Ok(Host::Herdr(h)),
+            None => Host::background(),
+        }
+    }
+
+    fn background() -> Result<Host> {
+        let bg = Background::detect();
+        if !bg.available() {
+            bail!(
+                "outside herdr, fleet runs its agents as Claude Code background sessions, \
+                 and `claude agents` does not answer here. Update Claude Code, or start fleet from a herdr pane"
+            );
+        }
+        Ok(Host::Background(bg))
+    }
+
+    /// The same host, starting agents for the fleet whose board this is.
+    pub fn in_fleet(self, board: Option<&Path>) -> Host {
+        match self {
+            Host::Herdr(h) => Host::Herdr(h.in_fleet(board)),
+            other => other,
+        }
+    }
+
+    /// herdr, when this is it: for what only herdr does, its sidebar and
+    /// notifications.
+    pub fn herdr(&self) -> Option<&HerdrHost> {
+        match self {
+            Host::Herdr(h) => Some(h),
+            Host::Background(_) => None,
+        }
+    }
+
+    fn background_for(&self) -> Background {
+        match self {
+            Host::Background(b) => b.clone(),
+            Host::Herdr(_) => Background::detect(),
+        }
+    }
+
+    pub fn settle(&self, placed: &Placed, timeout: Duration) -> bool {
+        if background::is_background(&placed.target) {
+            return self.background_for().settle(&placed.target, timeout);
+        }
+        match self {
+            Host::Herdr(h) => h.settle(placed, timeout),
+            Host::Background(_) => false,
+        }
+    }
+
+    pub fn session_at(&self, target: &str) -> Option<String> {
+        if background::is_background(target) {
+            return self.background_for().find(target)?.session_id;
+        }
+        self.herdr()?.session_at(target)
+    }
+
+    pub fn focus(&self, target: &str) -> Result<()> {
+        if background::is_background(target) {
+            bail!("it runs in the background: {}", Background::attach_hint(target));
+        }
+        match self.herdr() {
+            Some(h) => h.focus(target),
+            None => bail!("it is in herdr, and this is not"),
+        }
+    }
+
+    pub fn close(&self, target: &str) -> Result<String> {
+        self.close_with(target, false)
+    }
+
+    pub fn close_now(&self, target: &str) -> Result<String> {
+        self.close_with(target, true)
+    }
+
+    fn close_with(&self, target: &str, now: bool) -> Result<String> {
+        if background::is_background(target) {
+            let bg = self.background_for();
+            if !now && bg.is_working(target) {
+                // Worded as herdr's is: a handoff reads "left open" as "not closed".
+                return Ok("its session is left open: it is still working; stop it when it stops".into());
+            }
+            return bg.stop(target);
+        }
+        match self.herdr() {
+            Some(h) if now => h.close_now(target),
+            Some(h) => h.close(target),
+            None => Ok("its tab is left open: this is not herdr".into()),
+        }
+    }
+
+    pub fn is_working(&self, target: &str) -> bool {
+        if background::is_background(target) {
+            return self.background_for().is_working(target);
+        }
+        self.herdr().is_some_and(|h| h.is_working(target))
+    }
 }
 
 /// A terminal opened for an agent.
@@ -59,16 +182,18 @@ pub struct Placed {
     herdr_name: String,
 }
 
-impl Host {
+impl Placed {
+    /// A background session: no pane, no shell, nothing to name.
+    pub fn background(target: String, place: String) -> Placed {
+        Placed { target, place, pid: 0, pane: String::new(), herdr_name: String::new() }
+    }
+}
+
+impl HerdrHost {
     /// The same host, starting agents for the fleet whose board this is.
-    pub fn in_fleet(mut self, board: Option<&Path>) -> Host {
+    pub fn in_fleet(mut self, board: Option<&Path>) -> HerdrHost {
         self.fleet = board.and_then(crate::scope::fleet_of);
         self
-    }
-
-    /// The herdr fleet is running in, or why it is not.
-    pub fn detect() -> Result<Host> {
-        Host::from_env().context("fleet runs inside herdr: start it from a herdr pane, or with the plugin's fleet.open")
     }
 
     /// The command line for `what`, with the brief read from files and the
@@ -195,15 +320,15 @@ fn closing(pane: &str, status: &str, own_pane: Option<&str>, shared: bool) -> Cl
     }
 }
 
-impl Host {
+impl HerdrHost {
     /// The herdr session and workspace this pane is in, when it is in one.
-    pub fn from_env() -> Option<Host> {
+    pub fn from_env() -> Option<HerdrHost> {
         if !crate::herdr::inside() {
             return None;
         }
         let herdr = Herdr::from_env()?;
         let workspace = std::env::var("HERDR_WORKSPACE_ID").ok().filter(|w| !w.is_empty())?;
-        Some(Host { herdr, workspace, fleet: None })
+        Some(HerdrHost { herdr, workspace, fleet: None })
     }
 
     /// A tab of its own per agent, labelled with its name. A Claude Code
@@ -266,7 +391,7 @@ impl Host {
     }
 }
 
-impl Host {
+impl HerdrHost {
     /// The pane the fleet view runs in, in this workspace.
     pub fn view_pane(&self) -> Option<Pane> {
         self.herdr.panes(&self.workspace).ok()?.into_iter().find(|p| p.label == crate::plugin::TAB)

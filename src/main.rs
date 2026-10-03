@@ -3,6 +3,7 @@
 //! the chief to delegate, and `fleet board` for everyone to coordinate.
 
 mod agent;
+mod background;
 mod brief;
 mod db;
 mod herdr;
@@ -21,7 +22,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use crate::db::Db;
-use crate::host::{Host, What};
+use crate::host::{HerdrHost, Host, What};
 
 #[derive(Parser)]
 #[command(name = "fleet", version, about = "Orchestrate Claude Code sessions across repos, inside herdr")]
@@ -379,11 +380,16 @@ fn knock(
     let Some(target) = agent.target.as_deref() else {
         return format!("not delivered: {to} has no pane fleet can reach");
     };
+    if background::is_background(target) {
+        // No prompt to type at: a background session's messages go through
+        // its mod, and the mailbox check above found it quiet.
+        return format!("not delivered: {to} runs in the background, and its mod is not checking in; it is on the board");
+    }
     if !host::is_herdr(target) {
         // A tmux window, from before fleet ran only in herdr.
         return format!("not delivered: {to} is not in herdr");
     }
-    let Some(host) = Host::from_env() else {
+    let Some(host) = HerdrHost::from_env() else {
         return format!("not delivered: {to} is in herdr, and this is not");
     };
     let text = msg::line(from, task, summary, body);
@@ -511,7 +517,7 @@ fn handoff(name: &str, note: Option<&str>, now: bool, timeout: u64, db_path: Opt
     // The old session goes before the new one comes: herdr names a tab for
     // its agent, and two of one name is one too many.
     let closed = match agent.target.as_deref() {
-        Some(t) if host::is_herdr(t) => {
+        Some(t) if host::is_herdr(t) || background::is_background(t) => {
             let said = if now { host.close_now(t) } else { host.close(t) };
             said.unwrap_or_else(|e| format!("its tab could not be closed: {e}"))
         }
@@ -607,23 +613,22 @@ fn spawn(
     }
     println!("{}  {}", spawned.name, spawned.placed.place);
 
-    if !host.settle(&spawned.placed, Duration::from_secs(timeout)) {
-        println!("      herdr has not recognised an agent in it yet");
-    }
-    if let Some(sid) = host.session_at(&spawned.placed.target) {
-        agent::link(&db, &spawned.name, &sid, run)?;
-        println!("      adopted session {sid}");
-        return Ok(());
-    }
-    match agent::adopt(spawned.placed.pid, Duration::from_secs(timeout)) {
-        Some(found) => {
-            agent::link(&db, &spawned.name, &found.session_id, run)?;
-            println!("      adopted session {} (pid {})", found.session_id, found.pid);
+    match agent::found_session(&host, &spawned.placed, Duration::from_secs(timeout)) {
+        Some(sid) => {
+            agent::link(&db, &spawned.name, &sid, run)?;
+            println!("      adopted session {sid}");
         }
+        None if background::is_background(&spawned.placed.target) => println!(
+            "      no session listed yet; `claude agents` shows it, and it is linked once it reports"
+        ),
         None => println!(
             "      no session yet — it may be waiting at a dialog in its tab; \
              the fleet tab links it once it has one"
         ),
+    }
+    // Where to find it, when there is no tab to switch to.
+    if background::is_background(&spawned.placed.target) {
+        println!("      {}", background::Background::attach_hint(&spawned.placed.target));
     }
     Ok(())
 }
@@ -827,9 +832,9 @@ fn board(cmd: BoardCmd, path: Option<PathBuf>, fleet: Option<String>) -> Result<
             }
             let tab = match (keep_tab, target.as_deref()) {
                 (true, _) => "its tab is left open".to_string(),
-                (false, Some(t)) if host::is_herdr(t) => match Host::from_env() {
-                    Some(host) => host.close(t).unwrap_or_else(|e| format!("its tab could not be closed: {e}")),
-                    None => "its tab is left open: this is not herdr".into(),
+                (false, Some(t)) if host::is_herdr(t) || background::is_background(t) => match Host::detect() {
+                    Ok(host) => host.close(t).unwrap_or_else(|e| format!("it could not be closed: {e}")),
+                    Err(_) => "its tab is left open: this is not herdr".into(),
                 },
                 (false, _) => "it had no herdr tab".into(),
             };

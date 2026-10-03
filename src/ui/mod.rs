@@ -639,14 +639,13 @@ impl App {
         let tx = self.tx.clone();
         let run = self.run;
         std::thread::spawn(move || {
-            host.settle(&spawned.placed, Duration::from_secs(30));
-            let Some(found) = agent::adopt(spawned.placed.pid, Duration::from_secs(30)) else {
+            let Some(found) = agent::found_session(&host, &spawned.placed, Duration::from_secs(30)) else {
                 return;
             };
             // A separate connection: this thread cannot borrow the one the UI
             // is using, and SQLite in WAL mode is happy with both.
             if let Ok(db) = Db::open(&db_path) {
-                let _ = agent::link(&db, &spawned.name, &found.session_id, run);
+                let _ = agent::link(&db, &spawned.name, &found, run);
             }
             let _ = tx.send(Msg::Registry);
         });
@@ -1048,10 +1047,12 @@ pub fn run(db: Db, db_path: PathBuf, root: Option<PathBuf>, host: Host) -> Resul
     spawn_registry(tx.clone());
     spawn_board_watch(tx.clone(), &app.db_path);
     spawn_frames(tx.clone());
-    if let Some(host) = app.host.clone() {
+    // herdr's agents and its sidebar and notifications: outside herdr the
+    // crew is drawn from the board and the session registry alone.
+    if let Some(herdr) = app.host.as_ref().and_then(Host::herdr).map(|h| h.herdr.clone()) {
         let back = tx.clone();
-        hosting::follow(host.herdr.clone(), move |agents| back.send(Msg::Agents(agents)).is_ok());
-        app.jobs = Some(hosting::worker(host.herdr));
+        hosting::follow(herdr.clone(), move |agents| back.send(Msg::Agents(agents)).is_ok());
+        app.jobs = Some(hosting::worker(herdr));
     }
     spawn_ticker(tx);
 
@@ -1352,11 +1353,11 @@ mod tests {
         db.upsert_agent("chief", Some("chief"), None, None, Some("herdr:chief"), None).unwrap();
         db.upsert_agent("billing-svc", None, Some("/repo/content"), None, Some("herdr:billing-svc"), None)
             .unwrap();
-        let host = Host {
+        let host = Host::Herdr(crate::host::HerdrHost {
             herdr: crate::herdr::Herdr::with(bin.to_string_lossy(), dir.join("sock")),
             workspace: "w1".into(),
             fleet: None,
-        };
+        });
         let mut app = App::new(db, PathBuf::from(":memory:"), Some(PathBuf::from("/nowhere")), Some(host));
         app.refresh();
         app
