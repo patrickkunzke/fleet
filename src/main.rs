@@ -564,7 +564,10 @@ fn spawn(
     } else {
         assignment.as_ref().map_or_else(
             || brief::worker(name, repo, None, None),
-            |(t, body, _)| brief::worker(name, repo, Some(t), body.as_deref()),
+            |(t, body, _)| {
+                let approved = db.approved(&t.key).unwrap_or(false);
+                brief::worker_with(name, repo, Some(t), body.as_deref(), approved)
+            },
         )
     };
     let program = brief::claude_program();
