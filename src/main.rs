@@ -75,8 +75,13 @@ enum Command {
         root: Option<PathBuf>,
         /// Go back into the last chief's conversation, and its run, rather
         /// than starting a new one.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "adopt")]
         resume: bool,
+        /// Make a Claude Code session already running the chief, rather than
+        /// starting one: what `/fleet start` runs. Prints, as JSON, what that
+        /// session's mod needs.
+        #[arg(long, value_name = "SESSION")]
+        adopt: Option<String>,
     },
     /// Start an agent, in a herdr tab or as a background session, and
     /// register it on the board.
@@ -486,7 +491,10 @@ fn main() -> Result<()> {
             timeout,
             db,
         } => spawn(&name, &repo, task.as_deref(), &role, command.as_deref(), timeout, db, None),
-        Command::Chief { root, resume } => chief::run(root, resume),
+        Command::Chief { root, resume, adopt } => match adopt {
+            Some(session) => chief::adopt(root, &session),
+            None => chief::run(root, resume),
+        },
         Command::Handoff { agent, note, now, timeout, db } => handoff(&agent, note.as_deref(), now, timeout, db),
     }
 }

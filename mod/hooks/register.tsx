@@ -275,6 +275,27 @@ async function runBoardTool($: EngineInterface, tool: BoardTool, input: Record<s
   }
 }
 
+/** Register the board's tools in this session. */
+async function registerTools($: EngineInterface) {
+  for (const t of BOARD_TOOLS) {
+    try {
+      await $.tool.register({ name: t.name, description: t.description, inputSchema: { type: 'object', properties: t.properties, required: t.required } })
+    } catch {
+      // A name already taken: the `fleet board` command still is.
+    }
+  }
+}
+
+/** What `fleet chief --adopt` prints. */
+type Adopted = { board: string; run: number; bin: string | null; brief: string }
+
+/**
+ * A plain `fleet board`, `fleet spawn` or `fleet handoff` command: what a
+ * fleet session runs without being asked. Anything that chains, pipes,
+ * redirects or substitutes is left to the usual prompt.
+ */
+const FLEET_COMMAND = /^\s*fleet\s+(?:board|spawn|handoff)\b[^;&|`$<>\n]*$/
+
 /** A worker reaching for the go-ahead it is waiting for. */
 const SELF_APPROVAL = /\bfleet\s+board\s+(?:go|gate)\b/
 
@@ -392,8 +413,11 @@ function notify($: EngineInterface, s: Snapshot, seen: Set<string> | undefined):
 }
 
 export const register: Register = on => {
-  // Set once the session has started and turns out to be one of fleet's.
+  // The session's id, once it has started.
   let session: string | undefined
+  // Whether it is part of a fleet: started by one (FLEET_DB is set), or made
+  // its chief with /fleet start. Until then the plugin does nothing at all.
+  let active = false
 
   // The view's own: see the header.
   // Set once the board says this session is a worker: it draws nothing.
@@ -417,25 +441,27 @@ export const register: Register = on => {
   const running: string[] = []
 
   on('session.start', async ($, e, next) => {
-    // Only a session fleet started has a board. The plugin is handed to no
-    // other, but a mod that checks costs nothing.
-    if (!e.isInteractive || !(await $.env.get('FLEET_DB'))) return next(e)
+    if (!e.isInteractive) return next(e)
     const id = await $.session.id()
     session = id
-
-    // The board as tools, in every session fleet started. Which ones the
-    // chief alone may use is settled when they are called: a session is put
-    // on the board, and so has a role, only after it starts.
-    for (const t of BOARD_TOOLS) {
-      try {
-        await $.tool.register({ name: t.name, description: t.description, inputSchema: { type: 'object', properties: t.properties, required: t.required } })
-      } catch {
-        // A name already taken: the `fleet board` command still is.
-      }
+    // /fleet, in every session with the plugin: in one fleet started it
+    // shows the fleet, in any other `/fleet start` makes it the chief.
+    try {
+      await $.command.register({ name: 'fleet', description: 'Show the fleet, or `/fleet start` to make this session its chief', argumentHint: '[start]' })
+    } catch {
+      // A command of that name already: the band and toasts still work.
     }
 
+    // A session fleet started has a board from the start. Any other waits
+    // for /fleet start, and the timers below do nothing until then.
+    active = Boolean(await $.env.get('FLEET_DB'))
+    // The board as tools. Which ones the chief alone may use is settled when
+    // they are called: a session is put on the board, and so has a role,
+    // only after it starts.
+    if (active) await registerTools($)
+
     const check = async () => {
-      if (checking) return
+      if (!active || checking) return
       checking = true
       try {
         const take = !busy && !pending
@@ -479,15 +505,10 @@ export const register: Register = on => {
     $.clock.every(EVERY, () => { void check() })
     void check()
 
-    // The chief's view. Registered in every fleet session, since which one
-    // is the chief is only known once the board has linked it.
-    try {
-      await $.command.register({ name: 'fleet', description: 'Show the fleet: the crew, the open tasks, the latest messages' })
-    } catch {
-      // A command of that name already: the band and toasts still work.
-    }
+    // The chief's view, in every fleet session, since which one is the chief
+    // is only known once the board has linked it.
     const watch = $.clock.every(EVERY, async () => {
-      if (isWorker || looking) return
+      if (!active || isWorker || looking) return
       looking = true
       try {
         const s = await look($, id)
@@ -518,7 +539,7 @@ export const register: Register = on => {
     const typed = e.origin?.kind === 'composer' || e.origin?.kind === 'bridge'
     const text = e.text.trimStart()
     if (
-      session && typed && !text.startsWith('[fleet ·') && !text.startsWith('/') &&
+      active && session && typed && !text.startsWith('[fleet ·') && !text.startsWith('/') &&
       (await $.session.turns()) > 0
     ) {
       await gate($, session, true)
@@ -532,7 +553,7 @@ export const register: Register = on => {
     const main = session !== undefined && e.agentId === undefined
     if (main) running.push(e.tool)
     try {
-      const boardTool = session && e.tool.startsWith(TOOL_PREFIX)
+      const boardTool = active && session && e.tool.startsWith(TOOL_PREFIX)
         ? BOARD_TOOLS.find(t => TOOL_PREFIX + t.name === e.tool)
         : undefined
       if (boardTool && session) {
@@ -546,7 +567,7 @@ export const register: Register = on => {
       }
       const edit = EDITS.has(e.tool)
       const command = e.tool === 'Bash' && typeof e.command === 'string' ? e.command : undefined
-      if (!session || (!edit && command === undefined)) return await next(e)
+      if (!active || !session || (!edit && command === undefined)) return await next(e)
       if (command !== undefined && !writes(command) && !SELF_APPROVAL.test(command)) return await next(e)
 
       const g = await gate($, session)
@@ -589,6 +610,19 @@ export const register: Register = on => {
     }
   })
 
+  // fleet's own tools and plain fleet commands need no prompt in a fleet
+  // session: an agent started by fleet has them allowed on its command
+  // line, and a session made the chief with /fleet start has this.
+  on('tool.check', ($, e, next) => {
+    if (!active) return next(e)
+    if (e.tool.startsWith(TOOL_PREFIX)) return { decision: 'allow' as const }
+    const command = (e.input as { command?: unknown } | null)?.command
+    if (e.tool === 'Bash' && typeof command === 'string' && FLEET_COMMAND.test(command)) {
+      return { decision: 'allow' as const }
+    }
+    return next(e)
+  })
+
   on('turn.start', ($, e, next) => {
     busy = true
     pending = false
@@ -603,7 +637,34 @@ export const register: Register = on => {
     return done
   })
 
-  on('command.run', { command: 'fleet' }, async $ => {
+  on('command.run', { command: 'fleet' }, async ($, e) => {
+    if (e.args.trim() === 'start') {
+      if (active) return { text: 'This session is part of a fleet already. /fleet shows it.' }
+      if (!session) return { text: 'This session has not started yet.' }
+      const root = await $.session.root()
+      let adopted: Adopted
+      try {
+        const out = await $.process.run(['fleet', 'chief', '--adopt', session, '--root', root], { timeoutMs: 20_000 })
+        if (out.exitCode !== 0) return { text: `fleet: ${(out.stderr || out.stdout).trim()}` }
+        adopted = JSON.parse(out.stdout) as Adopted
+      } catch {
+        return { text: 'fleet is not on PATH here: install it, or link it into ~/.local/bin, and run /fleet start again.' }
+      }
+      // What a session fleet starts is given on its command line: the board,
+      // the run, and fleet itself on PATH, for this session's processes and
+      // the agents it starts.
+      await $.env.set('FLEET_DB', adopted.board)
+      await $.env.set('FLEET_RUN', String(adopted.run))
+      if (adopted.bin) await $.env.set('PATH', `${adopted.bin}:${(await $.env.get('PATH')) ?? ''}`)
+      await registerTools($)
+      active = true
+      // The chief's brief, as a turn of its own: Claude Code keeps a mod
+      // installed by a user out of the system prompt. From a timer, since a
+      // command cannot wait on a turn while it holds this one.
+      $.clock.after(1, () => { void $.prompt.submit({ text: adopted.brief }) })
+      return { text: `This session is the chief of ${root} now. Its brief follows; /fleet shows the crew.` }
+    }
+    if (!active) return { text: 'This session is not part of a fleet. `/fleet start` makes it the chief of this workspace.' }
     if (isWorker) return { text: "The fleet is drawn in the chief's session." }
     const opened = await $.ui.open({ id: PANE, title: 'fleet' })
     return opened.isPlaced ? {} : { text: 'Widen the terminal to see the fleet pane.' }

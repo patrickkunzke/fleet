@@ -10,6 +10,11 @@
 //! The session's id is chosen here and given to Claude Code, which an
 //! interactive session honours, so the board knows the chief before it has
 //! said a word.
+//!
+//! Or the session is one already running: `/fleet start`, in a Claude Code
+//! session with fleet's plugin, asks `fleet chief --adopt <session>` to make
+//! that session the chief. Nothing is started then: the board records it,
+//! and fleet's mod in that session does the rest.
 
 use std::path::{Path, PathBuf};
 
@@ -30,9 +35,37 @@ pub struct Launch {
     pub session: String,
 }
 
-/// Start the chief in this terminal, in `root` or the directory it is run
-/// in, and do not come back: the terminal is the chief's from here.
-pub fn run(root: Option<PathBuf>, resume: bool) -> Result<()> {
+/// What `fleet chief --adopt` tells the mod that asked: where the board
+/// is, the run, where fleet is, and the brief to submit, since the session
+/// was not started with one.
+#[derive(Debug, serde::Serialize)]
+pub struct Adopted {
+    pub board: String,
+    pub run: i64,
+    pub bin: Option<String>,
+    pub brief: String,
+}
+
+/// Make the running `session` the chief of `root`, and say what its mod
+/// needs to act as one.
+pub fn adopt(root: Option<PathBuf>, session: &str) -> Result<()> {
+    let (root, path, db) = open(root)?;
+    refuse_second(&db, Some(session))?;
+    let launch = prepare(&db, &root, Mode::Adopt(session), &registry::default_projects_dir(), None)?;
+    let brief = brief::chief(&root);
+    let bin = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_string_lossy().into_owned()));
+    let adopted = Adopted {
+        board: path.to_string_lossy().into_owned(),
+        run: launch.run,
+        bin,
+        brief: format!("{}\n\n{}", brief.role, brief.opening),
+    };
+    println!("{}", serde_json::to_string(&adopted)?);
+    Ok(())
+}
+
+/// The workspace, its board, and the board open.
+fn open(root: Option<PathBuf>) -> Result<(PathBuf, PathBuf, Db)> {
     let root = match root {
         Some(r) => r,
         None => std::env::current_dir()?,
@@ -40,19 +73,33 @@ pub fn run(root: Option<PathBuf>, resume: bool) -> Result<()> {
     let root = root.canonicalize().with_context(|| format!("no such directory: {}", root.display()))?;
     let path = scope::board_for_root(&root)?;
     let db = Db::open(&path)?;
+    Ok((root, path, db))
+}
 
+/// Refuse a second chief while the board's chief is a live session, other
+/// than `this` one asking again.
+fn refuse_second(db: &Db, this: Option<&str>) -> Result<()> {
     let mut reg = Registry::new(registry::default_dir());
     reg.refresh();
     let live: Vec<String> = reg.sessions().map(|s| s.session_id.clone()).collect();
-    if let Some(sid) = live_chief(&db, &live)? {
+    if let Some(sid) = live_chief(db, &live)?.filter(|sid| Some(sid.as_str()) != this) {
         bail!(
             "this workspace's chief is already running (session {sid}). \
              Two chiefs would each think the board is theirs: go to that one, or end it first"
         );
     }
+    Ok(())
+}
+
+/// Start the chief in this terminal, in `root` or the directory it is run
+/// in, and do not come back: the terminal is the chief's from here.
+pub fn run(root: Option<PathBuf>, resume: bool) -> Result<()> {
+    let (root, path, db) = open(root)?;
+    refuse_second(&db, None)?;
 
     let plugin = brief::write_plugin(&brief::plugin_dir()).ok();
-    let launch = prepare(&db, &root, resume, &registry::default_projects_dir(), plugin.as_deref())?;
+    let mode = if resume { Mode::Resume } else { Mode::Fresh };
+    let launch = prepare(&db, &root, mode, &registry::default_projects_dir(), plugin.as_deref())?;
 
     let bin = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf));
     let env = agent::variables(Some(launch.run), Some(&path), bin.as_deref());
@@ -72,14 +119,28 @@ fn live_chief(db: &Db, live: &[String]) -> Result<Option<String>> {
         .filter(|sid| live.contains(sid)))
 }
 
-/// Record the chief on the board and say how to start it. A fresh chief
-/// begins a run of its own; `resume` goes back into the last run's chief
-/// conversation, and that run.
-pub fn prepare(db: &Db, root: &Path, resume: bool, projects: &Path, plugin: Option<&Path>) -> Result<Launch> {
+/// How the chief comes to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode<'a> {
+    /// A new session, in a new run.
+    Fresh,
+    /// Back into the last run's chief conversation, and that run.
+    Resume,
+    /// A session already running, made the chief of a new run.
+    Adopt(&'a str),
+}
+
+/// Record the chief on the board and say how to start it. A fresh or an
+/// adopted chief begins a run of its own; a resumed one goes back into the
+/// last run's chief conversation, and that run. An adopted one is already
+/// running, so there is nothing to start it with.
+pub fn prepare(db: &Db, root: &Path, mode: Mode, projects: &Path, plugin: Option<&Path>) -> Result<Launch> {
     let root_text = root.to_string_lossy().to_string();
     let brief = brief::chief(root);
 
-    let (run, session, args) = if resume {
+    let (run, session, args) = if let Mode::Adopt(session) = mode {
+        (db.start_run(&root_text)?, session.to_string(), Vec::new())
+    } else if mode == Mode::Resume {
         let run = db
             .runs(&root_text)?
             .into_iter()
@@ -107,7 +168,11 @@ pub fn prepare(db: &Db, root: &Path, resume: bool, projects: &Path, plugin: Opti
     db.upsert_agent("chief", Some("chief"), Some(&root_text), Some(&session), None, None)?;
     db.join_run(run, "chief", "chief", &root_text)?;
     db.set_run_session(run, "chief", &session)?;
-    let said = if resume { "resumed in a terminal" } else { "started in a terminal" };
+    let said = match mode {
+        Mode::Fresh => "started in a terminal",
+        Mode::Resume => "resumed in a terminal",
+        Mode::Adopt(_) => "started in a session already running",
+    };
     db.log_event("note", Some("chief"), None, None, said, None, None)?;
     Ok(Launch { args, run, session })
 }
@@ -144,7 +209,7 @@ mod tests {
     fn a_fresh_chief_is_on_the_board_with_its_session_before_it_starts() {
         let db = Db::open_in_memory().unwrap();
         let root = Path::new("/w/acme");
-        let launch = prepare(&db, root, false, Path::new("/nowhere"), None).unwrap();
+        let launch = prepare(&db, root, Mode::Fresh, Path::new("/nowhere"), None).unwrap();
 
         assert_eq!(launch.args[..2], ["--session-id".to_string(), launch.session.clone()]);
         assert!(launch.args.contains(&"--append-system-prompt".to_string()));
@@ -160,15 +225,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
         let root = Path::new("/w/acme");
-        let first = prepare(&db, root, false, dir.path(), None).unwrap();
+        let first = prepare(&db, root, Mode::Fresh, dir.path(), None).unwrap();
 
-        let err = prepare(&db, root, true, dir.path(), None).unwrap_err().to_string();
+        let err = prepare(&db, root, Mode::Resume, dir.path(), None).unwrap_err().to_string();
         assert!(err.contains("no longer on disk"), "{err}");
 
         let project = dir.path().join(registry::project_slug(root));
         std::fs::create_dir_all(&project).unwrap();
         std::fs::write(project.join(format!("{}.jsonl", first.session)), "").unwrap();
-        let again = prepare(&db, root, true, dir.path(), None).unwrap();
+        let again = prepare(&db, root, Mode::Resume, dir.path(), None).unwrap();
         assert_eq!(again.session, first.session);
         assert_eq!(again.run, first.run, "the same run, with its crew");
         assert_eq!(again.args[..2], ["--resume".to_string(), first.session.clone()]);
@@ -177,16 +242,28 @@ mod tests {
     #[test]
     fn nothing_to_resume_in_a_new_workspace_is_said_plainly() {
         let db = Db::open_in_memory().unwrap();
-        let err = prepare(&db, Path::new("/w/new"), true, Path::new("/nowhere"), None).unwrap_err().to_string();
+        let err = prepare(&db, Path::new("/w/new"), Mode::Resume, Path::new("/nowhere"), None).unwrap_err().to_string();
         assert!(err.contains("without --resume"), "{err}");
     }
 
     #[test]
     fn a_second_chief_is_refused_while_the_first_is_alive() {
         let db = Db::open_in_memory().unwrap();
-        let launch = prepare(&db, Path::new("/w/acme"), false, Path::new("/nowhere"), None).unwrap();
+        let launch = prepare(&db, Path::new("/w/acme"), Mode::Fresh, Path::new("/nowhere"), None).unwrap();
         assert_eq!(live_chief(&db, std::slice::from_ref(&launch.session)).unwrap(), Some(launch.session.clone()));
         assert_eq!(live_chief(&db, &[]).unwrap(), None, "a chief whose process is gone is no obstacle");
+    }
+
+    #[test]
+    fn a_session_already_running_is_made_the_chief_of_a_new_run() {
+        let db = Db::open_in_memory().unwrap();
+        let earlier = prepare(&db, Path::new("/w/acme"), Mode::Fresh, Path::new("/nowhere"), None).unwrap();
+        let adopted = prepare(&db, Path::new("/w/acme"), Mode::Adopt("sid-mine"), Path::new("/nowhere"), None).unwrap();
+        assert!(adopted.args.is_empty(), "nothing to start: it is running");
+        assert_ne!(adopted.run, earlier.run, "a run of its own");
+        let chief = db.agents().unwrap().into_iter().find(|a| a.role == "chief").unwrap();
+        assert_eq!(chief.session_id.as_deref(), Some("sid-mine"));
+        assert_eq!(live_chief(&db, &["sid-mine".into()]).unwrap().as_deref(), Some("sid-mine"));
     }
 
     #[test]

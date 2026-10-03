@@ -62,6 +62,20 @@ The terminal becomes the chief's Claude Code session: briefed, with the
 `/board` skill and fleet's mod, on the workspace's board. It refuses to start
 a second chief while the first is still running.
 
+Or make a session you already have open the chief. In a Claude Code session
+with fleet's plugin loaded, in the workspace:
+
+```
+/fleet start
+```
+
+The session is put on the board as the chief of a new run, gets the board's
+tools and the fleet view, and receives the chief's brief as a turn. The
+plugin does nothing in a session until then. For now, load the plugin with
+`claude --plugin-dir ~/.claude-fleet/claude-plugin`, the copy fleet writes for
+its agents, with `fleet` on your PATH; installing it from a marketplace is
+next.
+
 fleet runs the agents the chief starts as Claude Code
 [background sessions](https://code.claude.com/docs/en/agent-view) instead of
 herdr tabs. `fleet spawn`, `fleet handoff`, `fleet board retire` and resume
