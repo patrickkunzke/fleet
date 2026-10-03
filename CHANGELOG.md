@@ -4,6 +4,12 @@ Every release of fleet. Each section is written when a pull request with a
 `feat`, `fix` or `perf` commit is merged; see
 [Releases](README.md#releases).
 
+## [0.10.0](https://github.com/patrickkunzke/fleet/releases/tag/v0.10.0) — 2026-10-03
+
+### Features
+
+- Run the crew as Claude Code background sessions outside herdr
+
 ## [0.9.1](https://github.com/patrickkunzke/fleet/releases/tag/v0.9.1) — 2026-10-03
 
 ### Fixes
