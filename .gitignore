@@ -7,3 +7,5 @@
 # Written by Claude Code when it loads mod/ as a plugin, for the editor.
 /mod/tsconfig.json
 /mod/.claude-plugin/types/
+# The fleet binary the plugin fetches for itself (mod/scripts/fetch-fleet.sh).
+/mod/bin/

@@ -1,8 +1,10 @@
 name: release
 
 # A merge to main is released when its commits call for it (see
-# scripts/next-version.sh): the version is raised in Cargo.toml, Cargo.lock
-# and herdr-plugin.toml, the section is added to CHANGELOG.md, and the commit
+# scripts/next-version.sh): the version is raised in Cargo.toml, Cargo.lock,
+# herdr-plugin.toml and the Claude Code plugin's manifest (mod/.claude-plugin/
+# plugin.json, whose version is what an installed plugin updates to and which
+# binary it fetches), the section is added to CHANGELOG.md, and the commit
 # is tagged and published as a GitHub Release, and binaries.yml builds the
 # prebuilt binaries for it.
 #
@@ -66,6 +68,7 @@ jobs:
 
           # The first `version =` in each is the package's own.
           sed -i "0,/^version = \".*\"/s//version = \"$VERSION\"/" Cargo.toml herdr-plugin.toml
+          sed -i "0,/\"version\": \".*\"/s//\"version\": \"$VERSION\"/" mod/.claude-plugin/plugin.json
           cargo update --workspace
 
           git cliff --unreleased --tag "$tag" --strip all > notes.md
@@ -78,7 +81,7 @@ jobs:
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock herdr-plugin.toml CHANGELOG.md
+          git add Cargo.toml Cargo.lock herdr-plugin.toml mod/.claude-plugin/plugin.json CHANGELOG.md
           git commit -m "chore(release): $tag"
           git tag "$tag"
           git push origin HEAD:main "$tag"

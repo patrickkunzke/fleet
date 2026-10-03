@@ -1,6 +1,9 @@
 {
   "name": "fleet",
-  "version": "0.0.0",
-  "description": "The fleet board, for the agents a fleet starts. fleet writes its own copy of this manifest; this one is for developing the mod.",
+  "version": "0.14.0",
+  "description": "A chief of staff for Claude Code: /fleet start makes a session the chief, which plans, keeps a task board and delegates to one agent per repository.",
+  "author": { "name": "Patrick Kunzke" },
+  "repository": "https://github.com/patrickkunzke/fleet",
+  "license": "MIT",
   "types": "./types/index.d.ts"
 }

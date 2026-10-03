@@ -286,6 +286,25 @@ async function registerTools($: EngineInterface) {
   }
 }
 
+/**
+ * Where the `fleet` to start with is, or why there is none. The one that
+ * matches this plugin first, so the mod and the board agree on what they
+ * say to each other: FLEET_BIN when set, for working on fleet itself; then
+ * the copy in this plugin's folder, fetched now if it is not there yet; and
+ * only then whatever fleet is on PATH.
+ */
+async function findFleet($: EngineInterface): Promise<{ path: string } | { problem: string }> {
+  const given = await $.env.get('FLEET_BIN')
+  if (given) return { path: given }
+  const own = `${$.plugin.root}/bin/fleet`
+  if ((await $.process.run(['test', '-x', own])).exitCode === 0) return { path: own }
+  const fetched = await $.process.run(['sh', `${$.plugin.root}/scripts/fetch-fleet.sh`], { timeoutMs: 120_000 })
+  if (fetched.exitCode === 0) return { path: own }
+  const onPath = await $.process.run(['sh', '-c', 'command -v fleet'])
+  if (onPath.exitCode === 0 && onPath.stdout.trim()) return { path: onPath.stdout.trim() }
+  return { problem: (fetched.stderr || fetched.stdout).trim() || 'fleet could not be downloaded' }
+}
+
 /** What `fleet chief --adopt` prints. */
 type Adopted = { board: string; run: number; bin: string | null; brief: string }
 
@@ -319,6 +338,7 @@ const PANE = 'fleet'
 const HIGH = 80
 
 const snapshot = atom({ plugin: 'fleet', key: 'snapshot' } as const, null)
+const brief = atom({ plugin: 'fleet', key: 'brief' } as const, null)
 
 /** The board as `session` sees it; undefined when it cannot be read. */
 async function look($: EngineInterface, session: string): Promise<Snapshot | undefined> {
@@ -610,6 +630,24 @@ export const register: Register = on => {
     }
   })
 
+  // A chief made with /fleet start has its brief as a turn, and compaction
+  // summarises turns: put the brief back at the head of what is kept. A
+  // chief fleet started has it in its system prompt, which compaction
+  // leaves alone, so it has nothing here to put back.
+  on('session.compact', async ($, e, next) => {
+    const compacted = await next(e)
+    const kept = await read($, brief)
+    if (!active || !kept || e.agentId !== undefined || !('messages' in compacted) || !compacted.messages) {
+      return compacted
+    }
+    const reminder = {
+      role: 'user' as const,
+      text: `[fleet] You are this workspace's chief of staff. Your brief, kept through compaction:\n\n${kept}`,
+      toolUses: [],
+    }
+    return { ...compacted, messages: [reminder, ...compacted.messages] }
+  })
+
   // fleet's own tools and plain fleet commands need no prompt in a fleet
   // session: an agent started by fleet has them allowed on its command
   // line, and a session made the chief with /fleet start has this.
@@ -644,11 +682,13 @@ export const register: Register = on => {
       const root = await $.session.root()
       let adopted: Adopted
       try {
-        const out = await $.process.run(['fleet', 'chief', '--adopt', session, '--root', root], { timeoutMs: 20_000 })
+        const found = await findFleet($)
+        if ('problem' in found) return { text: `${found.problem}\nInstall fleet another way (see its README), then run /fleet start again.` }
+        const out = await $.process.run([found.path, 'chief', '--adopt', session, '--root', root], { timeoutMs: 20_000 })
         if (out.exitCode !== 0) return { text: `fleet: ${(out.stderr || out.stdout).trim()}` }
         adopted = JSON.parse(out.stdout) as Adopted
-      } catch {
-        return { text: 'fleet is not on PATH here: install it, or link it into ~/.local/bin, and run /fleet start again.' }
+      } catch (err) {
+        return { text: `fleet could not be started: ${String(err)}` }
       }
       // What a session fleet starts is given on its command line: the board,
       // the run, and fleet itself on PATH, for this session's processes and
@@ -662,6 +702,8 @@ export const register: Register = on => {
       // installed by a user out of the system prompt. From a timer, since a
       // command cannot wait on a turn while it holds this one.
       $.clock.after(1, () => { void $.prompt.submit({ text: adopted.brief }) })
+      // Kept for compaction, which summarises a turn like any other.
+      await update($, brief, () => adopted.brief)
       return { text: `This session is the chief of ${root} now. Its brief follows; /fleet shows the crew.` }
     }
     if (!active) return { text: 'This session is not part of a fleet. `/fleet start` makes it the chief of this workspace.' }

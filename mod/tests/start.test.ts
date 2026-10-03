@@ -44,7 +44,7 @@ function session(on: On) {
 }
 
 test('an ordinary session with the plugin runs nothing until /fleet start', async ($, on) => {
-  mock.env(on, { PATH: '/usr/bin' })
+  mock.env(on, { PATH: '/usr/bin', FLEET_BIN: 'fleet' })
   const clock = mock.clock(on)
   const { ran, registered } = session(on)
 
@@ -62,7 +62,7 @@ test('an ordinary session with the plugin runs nothing until /fleet start', asyn
 })
 
 test('/fleet start makes this session the chief', async ($, on) => {
-  mock.env(on, { PATH: '/usr/bin' })
+  mock.env(on, { PATH: '/usr/bin', FLEET_BIN: 'fleet' })
   const clock = mock.clock(on)
   const { ran, set, submitted, registered } = session(on)
 
@@ -86,7 +86,7 @@ test('/fleet start makes this session the chief', async ($, on) => {
 })
 
 test("a fleet session runs fleet's own without a prompt, and nothing that only starts like it", async ($, on) => {
-  mock.env(on, { PATH: '/usr/bin' })
+  mock.env(on, { PATH: '/usr/bin', FLEET_BIN: 'fleet' })
   mock.clock(on)
   session(on)
   await $.session.start(start)
@@ -99,4 +99,55 @@ test("a fleet session runs fleet's own without a prompt, and nothing that only s
   expect(await allowed('Bash', { command: 'fleet board ls; rm -rf ~' })).toBe('ask')
   expect(await allowed('Bash', { command: 'fleet board msg chief x "$(cat ~/.ssh/id_rsa)"' })).toBe('ask')
   expect(await allowed('Bash', { command: 'fleet update' })).toBe('ask')
+})
+
+test("an adopted chief's brief is put back at the head of a compacted conversation", async ($, on) => {
+  mock.env(on, { PATH: '/usr/bin', FLEET_BIN: 'fleet' })
+  mock.clock(on)
+  session(on)
+  const summary = { role: 'user' as const, text: 'Summary: planned LIME-1, citrus is on it.', toolUses: [] }
+  const said = [{ role: 'user' as const, text: 'plan LIME-1', toolUses: [] }]
+  on('session.compact', () => ({ messages: [summary] }))
+
+  await $.session.start(start)
+  const before = await $.session.compact({ trigger: 'manual', messages: said })
+  expect(before).toEqual({ messages: [summary] })
+
+  await $.command.run({ command: 'fleet', args: 'start' } as never)
+  const after = await $.session.compact({ trigger: 'auto', messages: said })
+  if (!('messages' in after) || !after.messages) throw new Error('compaction was skipped')
+  expect(after.messages[0].text).toContain('You are the chief of staff…')
+  expect(after.messages[1]).toEqual(summary)
+})
+
+test('/fleet start fetches the fleet that matches the plugin when it has none', async ($, on) => {
+  mock.env(on, { PATH: '/usr/bin' })
+  mock.clock(on)
+  const ran: string[][] = []
+  let fetched = false
+  on('process.run', ($, e) => {
+    const argv = [...e.argv]
+    ran.push(argv)
+    const reply = (exitCode: number, stdout = '') => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+    if (argv[0] === 'test') return reply(fetched ? 0 : 1)
+    if (argv[0] === 'sh' && argv[1].endsWith('/scripts/fetch-fleet.sh')) {
+      fetched = true
+      return reply(0)
+    }
+    if (argv[1] === 'chief') return reply(0, JSON.stringify({ board: '/b/fleet.db', run: 1, bin: null, brief: 'brief' }))
+    return reply(0, JSON.stringify({ agent: 'chief', text: null, waiting: 0, awaiting_go: null }))
+  })
+  for (const [event, value] of [['env.set', undefined], ['session.id', 'sid-mine'], ['session.root', '/w/acme'], ['command.register', undefined], ['tool.register', undefined], ['ui.status', undefined]] as const) {
+    on(event, () => ({ value }) as never)
+  }
+  on('session.start', ($, e) => ({ cwd: e.cwd }))
+  on('prompt.submit', ($, e) => ({ text: e.text }))
+
+  await $.session.start(start)
+  const said = await $.command.run({ command: 'fleet', args: 'start' } as never)
+
+  const adopt = ran.find(argv => argv[1] === 'chief')
+  expect(adopt?.[0]).toMatch(/\/bin\/fleet$/)
+  expect(fetched).toBe(true)
+  expect(said.text).toContain('chief of /w/acme')
 })

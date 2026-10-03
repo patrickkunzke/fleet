@@ -278,7 +278,7 @@ pub fn claude_program() -> String {
 
 /// The `/board` skill, in the binary, so an agent always gets the one that
 /// matches the fleet that started it.
-const SKILL: &str = include_str!("../skills/board/SKILL.md");
+const SKILL: &str = include_str!("../mod/skills/board/SKILL.md");
 
 /// The mod that delivers board messages from inside the agent's session.
 /// `mod/` is a plugin of its own, so `claude plugin test mod` runs its tests;
@@ -785,6 +785,19 @@ mod tests {
         assert_eq!(std::fs::read_to_string(plugin.join("skills/board/SKILL.md")).unwrap(), SKILL, "rewritten");
         let strays: Vec<_> = std::fs::read_dir(plugin.join("skills/board")).unwrap().flatten().map(|e| e.file_name()).collect();
         assert_eq!(strays.len(), 1, "no temporary files left behind: {strays:?}");
+    }
+
+    #[test]
+    fn the_published_plugin_is_this_version_of_fleet() {
+        // An installed plugin fetches the release binary its manifest names:
+        // a manifest behind the crate would fetch a fleet that does not know
+        // what the mod asks of it.
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../mod/.claude-plugin/plugin.json")).unwrap();
+        assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"));
+        let market: serde_json::Value = serde_json::from_str(include_str!("../.claude-plugin/marketplace.json")).unwrap();
+        assert_eq!(market["plugins"][0]["source"], "./mod");
+        assert_eq!(market["plugins"][0]["name"], manifest["name"]);
     }
 
     #[test]

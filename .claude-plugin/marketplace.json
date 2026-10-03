@@ -1,0 +1,11 @@
+{
+  "name": "fleet",
+  "owner": { "name": "Patrick Kunzke" },
+  "plugins": [
+    {
+      "name": "fleet",
+      "source": "./mod",
+      "description": "A chief of staff for Claude Code: /fleet start makes a session the chief, which plans, keeps a task board and delegates to one agent per repository."
+    }
+  ]
+}
