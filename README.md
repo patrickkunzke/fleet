@@ -40,10 +40,13 @@ context small, and something has to keep track of what waits on what.
 
 ## Requirements
 
-- **herdr 0.9.1 or newer**, and its *server* too: an update leaves the old
-  server running until herdr restarts, and `herdr status` shows both.
-- **[Claude Code](https://claude.com/claude-code)**, the native install
-  (`~/.local/bin/claude`), or any `claude` named by `FLEET_CLAUDE`.
+- **[Claude Code](https://claude.com/claude-code) v2.1.287 or newer**, for
+  the mods that carry messages, hold the go-ahead and draw the fleet.
+- **herdr 0.9.1 or newer**, only to run fleet inside herdr, and its *server*
+  too: an update leaves the old server running until herdr restarts, and
+  `herdr status` shows both.
+- **The native install of Claude Code** (`~/.local/bin/claude`), or any
+  `claude` named by `FLEET_CLAUDE`, which fleet starts its agents with.
 - **A Rust toolchain** (`cargo`) only on a machine without a prebuilt
   binary: macOS and Linux on arm64 and x86_64 have one.
 - macOS or Linux.
@@ -70,11 +73,11 @@ with fleet's plugin loaded, in the workspace:
 ```
 
 The session is put on the board as the chief of a new run, gets the board's
-tools and the fleet view, and receives the chief's brief as a turn. The
-plugin does nothing in a session until then. For now, load the plugin with
-`claude --plugin-dir ~/.claude-fleet/claude-plugin`, the copy fleet writes for
-its agents, with `fleet` on your PATH; installing it from a marketplace is
-next.
+tools and the fleet view, and receives the chief's brief as a turn. Claude
+Code keeps a plugin you install out of the system prompt, so the brief is
+part of the conversation; when the conversation is compacted, fleet puts the
+brief back at the head of what is kept. The plugin does nothing in a session
+until `/fleet start`.
 
 fleet runs the agents the chief starts as Claude Code
 [background sessions](https://code.claude.com/docs/en/agent-view) instead of
@@ -112,6 +115,28 @@ Two things to know:
 where fleet runs. The setup check's `running in` row says which it will use.
 
 ## Install
+
+### As a Claude Code plugin, in any terminal
+
+```bash
+claude plugin marketplace add patrickkunzke/fleet
+claude plugin install fleet@fleet
+```
+
+Then start Claude Code in your workspace as you always do, and make that
+session the chief:
+
+```
+/fleet start
+```
+
+The plugin does nothing in a session until then. The first `/fleet start`
+downloads fleet's binary for your machine into the plugin's folder, checked
+against the release's `SHA256SUMS`; a `fleet` already on your PATH is used if
+that fails. See [Without herdr](#without-herdr) for what the chief and its
+agents do from there.
+
+### In herdr
 
 ```bash
 herdr plugin install patrickkunzke/fleet
