@@ -1,5 +1,6 @@
 {
   "name": "fleet",
   "version": "0.0.0",
-  "description": "The fleet board, for the agents a fleet starts. fleet writes its own copy of this manifest; this one is for developing the mod."
+  "description": "The fleet board, for the agents a fleet starts. fleet writes its own copy of this manifest; this one is for developing the mod.",
+  "types": "./types/index.d.ts"
 }

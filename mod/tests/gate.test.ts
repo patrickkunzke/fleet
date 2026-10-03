@@ -1,6 +1,6 @@
 import { test, expect, mock } from 'claude-code/testing'
 import type { On } from 'claude-code'
-import { writes } from '../hooks/register.ts'
+import { writes } from '../hooks/register.tsx'
 
 type Gate = { agent: string | null; role: string | null; tasks: string[]; approved: boolean }
 
