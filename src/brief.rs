@@ -373,6 +373,48 @@ pub fn resume_line(
     Ok(out)
 }
 
+/// The arguments that start a briefed agent as a background session, for a
+/// program run directly rather than a line typed at a shell: the role and
+/// the opening are passed as they are. The same order as [`launch_line`]:
+/// the plugin, the role, the opening, then the tool lists, which take
+/// several values each and would read the opening as one more.
+pub fn launch_args(brief: &Brief, plugin: Option<&Path>) -> Vec<String> {
+    let mut args = plugin_args(plugin);
+    args.push("--append-system-prompt".into());
+    args.push(brief.role.clone());
+    args.push(brief.opening.clone());
+    args.extend(tool_args(brief));
+    args
+}
+
+/// [`launch_args`] for a session coming back into its conversation: the
+/// role and tools again, and no opening turn.
+pub fn resume_args(brief: &Brief, session: &str, plugin: Option<&Path>) -> Vec<String> {
+    let mut args = vec!["--resume".to_string(), session.to_string()];
+    args.extend(plugin_args(plugin));
+    args.push("--append-system-prompt".into());
+    args.push(brief.role.clone());
+    args.extend(tool_args(brief));
+    args
+}
+
+fn plugin_args(plugin: Option<&Path>) -> Vec<String> {
+    plugin.map(|p| vec!["--plugin-dir".to_string(), p.to_string_lossy().into_owned()]).unwrap_or_default()
+}
+
+fn tool_args(brief: &Brief) -> Vec<String> {
+    let mut args = Vec::new();
+    if !brief.allow.is_empty() {
+        args.push("--allowed-tools".into());
+        args.extend(brief.allow.iter().map(|t| t.to_string()));
+    }
+    if !brief.deny.is_empty() {
+        args.push("--disallowed-tools".into());
+        args.extend(brief.deny.iter().map(|t| t.to_string()));
+    }
+    args
+}
+
 fn write_brief(brief: &Brief, dir: &Path, stem: &str) -> std::io::Result<(std::path::PathBuf, std::path::PathBuf)> {
     std::fs::create_dir_all(dir)?;
     let stem: String = stem

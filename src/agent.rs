@@ -74,8 +74,13 @@ pub fn start(
         Naming::Exact => wanted,
     };
     let bin = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf));
-    let command = format!("{}{}", environment(run, db.path(), bin.as_deref()), host.line(what, &name)?);
-    let placed = host.open(&name, &repo, &command, role == "chief")?;
+    let placed = match host {
+        Host::Herdr(h) => {
+            let command = format!("{}{}", environment(run, db.path(), bin.as_deref()), h.line(what, &name)?);
+            h.open(&name, &repo, &command, role == "chief")?
+        }
+        Host::Background(b) => b.open(&name, &repo, what, &variables(run, db.path(), bin.as_deref()))?,
+    };
     if let Some(id) = run {
         db.join_run(id, &name, role, &repo.to_string_lossy())?;
     }
@@ -116,6 +121,24 @@ fn environment(run: Option<i64>, board: Option<&Path>, bin: Option<&Path>) -> St
     }
     if let Some(board) = board {
         out.push_str(&format!("FLEET_DB={} ", brief::quote(&board.to_string_lossy())));
+    }
+    out
+}
+
+/// [`environment`], as variables for a process fleet starts itself: a
+/// background session takes its environment from whatever starts it, and
+/// keeps it, mod included, for as long as it runs.
+fn variables(run: Option<i64>, board: Option<&Path>, bin: Option<&Path>) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if let Some(bin) = bin {
+        let path = std::env::var("PATH").unwrap_or_default();
+        out.push(("PATH".into(), format!("{}:{path}", bin.to_string_lossy())));
+    }
+    if let Some(id) = run {
+        out.push(("FLEET_RUN".into(), id.to_string()));
+    }
+    if let Some(board) = board {
+        out.push(("FLEET_DB".into(), board.to_string_lossy().into_owned()));
     }
     out
 }
@@ -193,6 +216,20 @@ fn parent_map() -> HashMap<i32, i32> {
         }
     }
     map
+}
+
+/// The session a just-started agent turned out to be, once it has one: as
+/// its host knows it, or, for a pane, by the process tree under its shell.
+/// A background session has no shell of fleet's to look under.
+pub fn found_session(host: &Host, placed: &Placed, timeout: Duration) -> Option<String> {
+    host.settle(placed, timeout);
+    if let Some(sid) = host.session_at(&placed.target) {
+        return Some(sid);
+    }
+    if placed.pid <= 0 {
+        return None;
+    }
+    adopt(placed.pid, timeout).map(|s| s.session_id)
 }
 
 /// Record which session an agent turned out to be — on the board, and in
@@ -449,11 +486,11 @@ mod tests {
     /// A herdr that is never reached: resuming is refused before a pane is
     /// asked for.
     fn nowhere() -> Host {
-        Host {
+        Host::Herdr(crate::host::HerdrHost {
             herdr: crate::herdr::Herdr::with("false", "/nonexistent/sock"),
             workspace: "w1".into(),
             fleet: None,
-        }
+        })
     }
 
     #[test]

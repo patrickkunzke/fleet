@@ -48,6 +48,31 @@ context small, and something has to keep track of what waits on what.
   binary: macOS and Linux on arm64 and x86_64 have one.
 - macOS or Linux.
 
+### Without herdr
+
+Outside herdr, fleet runs its agents as Claude Code
+[background sessions](https://code.claude.com/docs/en/agent-view) instead of
+herdr tabs. `fleet spawn`, `fleet handoff`, `fleet board retire` and resume
+work the same from any terminal: each agent is a `claude --bg` session in its
+repository, with the same brief, plugin and tools, and messages reach it
+through fleet's mod. `claude agents` lists the crew and says which one needs
+you; `claude attach <id>`, which `fleet spawn` prints, opens one to talk to.
+`fleet tui` runs in a plain terminal too, without herdr's sidebar labels and
+notifications.
+
+Two things to know:
+
+- **Trust the workspace once.** Claude Code refuses to start a background
+  session in a folder it has not been trusted in. Trust carries down to the
+  folders inside, so running `claude` once in the workspace and accepting the
+  prompt covers every repository in it.
+- **Messages need the mod.** A background session has no prompt to type a
+  message at, so an agent whose mod is not checking in (mods turned off, or
+  Claude Code older than v2.1.287) only finds its messages on the board.
+
+`FLEET_HOST=herdr` or `FLEET_HOST=background` picks one instead of going by
+where fleet runs. The setup check's `running in` row says which it will use.
+
 ## Install
 
 ```bash
