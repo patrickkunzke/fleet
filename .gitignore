@@ -3,3 +3,7 @@
 *.db-shm
 *.db-wal
 .DS_Store
+
+# Written by Claude Code when it loads mod/ as a plugin, for the editor.
+/mod/tsconfig.json
+/mod/.claude-plugin/types/
