@@ -5,6 +5,11 @@ import type { On } from 'claude-code'
 function board(on: On, held: string[], awaiting_go: string | null = null) {
   const runs: string[][] = []
   on('process.run', ($, e) => {
+    // The view's read: this session is a worker, so it stops reading.
+    if (e.argv[2] === 'snapshot') {
+      const stdout = JSON.stringify({ me: { name: 'accounts-svc', role: 'worker' }, agents: [], tasks: [], events: [] })
+      return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
     runs.push([...e.argv])
     const take = e.argv.includes('--take')
     const text = take && held.length ? held.splice(0).join('\n\n') : null

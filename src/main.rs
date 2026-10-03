@@ -12,6 +12,7 @@ mod msg;
 mod plugin;
 mod registry;
 mod scope;
+mod snapshot;
 mod ui;
 mod update;
 
@@ -273,6 +274,15 @@ enum BoardCmd {
         /// Who gives it.
         #[arg(long, default_value = "chief")]
         from: String,
+    },
+    /// The fleet as the chief's own session draws it: the crew, the open
+    /// tasks and recent events, as JSON. What fleet's mod reads every few
+    /// seconds outside herdr.
+    #[command(hide = true)]
+    Snapshot {
+        /// The session asking, so it is told which agent it is.
+        #[arg(long)]
+        session: Option<String>,
     },
     /// What fleet's mod asks before an edit: who this session is, its open
     /// tasks, and whether one has a go-ahead. With --user-approves, the
@@ -916,6 +926,10 @@ fn board(cmd: BoardCmd, path: Option<PathBuf>, fleet: Option<String>) -> Result<
                     println!("      nobody has claimed it yet; whoever does may start at once");
                 }
             }
+        }
+
+        BoardCmd::Snapshot { session } => {
+            println!("{}", serde_json::to_string(&snapshot::take(&db, session.as_deref())?)?);
         }
 
         BoardCmd::Gate { session, user_approves } => {

@@ -57,8 +57,20 @@ work the same from any terminal: each agent is a `claude --bg` session in its
 repository, with the same brief, plugin and tools, and messages reach it
 through fleet's mod. `claude agents` lists the crew and says which one needs
 you; `claude attach <id>`, which `fleet spawn` prints, opens one to talk to.
-`fleet tui` runs in a plain terminal too, without herdr's sidebar labels and
-notifications.
+
+The chief's own session draws the fleet, in place of the fleet tab:
+
+- **`/fleet`** opens a pane beside the conversation: the crew, with what each
+  agent is doing, how full its context is and what it waits for; the open
+  tasks; and the latest messages. A worker waiting for its go has a button
+  that gives it.
+- **A band above the prompt** keeps count, and names who needs something:
+  `fleet · 3 agents · 1 working · 4 open · billing needs a go · accounts at 84%`.
+- **Toasts** say what herdr would have notified: a task blocked, in review or
+  done, an agent waiting for a go or stopped at a permission prompt, one
+  nearly out of context.
+
+`fleet tui` runs in a plain terminal too, for the graph.
 
 Two things to know:
 

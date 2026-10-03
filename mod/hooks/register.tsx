@@ -17,8 +17,18 @@
 // a guard against an agent drifting into work, not a sandbox: a determined
 // one can write a file in ways no pattern here knows. When the board cannot
 // be asked, the edit goes ahead, as it would without the mod.
+//
+// And in the chief's session it draws the fleet. In herdr the fleet tab sits
+// beside the chief; outside herdr there is no tab, so `/fleet` opens a pane
+// with the crew, the open tasks and the latest messages, a band above the
+// prompt says who needs something, and toasts say what herdr would have
+// notified. It reads `fleet board snapshot` every few seconds; a worker's
+// session stops reading once the board says it is one.
 
+import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
+
+import type { SnapAgent, Snapshot } from '../types'
 
 /** How often the mailbox is checked. Well inside the board's fifteen. */
 const EVERY = 3_000
@@ -87,9 +97,115 @@ async function gate($: EngineInterface, session: string, approve = false): Promi
   }
 }
 
+const PANE = 'fleet'
+/** From here an agent is close to compacting: the board's CONTEXT_HIGH. */
+const HIGH = 80
+
+const snapshot = atom({ plugin: 'fleet', key: 'snapshot' } as const, null)
+
+/** The board as `session` sees it; undefined when it cannot be read. */
+async function look($: EngineInterface, session: string): Promise<Snapshot | undefined> {
+  try {
+    const out = await $.process.run(['fleet', 'board', 'snapshot', '--session', session], { timeoutMs: 10_000 })
+    return out.exitCode === 0 ? (JSON.parse(out.stdout) as Snapshot) : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** Give a waiting agent its go, as the chief would with `fleet board go`. */
+async function give($: EngineInterface, task: string) {
+  try {
+    const out = await $.process.run(['fleet', 'board', 'go', task], { timeoutMs: 10_000 })
+    $.ui.toast(out.exitCode === 0 ? `${task}: go given` : `${task}: ${out.stderr.trim() || 'the go did not go through'}`)
+  } catch {
+    $.ui.toast(`${task}: fleet could not be run`)
+  }
+}
+
+/** What an agent is doing, in a few words, and the colour to say it in. */
+function state(a: SnapAgent): [string, string | undefined] {
+  if (a.waiting_for) return [`! ${a.waiting_for}`, 'red']
+  if (a.awaiting_go && a.presence === 'waiting') return ['◇ needs a go', 'red']
+  if (a.awaiting_go && a.presence === 'working') return ['● planning', 'yellow']
+  switch (a.presence) {
+    case 'working':
+      return [`● ${a.tool ? toolName(a.tool) : 'working'}`, 'yellow']
+    case 'waiting':
+      return ['○ waiting', 'green']
+    case 'gone':
+      return ['× ended', undefined]
+    default:
+      return ['· not started', undefined]
+  }
+}
+
+/** `mcp__claude_ai_Slack__slack_send_message` as `slack_send_message`. */
+function toolName(tool: string): string {
+  if (!tool.startsWith('mcp__')) return tool
+  const rest = tool.slice('mcp__'.length)
+  const at = rest.indexOf('__')
+  return at < 0 ? rest : rest.slice(at + 2)
+}
+
+/** What needs the user, for the band and its count. */
+function needs(s: Snapshot): string[] {
+  const out: string[] = []
+  for (const a of s.agents) {
+    if (a.waiting_for) out.push(`${a.name} at a ${a.waiting_for}`)
+    else if (a.awaiting_go && a.presence === 'waiting') out.push(`${a.name} needs a go`)
+    if (a.context !== null && a.context >= HIGH) out.push(`${a.name} at ${a.context}%`)
+  }
+  return out
+}
+
+function pad(text: string, width: number): string {
+  return text.length >= width ? text.slice(0, width) : text + ' '.repeat(width - text.length)
+}
+
+/**
+ * Toast what is new since `seen`, and return what holds now. `seen` is
+ * undefined until the first read, which marks everything already there as
+ * seen: opening the chief must not replay yesterday's blockers.
+ */
+function notify($: EngineInterface, s: Snapshot, seen: Set<string> | undefined): Set<string> {
+  const now = new Set<string>()
+  const said: string[] = []
+  for (const e of s.events) {
+    if (!e.notice) continue
+    now.add(`event:${e.key}`)
+    if (seen && !seen.has(`event:${e.key}`)) said.push(`${e.notice.title} — ${e.notice.body}`)
+  }
+  for (const a of s.agents) {
+    const marks: [string, string][] = []
+    if (a.waiting_for) marks.push([`ask:${a.name}:${a.waiting_for}`, `fleet · ${a.name} is waiting at a ${a.waiting_for}`])
+    if (a.awaiting_go && a.presence === 'waiting') {
+      marks.push([`go:${a.name}:${a.awaiting_go}`, `fleet · ${a.name} needs a go on ${a.awaiting_go}`])
+    }
+    if (a.context !== null && a.context >= HIGH) {
+      marks.push([`full:${a.name}`, `fleet · ${a.name} is at ${a.context}% context: \`fleet handoff ${a.name}\``])
+    }
+    for (const [mark, text] of marks) {
+      now.add(mark)
+      if (seen && !seen.has(mark)) said.push(text)
+    }
+  }
+  for (const text of said) $.ui.toast(text)
+  // Only what still holds, so a later wait or climb is news again.
+  return now
+}
+
 export const register: Register = on => {
   // Set once the session has started and turns out to be one of fleet's.
   let session: string | undefined
+
+  // The view's own: see the header.
+  // Set once the board says this session is a worker: it draws nothing.
+  let isWorker = false
+  let looking = false
+  // What has been toasted already: see notify.
+  let seen: Set<string> | undefined
+
 
   // A turn is running. Messages wait on the board until it ends, rather than
   // queueing up as prompts behind it.
@@ -155,6 +271,34 @@ export const register: Register = on => {
 
     $.clock.every(EVERY, () => { void check() })
     void check()
+
+    // The chief's view. Registered in every fleet session, since which one
+    // is the chief is only known once the board has linked it.
+    try {
+      await $.command.register({ name: 'fleet', description: 'Show the fleet: the crew, the open tasks, the latest messages' })
+    } catch {
+      // A command of that name already: the band and toasts still work.
+    }
+    const watch = $.clock.every(EVERY, async () => {
+      if (isWorker || looking) return
+      looking = true
+      try {
+        const s = await look($, id)
+        if (!s) return
+        if (s.me?.role === 'worker') {
+          isWorker = true
+          watch.cancel()
+          return
+        }
+        // Not linked yet: a session is put on the board a few seconds after
+        // it starts.
+        if (s.me?.role !== 'chief') return
+        await update($, snapshot, () => s)
+        seen = notify($, s, seen)
+      } finally {
+        looking = false
+      }
+    })
     return next(e)
   })
 
@@ -238,5 +382,86 @@ export const register: Register = on => {
     // of the main loop's turn; only the main loop's says the session is idle.
     if (e.agentId === undefined) busy = false
     return done
+  })
+
+  on('command.run', { command: 'fleet' }, async $ => {
+    if (isWorker) return { text: "The fleet is drawn in the chief's session." }
+    const opened = await $.ui.open({ id: PANE, title: 'fleet' })
+    return opened.isPlaced ? {} : { text: 'Widen the terminal to see the fleet pane.' }
+  })
+
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const { Box, Button, Text } = $.ui.resolve(e)
+    const s = await read($, snapshot)
+    if (!s) return <Text dimColor>Reading the board…</Text>
+    const width = Math.max(40, e.props.bodyColumns ?? 80)
+    const nameWidth = Math.min(18, Math.max(6, ...s.agents.map(a => a.name.length)) + 1)
+    const messages = s.events.filter(ev => ev.kind === 'message').slice(0, 6)
+
+    return (
+      <Box flexDirection="column" width={width}>
+        <Text bold>Crew</Text>
+        {s.agents.length === 0 && <Text dimColor>No agents yet: the chief starts them with fleet spawn.</Text>}
+        {s.agents.map(a => {
+          const [said, colour] = state(a)
+          const full = a.context !== null && a.context >= HIGH
+          return (
+            <Box key={`agent-${a.name}`} flexDirection="row" gap={1}>
+              <Text bold={a.role === 'chief'}>{pad(a.name, nameWidth)}</Text>
+              <Text color={colour}>{pad(said, 22)}</Text>
+              <Text color={full ? 'red' : undefined} dimColor={!full}>
+                {a.context === null ? '    ' : pad(`${a.context}%`, 4)}
+              </Text>
+              <Text dimColor wrap="truncate-end">{a.task ?? ''}</Text>
+              {a.awaiting_go && a.presence === 'waiting' && (
+                <Button key={`go-${a.name}`} label={`go ${a.awaiting_go}`} onPress={() => give($, a.awaiting_go ?? '')} />
+              )}
+            </Box>
+          )
+        })}
+        {s.agents.some(a => a.target?.startsWith('bg:')) && (
+          <Text dimColor>`claude agents` opens any of them; `claude attach &lt;id&gt;` one.</Text>
+        )}
+        <Text> </Text>
+        <Text bold>Open tasks</Text>
+        {s.tasks.length === 0 && <Text dimColor>Nothing open.</Text>}
+        {s.tasks.map(t => (
+          <Box key={`task-${t.key}`} flexDirection="row" gap={1}>
+            <Text>{pad(t.key, 12)}</Text>
+            <Text color={t.state === 'blocked' ? 'red' : t.state === 'running' ? 'yellow' : undefined}>{pad(t.state, 8)}</Text>
+            <Text dimColor>{pad(t.agent ?? '', nameWidth)}</Text>
+            <Text wrap="truncate-end">{t.note ? `${t.title} — ${t.note}` : t.title}</Text>
+          </Box>
+        ))}
+        <Text> </Text>
+        <Text bold>Latest messages</Text>
+        {messages.length === 0 && <Text dimColor>None yet.</Text>}
+        {messages.map(m => (
+          <Text key={`msg-${m.key}`} wrap="truncate-end">
+            <Text dimColor>{`${m.from ?? '?'} → ${m.to ?? '?'}: `}</Text>
+            {m.summary}
+          </Text>
+        ))}
+      </Box>
+    )
+  })
+
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (isWorker || e.props.hasSurvey) return next(e)
+    const s = await read($, snapshot)
+    const crew = s?.agents.filter(a => a.role === 'worker') ?? []
+    if (!s || crew.length === 0) return next(e)
+    const { Box, Text } = $.ui.resolve(e)
+    const want = needs(s)
+    const working = crew.filter(a => a.presence === 'working').length
+    const open = s.tasks.length
+
+    return (
+      <Box flexDirection="row">
+        <Text dimColor>{`fleet · ${crew.length} agent${crew.length === 1 ? '' : 's'} · ${working} working · ${open} open`}</Text>
+        {want.length > 0 && <Text color="red">{` · ${want.join(' · ')}`}</Text>}
+        <Text dimColor> · /fleet</Text>
+      </Box>
+    )
   })
 }

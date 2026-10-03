@@ -1167,7 +1167,7 @@ const STACK_BELOW: u16 = 80 + 36;
 
 /// An event's identity, for remembering when it was first seen. The log has
 /// no id column to read, and these four together do not repeat.
-fn event_key(e: &db::Event) -> String {
+pub(crate) fn event_key(e: &db::Event) -> String {
     format!(
         "{}|{}|{}|{}",
         e.ts,

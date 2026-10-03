@@ -280,7 +280,9 @@ const SKILL: &str = include_str!("../skills/board/SKILL.md");
 /// `mod/` is a plugin of its own, so `claude plugin test mod` runs its tests;
 /// what an agent is started with is these two files beside the skill.
 const MOD_HOOKS: &str = include_str!("../mod/hooks/hooks.json");
-const MOD_REGISTER: &str = include_str!("../mod/hooks/register.ts");
+const MOD_REGISTER: &str = include_str!("../mod/hooks/register.tsx");
+/// The types of what the mod keeps in its state, which Claude Code holds it to.
+const MOD_TYPES: &str = include_str!("../mod/types/index.d.ts");
 
 /// Where fleet keeps the Claude Code plugin its agents are started with.
 pub fn plugin_dir() -> std::path::PathBuf {
@@ -300,11 +302,16 @@ pub fn write_plugin(dir: &Path) -> std::io::Result<std::path::PathBuf> {
         "version": env!("CARGO_PKG_VERSION"),
         "description": "The fleet board, for the agents a fleet starts.",
         "author": { "name": "Patrick Kunzke" },
+        "types": "./types/index.d.ts",
     });
     put(&dir.join(".claude-plugin/plugin.json"), &format!("{manifest:#}\n"))?;
     put(&dir.join("skills/board/SKILL.md"), SKILL)?;
     put(&dir.join("hooks/hooks.json"), MOD_HOOKS)?;
-    put(&dir.join("hooks/register.ts"), MOD_REGISTER)?;
+    put(&dir.join("hooks/register.tsx"), MOD_REGISTER)?;
+    put(&dir.join("types/index.d.ts"), MOD_TYPES)?;
+    // The module's name before it drew anything: hooks.json no longer names
+    // it, and a copy left beside the new one only misleads.
+    let _ = std::fs::remove_file(dir.join("hooks/register.ts"));
     Ok(dir.to_path_buf())
 }
 
@@ -786,6 +793,15 @@ mod tests {
         let register = std::fs::read_to_string(plugin.join("hooks").join(module)).unwrap();
         assert_eq!(register, MOD_REGISTER);
         assert!(register.contains("'board', 'inbox'"), "it checks the mailbox fleet answers");
+        assert!(register.contains("'board', 'snapshot'"), "and reads the fleet for the chief's view");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(plugin.join(".claude-plugin/plugin.json")).unwrap()).unwrap();
+        let types = std::fs::read_to_string(plugin.join(manifest["types"].as_str().unwrap())).unwrap();
+        assert!(types.contains("snapshot: Snapshot | null"), "the state it keeps is declared");
+
+        std::fs::write(plugin.join("hooks/register.ts"), "old").unwrap();
+        write_plugin(dir.path()).unwrap();
+        assert!(!plugin.join("hooks/register.ts").exists(), "an older fleet's module is cleared away");
     }
 
     fn said(from: &str, to: &str, summary: &str) -> crate::db::Event {
