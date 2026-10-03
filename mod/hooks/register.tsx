@@ -18,6 +18,11 @@
 // one can write a file in ways no pattern here knows. When the board cannot
 // be asked, the edit goes ahead, as it would without the mod.
 //
+// It gives the session the board as tools: `mcp__fleet__board_start`,
+// `..._msg`, `..._go` and the rest, each running the `fleet board` command of
+// the same name. A tool has a schema to fill in where a shell line has
+// quoting to get wrong, and nothing to mistake for a skill.
+//
 // And in the chief's session it draws the fleet. In herdr the fleet tab sits
 // beside the chief; outside herdr there is no tab, so `/fleet` opens a pane
 // with the crew, the open tasks and the latest messages, a band above the
@@ -77,6 +82,197 @@ export function writes(command: string): boolean {
     new RegExp(String.raw`${AT}git\s+(?:-C\s+\S+\s+)?(?:apply|am|checkout|switch|restore|reset|stash|commit|merge|rebase|cherry-pick|revert|mv|rm|clean|pull)\b`),
   ]
   return rules.some(rule => rule.test(bare))
+}
+
+/** One of the board's commands, as a tool the model calls. */
+type BoardTool = {
+  name: string
+  description: string
+  properties: Record<string, unknown>
+  required: string[]
+  /** Only the chief plans, dispatches and gives the go. */
+  isChiefs?: true
+  /** The `fleet` command line, from the tool's input and who calls it. */
+  argv: (input: Record<string, unknown>, me: string) => string[]
+}
+
+const str = (description: string) => ({ type: 'string', description })
+const TASK = str('The task key, such as ENG-2553-1')
+
+/** `--flag value` when the value was given. */
+function opt(flag: string, value: unknown): string[] {
+  return typeof value === 'string' && value !== '' ? [flag, value] : []
+}
+
+const BOARD_TOOLS: BoardTool[] = [
+  {
+    name: 'board_ls',
+    description: 'Every task on the board, with its state, its agent and what it waits on.',
+    properties: { state: str('Only tasks in this state: queued, running, blocked, review, done, dropped'), epic: str('Only this epic'), repo: str('Only tasks whose repository path contains this') },
+    required: [],
+    argv: i => ['board', 'ls', ...opt('--state', i.state), ...opt('--epic', i.epic), ...opt('--repo', i.repo)],
+  },
+  {
+    name: 'board_show',
+    description: 'One task: its brief, and everything that happened to it.',
+    properties: { task: TASK },
+    required: ['task'],
+    argv: i => ['board', 'show', String(i.task)],
+  },
+  {
+    name: 'board_ready',
+    description: 'Queued tasks whose dependencies are all done: what can be dispatched now.',
+    properties: {},
+    required: [],
+    argv: () => ['board', 'ready'],
+  },
+  {
+    name: 'board_start',
+    description: 'Mark a task running: you have picked it up.',
+    properties: { task: TASK },
+    required: ['task'],
+    argv: i => ['board', 'start', String(i.task)],
+  },
+  {
+    name: 'board_block',
+    description: 'Mark a task blocked, with why. Tell the chief as well.',
+    properties: { task: TASK, reason: str('What it is waiting for') },
+    required: ['task', 'reason'],
+    argv: i => ['board', 'block', String(i.task), String(i.reason)],
+  },
+  {
+    name: 'board_unblock',
+    description: 'Carry on with a blocked task.',
+    properties: { task: TASK },
+    required: ['task'],
+    argv: i => ['board', 'unblock', String(i.task)],
+  },
+  {
+    name: 'board_review',
+    description: 'Open a task for review rather than finished.',
+    properties: { task: TASK, mr: str('The merge or pull request URL') },
+    required: ['task'],
+    argv: i => ['board', 'review', String(i.task), ...opt('--mr', i.mr)],
+  },
+  {
+    name: 'board_done',
+    description: 'Finish a task. Says which tasks that freed.',
+    properties: { task: TASK, mr: str('The merge or pull request URL') },
+    required: ['task'],
+    argv: i => ['board', 'done', String(i.task), ...opt('--mr', i.mr)],
+  },
+  {
+    name: 'board_msg',
+    description: 'Send another agent a message, recorded on the board and delivered to them. You are the sender.',
+    properties: { to: str('The agent, by its board name: chief, or a worker'), summary: str('One line'), body: str('The rest, if there is more'), task: TASK },
+    required: ['to', 'summary'],
+    argv: (i, me) => ['board', 'msg', me, String(i.to), String(i.summary), ...opt('--body', i.body), ...opt('--task', i.task)],
+  },
+  {
+    name: 'board_note',
+    description: 'Record something on the board that is not a message to anyone.',
+    properties: { summary: str('One line'), body: str('The rest'), task: TASK },
+    required: ['summary'],
+    argv: i => ['board', 'note', String(i.summary), ...opt('--body', i.body), ...opt('--task', i.task)],
+  },
+  {
+    name: 'board_add',
+    description: 'Queue a task for a repository.',
+    properties: {
+      task: TASK,
+      repo: str('The repository, as an absolute path'),
+      title: str('A short title'),
+      body: str('What a fresh agent in that repository needs in order to start'),
+      epic: str('The epic it belongs to'),
+      deps: { type: 'array', items: { type: 'string' }, description: 'Tasks it waits on' },
+    },
+    required: ['task', 'repo', 'title'],
+    isChiefs: true,
+    argv: i => [
+      'board', 'add', String(i.task), String(i.repo), String(i.title),
+      ...opt('--epic', i.epic), ...opt('--body', i.body),
+      ...(Array.isArray(i.deps) ? i.deps.flatMap(d => ['--dep', String(d)]) : []),
+    ],
+  },
+  {
+    name: 'board_dep',
+    description: 'Record that one task waits on another.',
+    properties: { task: TASK, depends_on: str('The task it waits on') },
+    required: ['task', 'depends_on'],
+    isChiefs: true,
+    argv: i => ['board', 'dep', String(i.task), String(i.depends_on)],
+  },
+  {
+    name: 'board_epic',
+    description: 'Create or retitle an epic.',
+    properties: { key: str('The epic key, such as ENG-2553'), title: str('Its title') },
+    required: ['key', 'title'],
+    isChiefs: true,
+    argv: i => ['board', 'epic', String(i.key), String(i.title)],
+  },
+  {
+    name: 'board_claim',
+    description: 'Assign a task to an agent.',
+    properties: { task: TASK, agent: str('The agent, by its board name') },
+    required: ['task', 'agent'],
+    isChiefs: true,
+    argv: i => ['board', 'claim', String(i.task), String(i.agent)],
+  },
+  {
+    name: 'board_go',
+    description: "Give a worker the go-ahead on its task, and tell it. Until a task has one, its worker cannot change files. Anything short of a go is board_msg.",
+    properties: { task: TASK, message: str('What to send with it; "go" when not given'), body: str('More, if there is more') },
+    required: ['task'],
+    isChiefs: true,
+    argv: i => ['board', 'go', String(i.task), ...(typeof i.message === 'string' && i.message ? [i.message] : []), ...opt('--body', i.body)],
+  },
+  {
+    name: 'board_drop',
+    description: 'Abandon a task.',
+    properties: { task: TASK, reason: str('Why') },
+    required: ['task'],
+    isChiefs: true,
+    argv: i => ['board', 'drop', String(i.task), ...(typeof i.reason === 'string' && i.reason ? [i.reason] : [])],
+  },
+  {
+    name: 'spawn',
+    description: 'Start an agent in a repository, briefed on its task, and claim the task for it.',
+    properties: { name: str('What to call it, usually after the repository'), repo: str('The repository, as an absolute path'), task: TASK },
+    required: ['name', 'repo'],
+    isChiefs: true,
+    argv: i => ['spawn', String(i.name), '--repo', String(i.repo), ...opt('--task', i.task)],
+  },
+  {
+    name: 'handoff',
+    description: "Hand an agent's task to a fresh session of it, for one nearly out of context.",
+    properties: { agent: str('The agent'), note: str('Anything the new session should know that the board does not say'), now: { type: 'boolean', description: 'Close the old session even mid-turn' } },
+    required: ['agent'],
+    isChiefs: true,
+    argv: i => ['handoff', String(i.agent), ...opt('--note', i.note), ...(i.now === true ? ['--now'] : [])],
+  },
+  {
+    name: 'retire',
+    description: "Take an agent off the board once its work is done, and close its tab or background session.",
+    properties: { name: str('The agent') },
+    required: ['name'],
+    isChiefs: true,
+    argv: i => ['board', 'retire', String(i.name)],
+  },
+]
+
+/** What Claude Code calls a tool of this plugin's. */
+const TOOL_PREFIX = 'mcp__fleet__'
+
+/** Run a board tool as the agent `me`, and answer with what fleet said. */
+async function runBoardTool($: EngineInterface, tool: BoardTool, input: Record<string, unknown>, me: string) {
+  try {
+    // spawn and handoff wait for the new session to report.
+    const out = await $.process.run(['fleet', ...tool.argv(input, me)], { timeoutMs: 120_000 })
+    const said = (out.stdout + out.stderr).trim() || 'done'
+    return out.exitCode === 0 ? { result: said } : { isError: true as const, result: said }
+  } catch (err) {
+    return { isError: true as const, result: `fleet could not be run: ${String(err)}` }
+  }
 }
 
 /** A worker reaching for the go-ahead it is waiting for. */
@@ -227,6 +423,17 @@ export const register: Register = on => {
     const id = await $.session.id()
     session = id
 
+    // The board as tools, in every session fleet started. Which ones the
+    // chief alone may use is settled when they are called: a session is put
+    // on the board, and so has a role, only after it starts.
+    for (const t of BOARD_TOOLS) {
+      try {
+        await $.tool.register({ name: t.name, description: t.description, inputSchema: { type: 'object', properties: t.properties, required: t.required } })
+      } catch {
+        // A name already taken: the `fleet board` command still is.
+      }
+    }
+
     const check = async () => {
       if (checking) return
       checking = true
@@ -325,6 +532,18 @@ export const register: Register = on => {
     const main = session !== undefined && e.agentId === undefined
     if (main) running.push(e.tool)
     try {
+      const boardTool = session && e.tool.startsWith(TOOL_PREFIX)
+        ? BOARD_TOOLS.find(t => TOOL_PREFIX + t.name === e.tool)
+        : undefined
+      if (boardTool && session) {
+        const g = await gate($, session)
+        if (!g?.agent) return { isError: true as const, result: 'fleet: this session is not on the board yet; try again in a moment' }
+        if (g.role === 'retired') return { deny: `fleet: this session of ${g.agent} was retired, and changes nothing more.` }
+        if (boardTool.isChiefs && g.role !== 'chief') {
+          return { deny: `fleet: ${boardTool.name} is the chief's. Ask the chief with board_msg.` }
+        }
+        return await runBoardTool($, boardTool, e as unknown as Record<string, unknown>, g.agent)
+      }
       const edit = EDITS.has(e.tool)
       const command = e.tool === 'Bash' && typeof e.command === 'string' ? e.command : undefined
       if (!session || (!edit && command === undefined)) return await next(e)

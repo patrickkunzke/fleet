@@ -38,10 +38,10 @@ pub struct Brief {
 const EDITING: &[&str] = &["Edit", "Write", "NotebookEdit"];
 
 /// What every agent may run without asking: the board.
-const WORKER_TOOLS: &[&str] = &["Bash(fleet board:*)"];
+const WORKER_TOOLS: &[&str] = &["Bash(fleet board:*)", "mcp__fleet"];
 
 /// The chief's: the board, and starting and handing off agents.
-const CHIEF_TOOLS: &[&str] = &["Bash(fleet board:*)", "Bash(fleet spawn:*)", "Bash(fleet handoff:*)"];
+const CHIEF_TOOLS: &[&str] = &["Bash(fleet board:*)", "Bash(fleet spawn:*)", "Bash(fleet handoff:*)", "mcp__fleet"];
 
 /// The session you talk to. It plans, it dispatches, and it is the only one
 /// that writes tasks.
@@ -59,7 +59,9 @@ pub fn chief(root: &Path) -> Brief {
              Write the task, start an agent, let it do the work. What you are for \
              is holding the whole picture; an hour spent editing one file is an \
              hour in which nobody is.\n\n\
-             Everything shared goes through the board skill, `fleet board --help`. \
+             Everything shared goes through the board: its commands are tools of \
+             yours, `mcp__fleet__board_*` with `spawn`, `handoff` and `retire`, \
+             and `fleet board --help` from the shell does the same. \
              The board is what the other agents read, so anything they must act on \
              belongs there rather than in this conversation. Dispatch with \
              `fleet spawn <name> --repo <path> --task <key>`, which briefs the \
@@ -100,7 +102,9 @@ pub fn worker_with(name: &str, repo: &Path, task: Option<&Task>, body: Option<&s
          repositories. Yours is {here}; stay in it — another agent has each of \
          the others, and two agents editing one repository is how the fleet \
          breaks.\n\n\
-         Report through the board skill, `fleet board --help`. It is how the \
+         Report through the board: its commands are tools of yours, \
+         `mcp__fleet__board_*`, and `fleet board --help` from the shell does \
+         the same. It is how the \
          chief of staff and the other agents see what you are doing, so state \
          changes and blockers go there as they happen, not at the end. To reach \
          the chief directly, `fleet board msg {name} chief '...'`, which both \
@@ -686,7 +690,7 @@ mod tests {
         assert_eq!(args[0], "--append-system-prompt");
         assert_eq!(args[1], b.role, "the role, newlines and apostrophes intact");
         assert_eq!(args[2], b.opening);
-        assert_eq!(&args[3..], ["--allowed-tools", "Bash(fleet board:*)", "Bash(fleet spawn:*)", "Bash(fleet handoff:*)", "--disallowed-tools", "Edit", "Write", "NotebookEdit"], "after the opening, which they would take for a tool name");
+        assert_eq!(&args[3..], ["--allowed-tools", "Bash(fleet board:*)", "Bash(fleet spawn:*)", "Bash(fleet handoff:*)", "mcp__fleet", "--disallowed-tools", "Edit", "Write", "NotebookEdit"], "after the opening, which they would take for a tool name");
     }
 
     #[test]
@@ -699,7 +703,7 @@ mod tests {
         assert_eq!(&args[..2], ["--resume", "sid-1"]);
         assert_eq!(args[2], "--append-system-prompt");
         assert_eq!(args[3], b.role);
-        assert_eq!(&args[4..], ["--allowed-tools", "Bash(fleet board:*)", "Bash(fleet spawn:*)", "Bash(fleet handoff:*)", "--disallowed-tools", "Edit", "Write", "NotebookEdit"]);
+        assert_eq!(&args[4..], ["--allowed-tools", "Bash(fleet board:*)", "Bash(fleet spawn:*)", "Bash(fleet handoff:*)", "mcp__fleet", "--disallowed-tools", "Edit", "Write", "NotebookEdit"]);
     }
 
     #[test]
@@ -713,7 +717,7 @@ mod tests {
         let args = landed(&line, dir.path());
         assert_eq!(&args[..2], ["--resume", "sess-123"]);
         assert_eq!(args[3], b.role);
-        assert_eq!(&args[4..], ["--allowed-tools", "Bash(fleet board:*)"], "no opening, no deny list");
+        assert_eq!(&args[4..], ["--allowed-tools", "Bash(fleet board:*)", "mcp__fleet"], "no opening, no deny list");
     }
 
     #[test]
@@ -726,7 +730,7 @@ mod tests {
         let line = launch_line(&program.to_string_lossy(), &b, &dir.path().join("b"), "billing-svc", None).unwrap();
         let args = landed(&line, dir.path());
         assert_eq!(args[2], b.opening, "the opening is still the prompt");
-        assert_eq!(&args[3..], ["--allowed-tools", "Bash(fleet board:*)"]);
+        assert_eq!(&args[3..], ["--allowed-tools", "Bash(fleet board:*)", "mcp__fleet"]);
     }
 
     #[test]
