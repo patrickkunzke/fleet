@@ -5,6 +5,7 @@
 mod agent;
 mod background;
 mod brief;
+mod chief;
 mod db;
 mod herdr;
 mod host;
@@ -64,7 +65,21 @@ enum Command {
         #[command(subcommand)]
         cmd: HerdrCmd,
     },
-    /// Start an agent in a herdr tab and register it on the board.
+    /// Start the chief of staff in this terminal, on this workspace's board.
+    /// Outside herdr, how a fleet begins: the agents it starts run as
+    /// Claude Code background sessions, and `/fleet` shows them.
+    Chief {
+        /// The workspace: the directory that holds the repositories. The
+        /// directory it is run in, by default.
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Go back into the last chief's conversation, and its run, rather
+        /// than starting a new one.
+        #[arg(long)]
+        resume: bool,
+    },
+    /// Start an agent, in a herdr tab or as a background session, and
+    /// register it on the board.
     Spawn {
         /// What to call it. Also the herdr tab's name.
         name: String,
@@ -471,6 +486,7 @@ fn main() -> Result<()> {
             timeout,
             db,
         } => spawn(&name, &repo, task.as_deref(), &role, command.as_deref(), timeout, db, None),
+        Command::Chief { root, resume } => chief::run(root, resume),
         Command::Handoff { agent, note, now, timeout, db } => handoff(&agent, note.as_deref(), now, timeout, db),
     }
 }

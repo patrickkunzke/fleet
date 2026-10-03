@@ -50,7 +50,19 @@ context small, and something has to keep track of what waits on what.
 
 ### Without herdr
 
-Outside herdr, fleet runs its agents as Claude Code
+Outside herdr, start a fleet by running this in the workspace, the directory
+that holds your repositories:
+
+```bash
+fleet chief            # a new chief, and a new run
+fleet chief --resume   # back into the last chief's conversation and its run
+```
+
+The terminal becomes the chief's Claude Code session: briefed, with the
+`/board` skill and fleet's mod, on the workspace's board. It refuses to start
+a second chief while the first is still running.
+
+fleet runs the agents the chief starts as Claude Code
 [background sessions](https://code.claude.com/docs/en/agent-view) instead of
 herdr tabs. `fleet spawn`, `fleet handoff`, `fleet board retire` and resume
 work the same from any terminal: each agent is a `claude --bg` session in its

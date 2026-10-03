@@ -128,7 +128,7 @@ fn environment(run: Option<i64>, board: Option<&Path>, bin: Option<&Path>) -> St
 /// [`environment`], as variables for a process fleet starts itself: a
 /// background session takes its environment from whatever starts it, and
 /// keeps it, mod included, for as long as it runs.
-fn variables(run: Option<i64>, board: Option<&Path>, bin: Option<&Path>) -> Vec<(String, String)> {
+pub fn variables(run: Option<i64>, board: Option<&Path>, bin: Option<&Path>) -> Vec<(String, String)> {
     let mut out = Vec::new();
     if let Some(bin) = bin {
         let path = std::env::var("PATH").unwrap_or_default();
@@ -335,7 +335,7 @@ pub fn conversation_exists(repo: &Path, session: &str) -> bool {
     conversation_in(&registry::default_projects_dir(), repo, session)
 }
 
-fn conversation_in(projects: &Path, repo: &Path, session: &str) -> bool {
+pub fn conversation_in(projects: &Path, repo: &Path, session: &str) -> bool {
     projects
         .join(registry::project_slug(repo))
         .join(format!("{session}.jsonl"))
