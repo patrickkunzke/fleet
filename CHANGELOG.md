@@ -4,6 +4,12 @@ Every release of fleet. Each section is written when a pull request with a
 `feat`, `fix` or `perf` commit is merged; see
 [Releases](README.md#releases).
 
+## [0.15.0](https://github.com/patrickkunzke/fleet/releases/tag/v0.15.0) — 2026-10-03
+
+### Features
+
+- Install fleet as a Claude Code plugin, and keep a chief's brief through compaction
+
 ## [0.14.0](https://github.com/patrickkunzke/fleet/releases/tag/v0.14.0) — 2026-10-03
 
 ### Features
