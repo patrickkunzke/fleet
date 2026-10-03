@@ -4,6 +4,12 @@ Every release of fleet. Each section is written when a pull request with a
 `feat`, `fix` or `perf` commit is merged; see
 [Releases](README.md#releases).
 
+## [0.11.0](https://github.com/patrickkunzke/fleet/releases/tag/v0.11.0) — 2026-10-03
+
+### Features
+
+- **mod:** Draw the fleet in the chief's own session
+
 ## [0.10.0](https://github.com/patrickkunzke/fleet/releases/tag/v0.10.0) — 2026-10-03
 
 ### Features
