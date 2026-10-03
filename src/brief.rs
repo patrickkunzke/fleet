@@ -26,12 +26,22 @@ pub struct Brief {
     pub opening: String,
     /// Tools withheld for the whole session.
     pub deny: &'static [&'static str],
+    /// Tools it may use without asking: the fleet's own commands, which
+    /// only read and write the board. Without them an agent's first report
+    /// stops at a permission dialog nobody is watching.
+    pub allow: &'static [&'static str],
 }
 
 /// The tools that change a file. Withheld from the chief, because asking it
 /// not to do the work was not enough: given a ticket touching one repository
 /// it did the work itself, which is the one thing it is not for.
 const EDITING: &[&str] = &["Edit", "Write", "NotebookEdit"];
+
+/// What every agent may run without asking: the board.
+const WORKER_TOOLS: &[&str] = &["Bash(fleet board:*)"];
+
+/// The chief's: the board, and starting and handing off agents.
+const CHIEF_TOOLS: &[&str] = &["Bash(fleet board:*)", "Bash(fleet spawn:*)", "Bash(fleet handoff:*)"];
 
 /// The session you talk to. It plans, it dispatches, and it is the only one
 /// that writes tasks.
@@ -71,11 +81,19 @@ pub fn chief(root: &Path) -> Brief {
                   what I want to work on. Be brief."
             .to_string(),
         deny: EDITING,
+        allow: CHIEF_TOOLS,
     }
 }
 
 /// A worker, and what it is for.
 pub fn worker(name: &str, repo: &Path, task: Option<&Task>, body: Option<&str>) -> Brief {
+    worker_with(name, repo, task, body, false)
+}
+
+/// [`worker`], for a task that may already have its go-ahead: one approved
+/// before anyone was started on it. Told to wait for a go it has, a worker
+/// waits for one nobody is going to send.
+pub fn worker_with(name: &str, repo: &Path, task: Option<&Task>, body: Option<&str>, approved: bool) -> Brief {
     let here = repo.display();
     let role = format!(
         "You are `{name}`, one agent of a fleet working across several \
@@ -105,6 +123,7 @@ pub fn worker(name: &str, repo: &Path, task: Option<&Task>, body: Option<&str>) 
                  is unblocked. If neither has anything for you, say so and wait."
             ),
             deny: &[],
+            allow: WORKER_TOOLS,
         };
     };
 
@@ -124,19 +143,30 @@ pub fn worker(name: &str, repo: &Path, task: Option<&Task>, body: Option<&str>) 
     opening.push_str(&format!(
         "\nMark it running with `fleet board start {}` when you begin, and \
          `fleet board done {}` when it is finished. If you are blocked, \
-         `fleet board block {} '<why>'` and tell the chief.\n\n\
-         Start by reading enough of the repository to say what you intend to \
-         do. Say it here, and send the chief the short version with \
-         `fleet board msg {} chief '...'`. Then wait for a go-ahead, from the \
-         chief or from me: until there is one, fleet holds back your edits. \
-         Be brief.",
-        task.key, task.key, task.key, name
+         `fleet board block {} '<why>'` and tell the chief.\n\n",
+        task.key, task.key, task.key
     ));
+    if approved {
+        opening.push_str(&format!(
+            "It already has its go-ahead. Read enough of the repository to know \
+             what to do, tell the chief in one line what you are about to do with \
+             `fleet board msg {name} chief '...'`, and get on with it. Be brief."
+        ));
+    } else {
+        opening.push_str(&format!(
+            "Start by reading enough of the repository to say what you intend to \
+             do. Say it here, and send the chief the short version with \
+             `fleet board msg {name} chief '...'`. Then wait for a go-ahead, from the \
+             chief or from me: until there is one, fleet holds back your edits. \
+             Be brief."
+        ));
+    }
 
     Brief {
         role,
         opening,
         deny: &[],
+        allow: WORKER_TOOLS,
     }
 }
 
@@ -208,7 +238,7 @@ pub fn handoff(name: &str, repo: &Path, task: Option<&Task>, body: Option<&str>,
              {name} chief '...'`, and wait for a go-ahead. Be brief."
         ));
     }
-    Brief { role, opening, deny: &[] }
+    Brief { role, opening, deny: &[], allow: WORKER_TOOLS }
 }
 
 /// The first `width` characters of `s`, with an ellipsis when cut.
@@ -361,7 +391,15 @@ fn plugin_arg(plugin: Option<&Path>) -> String {
 }
 
 fn push_deny(out: &mut String, brief: &Brief) {
-    // Variadic, so last: anything after it would be read as a tool name.
+    // Both variadic, so after the opening prompt, which they would otherwise
+    // take for one more tool name; each ends at the next flag.
+    if !brief.allow.is_empty() {
+        out.push_str(" --allowed-tools");
+        for tool in brief.allow {
+            out.push(' ');
+            out.push_str(&quote(tool));
+        }
+    }
     if !brief.deny.is_empty() {
         out.push_str(" --disallowed-tools ");
         out.push_str(&brief.deny.join(" "));
@@ -599,7 +637,7 @@ mod tests {
         assert_eq!(args[0], "--append-system-prompt");
         assert_eq!(args[1], b.role, "the role, newlines and apostrophes intact");
         assert_eq!(args[2], b.opening);
-        assert_eq!(&args[3..], ["--disallowed-tools", "Edit", "Write", "NotebookEdit"]);
+        assert_eq!(&args[3..], ["--allowed-tools", "Bash(fleet board:*)", "Bash(fleet spawn:*)", "Bash(fleet handoff:*)", "--disallowed-tools", "Edit", "Write", "NotebookEdit"], "after the opening, which they would take for a tool name");
     }
 
     #[test]
@@ -612,7 +650,7 @@ mod tests {
         assert_eq!(&args[..2], ["--resume", "sid-1"]);
         assert_eq!(args[2], "--append-system-prompt");
         assert_eq!(args[3], b.role);
-        assert_eq!(&args[4..], ["--disallowed-tools", "Edit", "Write", "NotebookEdit"]);
+        assert_eq!(&args[4..], ["--allowed-tools", "Bash(fleet board:*)", "Bash(fleet spawn:*)", "Bash(fleet handoff:*)", "--disallowed-tools", "Edit", "Write", "NotebookEdit"]);
     }
 
     #[test]
@@ -626,7 +664,31 @@ mod tests {
         let args = landed(&line, dir.path());
         assert_eq!(&args[..2], ["--resume", "sess-123"]);
         assert_eq!(args[3], b.role);
-        assert_eq!(args.len(), 4, "no opening, no deny list: {args:?}");
+        assert_eq!(&args[4..], ["--allowed-tools", "Bash(fleet board:*)"], "no opening, no deny list");
+    }
+
+    #[test]
+    fn a_worker_reports_to_the_board_without_asking_first() {
+        // Its first `fleet board start` stopped at a permission dialog that
+        // nobody was watching.
+        let dir = tempfile::tempdir().unwrap();
+        let program = recorder(dir.path());
+        let b = worker("billing-svc", Path::new("/w"), Some(&task("ENG-1-1", &[])), None);
+        let line = launch_line(&program.to_string_lossy(), &b, &dir.path().join("b"), "billing-svc", None).unwrap();
+        let args = landed(&line, dir.path());
+        assert_eq!(args[2], b.opening, "the opening is still the prompt");
+        assert_eq!(&args[3..], ["--allowed-tools", "Bash(fleet board:*)"]);
+    }
+
+    #[test]
+    fn a_worker_on_an_approved_task_is_told_it_has_its_go() {
+        let t = task("ENG-1-1", &[]);
+        let go = worker_with("billing-svc", Path::new("/w"), Some(&t), None, true);
+        assert!(go.opening.contains("already has its go-ahead"), "{}", go.opening);
+        assert!(!go.opening.contains("wait for a go-ahead"), "{}", go.opening);
+        let wait = worker_with("billing-svc", Path::new("/w"), Some(&t), None, false);
+        assert!(wait.opening.contains("wait for a go-ahead"), "{}", wait.opening);
+        assert_eq!(wait.opening, worker("billing-svc", Path::new("/w"), Some(&t), None).opening);
     }
 
     #[test]
@@ -648,6 +710,7 @@ mod tests {
         let args = landed(&line, dir.path());
         assert_eq!(args[..2], ["--plugin-dir".to_string(), plugin.to_string_lossy().to_string()]);
         assert_eq!(&args[args.len() - 4..], ["--disallowed-tools", "Edit", "Write", "NotebookEdit"], "still last");
+        assert!(args.contains(&"Bash(fleet spawn:*)".to_string()), "the chief starts agents without asking");
 
         let line = resume_line(&program.to_string_lossy(), &b, "s", &dir.path().join("b"), "chief", Some(&plugin)).unwrap();
         assert_eq!(landed(&line, dir.path())[..2], args[..2], "and when it comes back");
