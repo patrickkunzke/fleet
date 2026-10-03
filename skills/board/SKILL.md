@@ -37,6 +37,21 @@ It is not a memory store. Long-term recall belongs in claude-mem; raw tool
 activity stays in the transcripts. Write to the board only what another agent
 needs in order to act.
 
+## The tools
+
+The board's commands are tools you call directly: `board_ls`, `board_show`,
+`board_ready`, `board_start`, `board_block`, `board_unblock`, `board_review`,
+`board_done`, `board_msg` and `board_note`, and for the chief also
+`board_add`, `board_dep`, `board_epic`, `board_claim`, `board_go`,
+`board_drop`, `spawn`, `handoff` and `retire` (each `mcp__fleet__<name>`).
+Use them rather than the shell: they take their input as fields, so a
+message with quotes or several lines arrives as written, and `board_msg`
+signs it with your name. This skill is instructions, not a command: invoking
+it does nothing on the board.
+
+The examples below use the command line, which does the same and is what to
+use if the tools are not there.
+
 ## The CLI
 
 Every read and write goes through one command:
