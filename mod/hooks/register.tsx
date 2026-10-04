@@ -352,12 +352,13 @@ async function look($: EngineInterface, session: string): Promise<Snapshot | und
 }
 
 /**
- * The fleet view's graph at `width` by `height`, drawn by fleet itself so
- * the pane shows what the herdr tab shows; undefined when it cannot be read.
+ * The fleet view at `width` by `height`, drawn by fleet itself so the pane
+ * looks as the fleet tab does; undefined when it cannot be read.
  */
-async function drawGraph($: EngineInterface, width: number, height: number): Promise<GraphSpan[][] | undefined> {
+async function drawView($: EngineInterface, root: string, width: number, height: number): Promise<GraphSpan[][] | undefined> {
   try {
-    const out = await $.process.run(['fleet', 'board', 'graph', '--width', String(width), '--height', String(height)], { timeoutMs: 10_000 })
+    const argv = ['fleet', 'board', 'view', '--root', root, '--width', String(width), '--height', String(height)]
+    const out = await $.process.run(argv, { timeoutMs: 10_000 })
     return out.exitCode === 0 ? (JSON.parse(out.stdout) as { lines: GraphSpan[][] }).lines : undefined
   } catch {
     return undefined
@@ -383,10 +384,6 @@ function needs(s: Snapshot): string[] {
     if (a.context !== null && a.context >= HIGH) out.push(`${a.name} at ${a.context}%`)
   }
   return out
-}
-
-function pad(text: string, width: number): string {
-  return text.length >= width ? text.slice(0, width) : text + ' '.repeat(width - text.length)
 }
 
 /**
@@ -432,9 +429,11 @@ export const register: Register = on => {
   // Set once the board says this session is a worker: it draws nothing.
   let isWorker = false
   let looking = false
-  // The pane's size when it last drew, so the graph is drawn to fit it.
-  // Undefined until the pane has been opened: no graph is drawn for nobody.
+  // The pane's size when it last drew, so the view is drawn to fit it.
+  // Undefined until the pane has been opened: nothing is drawn for nobody.
   let paneSize: { width: number; height: number } | undefined
+  // The session's root: the workspace, which the view's header names.
+  let workspace = ''
   // What has been toasted already: see notify.
   let seen: Set<string> | undefined
 
@@ -536,7 +535,8 @@ export const register: Register = on => {
         await update($, snapshot, () => s)
         seen = notify($, s, seen)
         if (paneSize) {
-          const lines = await drawGraph($, paneSize.width, paneSize.height)
+          if (!workspace) workspace = await $.session.root()
+          const lines = await drawView($, workspace, paneSize.width, paneSize.height)
           if (lines) await update($, graph, () => lines)
         }
       } finally {
@@ -712,21 +712,20 @@ export const register: Register = on => {
     const { Box, Button, Text } = $.ui.resolve(e)
     const s = await read($, snapshot)
     if (!s) return <Text dimColor>Reading the board…</Text>
+    // The fleet tab's frame at the pane's size, less a row for the go
+    // buttons beneath it: the one thing the pane does that the tab does by
+    // keys.
     const width = Math.max(40, e.props.bodyColumns ?? 80)
-    // The graph takes what the tasks and messages beneath it leave.
-    const rows = e.viewport?.rows ?? 30
-    const wanted = { width, height: Math.max(12, rows - 12) }
+    const wanted = { width, height: Math.max(10, (e.viewport?.rows ?? 30) - 3) }
     if (!paneSize || paneSize.width !== wanted.width || paneSize.height !== wanted.height) paneSize = wanted
     const lines = await read($, graph)
-    const nameWidth = Math.min(18, Math.max(6, ...s.agents.map(a => a.name.length)) + 1)
-    const messages = s.events.filter(ev => ev.kind === 'message').slice(0, 4)
     const waiting = s.agents.filter(a => a.awaiting_go && a.presence === 'waiting')
 
     return (
       <Box flexDirection="column" width={width}>
-        {!lines && <Text dimColor>Drawing the crew…</Text>}
+        {!lines && <Text dimColor>Drawing the fleet…</Text>}
         {lines?.map((line, i) => (
-          <Text key={`graph-${i}`} wrap="truncate-end">
+          <Text key={`view-${i}`} wrap="truncate-end">
             {line.length === 0 ? ' ' : line.map(span => (
               <Text color={span.fg} bold={span.bold} dimColor={span.dim}>{span.t}</Text>
             ))}
@@ -734,35 +733,12 @@ export const register: Register = on => {
         ))}
         {waiting.length > 0 && (
           <Box flexDirection="row" gap={1}>
-            <Text>Waiting for a go:</Text>
+            <Text>  Waiting for a go:</Text>
             {waiting.map(a => (
               <Button key={`go-${a.name}`} label={`go ${a.awaiting_go}`} onPress={() => give($, a.awaiting_go ?? '')} />
             ))}
           </Box>
         )}
-        {s.agents.some(a => a.target?.startsWith('bg:')) && (
-          <Text dimColor>`claude agents` opens any of them; `claude attach &lt;id&gt;` one.</Text>
-        )}
-        <Text> </Text>
-        <Text bold>Open tasks</Text>
-        {s.tasks.length === 0 && <Text dimColor>Nothing open.</Text>}
-        {s.tasks.map(t => (
-          <Box key={`task-${t.key}`} flexDirection="row" gap={1}>
-            <Text>{pad(t.key, 12)}</Text>
-            <Text color={t.state === 'blocked' ? 'red' : t.state === 'running' ? 'yellow' : undefined}>{pad(t.state, 8)}</Text>
-            <Text dimColor>{pad(t.agent ?? '', nameWidth)}</Text>
-            <Text wrap="truncate-end">{t.note ? `${t.title} — ${t.note}` : t.title}</Text>
-          </Box>
-        ))}
-        <Text> </Text>
-        <Text bold>Latest messages</Text>
-        {messages.length === 0 && <Text dimColor>None yet.</Text>}
-        {messages.map(m => (
-          <Text key={`msg-${m.key}`} wrap="truncate-end">
-            <Text dimColor>{`${m.from ?? '?'} → ${m.to ?? '?'}: `}</Text>
-            {m.summary}
-          </Text>
-        ))}
       </Box>
     )
   })

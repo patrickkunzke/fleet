@@ -31,13 +31,15 @@ function board(on: On, seen: { now: Snapshot }) {
     const argv = [...e.argv]
     let stdout = JSON.stringify({ agent: 'chief', text: null, waiting: 0, awaiting_go: null })
     if (argv[2] === 'snapshot') stdout = JSON.stringify(seen.now)
-    if (argv[2] === 'graph') {
+    if (argv[2] === 'view') {
       drawn.push(argv)
       stdout = JSON.stringify({ lines: [
-        [{ t: '╭──────────╮' }],
-        [{ t: '│ ' }, { t: '◆ chief', fg: '#d97757', bold: true }, { t: ' │' }],
         [],
-        [{ t: '│ ○ billing   ' }, { t: '◇ needs a go', fg: '#d97757' }],
+        [{ t: '  fleet  /w/acme' }, { t: '1 needs a go', fg: '#d97757' }],
+        [{ t: '───────────┬──' }],
+        [{ t: '│ ' }, { t: '◆ chief', fg: '#d97757', bold: true }, { t: ' │  TASKS' }],
+        [],
+        [{ t: '│ ○ billing   ' }, { t: '◇ needs a go', fg: '#d97757' }, { t: '│   · write notes' }],
       ] })
     }
     if (argv[2] === 'go') gone.push(argv)
@@ -45,6 +47,7 @@ function board(on: On, seen: { now: Snapshot }) {
   })
   on('session.id', () => ({ value: 'sid-chief' }))
   on('session.start', ($, e) => ({ cwd: e.cwd }))
+  on('session.root', () => ({ value: '/w/acme' }))
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200_000, percent: 31 }, rateLimits: [] } }))
   on('command.register', () => ({ value: undefined }))
   on('ui.status', () => ({ value: undefined }))
@@ -56,7 +59,7 @@ function board(on: On, seen: { now: Snapshot }) {
   return { gone, toasts, drawn }
 }
 
-test("the chief's pane draws fleet's graph at its width, and a waiting agent gets its go from it", async ($, on) => {
+test("the chief's pane is the fleet tab's view at its size, and a waiting agent gets its go from it", async ($, on) => {
   mock.env(on, { FLEET_DB: '/tmp/fleet.db' })
   const clock = mock.clock(on)
   const seen = { now: chiefSees() }
@@ -64,16 +67,15 @@ test("the chief's pane draws fleet's graph at its width, and a waiting agent get
 
   await $.session.start(start)
   await clock.advance(3_000)
-  const ui = await $.ui.mount({ plugin: 'fleet', surface: 'terminal', component: 'Pane', requestId: 'fleet', props: { bodyColumns: 100 } as never })
-  expect(drawn).toEqual([], 'no graph is drawn for a pane nobody opened')
+  const ui = await $.ui.mount({ plugin: 'fleet', surface: 'terminal', component: 'Pane', requestId: 'fleet', props: { bodyColumns: 120 } as never })
+  expect(drawn).toEqual([], 'nothing is drawn for a pane nobody opened')
 
-  // The next read draws the graph to the pane's width.
+  // The next read draws the whole view, for this workspace, at the pane's size.
   await clock.advance(3_000)
-  expect(drawn.at(-1)?.slice(3, 6)).toEqual(['--width', '100', '--height'])
+  expect(drawn.at(-1)?.slice(0, 7)).toEqual(['fleet', 'board', 'view', '--root', '/w/acme', '--width', '120'])
+  expect(await ui.find({ text: /fleet {2}\/w\/acme/ })).toBeDefined()
   expect((await ui.find({ text: /◆ chief/ }))?.text).toContain('◆ chief')
-  expect(await ui.find({ text: /◇ needs a go/ })).toBeDefined()
-  expect(await ui.find({ text: /share the column — needs the flag/ })).toBeDefined()
-  expect(await ui.find({ text: /plan: add the column/ })).toBeDefined()
+  expect(await ui.find({ text: /TASKS/ })).toBeDefined()
 
   await ui.press({ key: 'go-billing' })
   expect(gone).toEqual([['fleet', 'board', 'go', 'ENG-1-1']])

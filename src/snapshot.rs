@@ -170,41 +170,23 @@ pub struct Span {
     pub dim: bool,
 }
 
-/// The graph the fleet view draws, at `width` by at most `height` cells, as
-/// lines of styled spans: the same picture, from the same code, for a pane
-/// that draws text rather than a terminal frame. Blank lines at the bottom
-/// are left off, so the pane can put more beneath it.
-pub fn graph(db: &Db, width: u16, height: u16, run: Option<i64>) -> anyhow::Result<Vec<Vec<Span>>> {
-    use ratatui::buffer::Buffer;
-    use ratatui::layout::Rect;
+/// The fleet view as the fleet tab draws it, at `width` by `height` cells,
+/// as lines of styled spans: the same picture, from the same code, for a
+/// pane that draws text rather than a terminal frame.
+pub fn view(db: Db, db_path: std::path::PathBuf, root: std::path::PathBuf, run: Option<i64>, width: u16, height: u16) -> anyhow::Result<Vec<Vec<Span>>> {
+    let buf = crate::ui::frame(db, db_path, Some(root), run, width.max(40), height.max(10))?;
+    Ok(spans(&buf))
+}
+
+/// A drawn buffer as lines of runs of cells in one style each, the trailing
+/// blank run of each line left off.
+fn spans(buf: &ratatui::buffer::Buffer) -> Vec<Vec<Span>> {
     use ratatui::style::Modifier;
-
-    let agents = db.agents()?;
-    let mut reg = Registry::new(registry::default_dir());
-    reg.refresh();
-    let sessions: Vec<_> = reg.sessions().cloned().collect();
-    let rows = crew::merge(&agents, &sessions);
-    let events = match run {
-        Some(id) => db.run_events(id, 200)?,
-        None => db.events(200)?,
-    };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0);
-    let ages: Vec<f64> = events
-        .iter()
-        .map(|e| (now - crate::ui::graph::epoch(&e.ts).unwrap_or(0.0)).max(0.0))
-        .collect();
-
-    let area = Rect::new(0, 0, width.max(20), height.max(4));
-    let mut buf = Buffer::empty(area);
-    crate::ui::graph::render(&mut buf, area, &rows, &events, &ages, None);
-
+    let area = buf.area;
     let mut lines: Vec<Vec<Span>> = Vec::new();
-    for y in 0..area.height {
+    for y in area.top()..area.bottom() {
         let mut line: Vec<Span> = Vec::new();
-        for x in 0..area.width {
+        for x in area.left()..area.right() {
             let cell = &buf[(x, y)];
             let fg = colour(cell.fg);
             let bold = cell.modifier.contains(Modifier::BOLD);
@@ -214,16 +196,12 @@ pub fn graph(db: &Db, width: u16, height: u16, run: Option<i64>) -> anyhow::Resu
                 _ => line.push(Span { t: cell.symbol().to_string(), fg, bold, dim }),
             }
         }
-        // Trailing blanks carry nothing a pane needs to draw.
-        while line.last().is_some_and(|s| s.t.trim().is_empty()) {
+        if line.last().is_some_and(|s| s.t.trim().is_empty()) {
             line.pop();
         }
         lines.push(line);
     }
-    while lines.last().is_some_and(|l| l.is_empty()) {
-        lines.pop();
-    }
-    Ok(lines)
+    lines
 }
 
 /// A cell's colour as the mod's `Text` takes it, or none for the default.
@@ -262,17 +240,23 @@ mod tests {
     }
 
     #[test]
-    fn the_graph_comes_as_styled_lines_the_size_of_the_pane() {
-        let db = Db::open_in_memory().unwrap();
-        db.upsert_agent("chief", Some("chief"), None, Some("sid-chief"), None, None).unwrap();
+    fn the_pane_gets_the_whole_fleet_view_without_its_key_bar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fleet.db");
+        let db = Db::open(&path).unwrap();
+        db.upsert_agent("chief", Some("chief"), Some("/w/acme"), Some("sid-chief"), None, None).unwrap();
         db.upsert_agent("billing", None, Some("/w/billing"), Some("sid-1"), None, None).unwrap();
-        let lines = graph(&db, 70, 30, None).unwrap();
+        db.add_task(&db::NewTask { key: "ENG-1-1", title: "write notes", repo: "/w/billing", ..Default::default() }).unwrap();
+        let lines = view(db, path, std::path::PathBuf::from("/w/acme"), None, 120, 30).unwrap();
         let text: Vec<String> = lines.iter().map(|l| l.iter().map(|s| s.t.as_str()).collect()).collect();
-        assert!(text.iter().any(|l| l.contains("◆ chief")), "the chief's card:\n{}", text.join("\n"));
-        assert!(text.iter().any(|l| l.contains("billing")), "and the worker's:\n{}", text.join("\n"));
-        assert!(text.iter().all(|l| l.chars().count() <= 70), "no wider than asked");
-        assert!(lines.len() < 30, "blank lines at the bottom are left off: {}", lines.len());
+        let all = text.join("\n");
+        assert_eq!(lines.len(), 30, "the pane's height, as the tab fills its own");
+        assert!(text[1].contains("fleet") && text[1].contains("agents"), "the header:\n{all}");
+        assert!(all.contains("◆ chief") && all.contains("billing"), "the graph:\n{all}");
+        assert!(all.contains("TASKS") && all.contains("write notes"), "the board beside it:\n{all}");
+        assert!(!all.contains("q quit"), "no key bar: the pane takes none of its keys:\n{all}");
+        assert!(text.iter().all(|l| l.chars().count() <= 120));
         let chief = lines.iter().flatten().find(|s| s.t.contains("chief") && s.bold).unwrap();
-        assert!(chief.bold && chief.fg.as_deref().is_some_and(|c| c.starts_with('#')), "{chief:?}");
+        assert!(chief.fg.as_deref().is_some_and(|c| c.starts_with('#')), "{chief:?}");
     }
 }

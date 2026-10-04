@@ -101,6 +101,9 @@ pub struct App {
     /// The run new agents join: the crew in this workspace that a later
     /// resume brings back together.
     run: Option<i64>,
+    /// Drawn into another program's pane, which takes none of the view's
+    /// keys: the key bar is left off, the rule above it kept.
+    embedded: bool,
     /// The list of earlier runs to bring back, while it is open.
     resume_picker: Option<resume::ResumePicker>,
     /// The repository picker, while it is open. An overlay rather than a
@@ -149,6 +152,7 @@ impl App {
             first_seen: std::collections::HashMap::new(),
             picker: None,
             run: None,
+            embedded: false,
             resume_picker: None,
             tasks: Vec::new(),
             background: Vec::new(),
@@ -834,7 +838,7 @@ impl App {
             Constraint::Length(1),
             Constraint::Min(0),
             Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(if self.embedded { 0 } else { 1 }),
         ])
         .areas(area);
 
@@ -1008,6 +1012,22 @@ impl App {
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), theme::pad(area));
     }
+}
+
+/// The whole fleet view, drawn once into a buffer of `width` by `height`:
+/// what fleet's mod shows in a chief's `/fleet` pane, so that pane looks as
+/// the fleet tab does. Read from the board and the session registry alone,
+/// with the chief selected, as the view opens; `run` the way the chief knows
+/// it, or the workspace's latest. Nothing is written.
+pub fn frame(db: Db, db_path: PathBuf, root: Option<PathBuf>, run: Option<i64>, width: u16, height: u16) -> Result<Buffer> {
+    let mut app = App::new(db, db_path, root, None);
+    app.embedded = true;
+    app.run = run.or_else(|| app.workspace().and_then(|w| app.db.latest_run(&w).ok().flatten()));
+    app.refresh();
+    app.select_chief();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))?;
+    term.draw(|f| app.draw(f))?;
+    Ok(term.backend().buffer().clone())
 }
 
 pub fn run(db: Db, db_path: PathBuf, root: Option<PathBuf>, host: Host) -> Result<()> {
