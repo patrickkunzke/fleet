@@ -158,6 +158,84 @@ pub fn take(db: &Db, session: Option<&str>) -> anyhow::Result<Snapshot> {
     Ok(Snapshot { me, agents, tasks, events })
 }
 
+/// One run of cells in one style: what the mod draws as one `Text`.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct Span {
+    pub t: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fg: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub bold: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub dim: bool,
+}
+
+/// The graph the fleet view draws, at `width` by at most `height` cells, as
+/// lines of styled spans: the same picture, from the same code, for a pane
+/// that draws text rather than a terminal frame. Blank lines at the bottom
+/// are left off, so the pane can put more beneath it.
+pub fn graph(db: &Db, width: u16, height: u16, run: Option<i64>) -> anyhow::Result<Vec<Vec<Span>>> {
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::style::Modifier;
+
+    let agents = db.agents()?;
+    let mut reg = Registry::new(registry::default_dir());
+    reg.refresh();
+    let sessions: Vec<_> = reg.sessions().cloned().collect();
+    let rows = crew::merge(&agents, &sessions);
+    let events = match run {
+        Some(id) => db.run_events(id, 200)?,
+        None => db.events(200)?,
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let ages: Vec<f64> = events
+        .iter()
+        .map(|e| (now - crate::ui::graph::epoch(&e.ts).unwrap_or(0.0)).max(0.0))
+        .collect();
+
+    let area = Rect::new(0, 0, width.max(20), height.max(4));
+    let mut buf = Buffer::empty(area);
+    crate::ui::graph::render(&mut buf, area, &rows, &events, &ages, None);
+
+    let mut lines: Vec<Vec<Span>> = Vec::new();
+    for y in 0..area.height {
+        let mut line: Vec<Span> = Vec::new();
+        for x in 0..area.width {
+            let cell = &buf[(x, y)];
+            let fg = colour(cell.fg);
+            let bold = cell.modifier.contains(Modifier::BOLD);
+            let dim = cell.modifier.contains(Modifier::DIM);
+            match line.last_mut() {
+                Some(last) if last.fg == fg && last.bold == bold && last.dim == dim => last.t.push_str(cell.symbol()),
+                _ => line.push(Span { t: cell.symbol().to_string(), fg, bold, dim }),
+            }
+        }
+        // Trailing blanks carry nothing a pane needs to draw.
+        while line.last().is_some_and(|s| s.t.trim().is_empty()) {
+            line.pop();
+        }
+        lines.push(line);
+    }
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    Ok(lines)
+}
+
+/// A cell's colour as the mod's `Text` takes it, or none for the default.
+fn colour(c: ratatui::style::Color) -> Option<String> {
+    use ratatui::style::Color;
+    match c {
+        Color::Rgb(r, g, b) => Some(format!("#{r:02x}{g:02x}{b:02x}")),
+        Color::Reset => None,
+        other => Some(other.to_string().to_lowercase()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,5 +259,20 @@ mod tests {
         let blocked = snap.events.iter().find(|e| e.summary.starts_with("blocked")).unwrap();
         assert_eq!(blocked.notice.as_ref().unwrap().title, "fleet · ENG-1-1 is blocked");
         assert!(take(&db, Some("sid-x")).unwrap().me.is_none(), "a session the board does not know is nobody");
+    }
+
+    #[test]
+    fn the_graph_comes_as_styled_lines_the_size_of_the_pane() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_agent("chief", Some("chief"), None, Some("sid-chief"), None, None).unwrap();
+        db.upsert_agent("billing", None, Some("/w/billing"), Some("sid-1"), None, None).unwrap();
+        let lines = graph(&db, 70, 30, None).unwrap();
+        let text: Vec<String> = lines.iter().map(|l| l.iter().map(|s| s.t.as_str()).collect()).collect();
+        assert!(text.iter().any(|l| l.contains("◆ chief")), "the chief's card:\n{}", text.join("\n"));
+        assert!(text.iter().any(|l| l.contains("billing")), "and the worker's:\n{}", text.join("\n"));
+        assert!(text.iter().all(|l| l.chars().count() <= 70), "no wider than asked");
+        assert!(lines.len() < 30, "blank lines at the bottom are left off: {}", lines.len());
+        let chief = lines.iter().flatten().find(|s| s.t.contains("chief") && s.bold).unwrap();
+        assert!(chief.bold && chief.fg.as_deref().is_some_and(|c| c.starts_with('#')), "{chief:?}");
     }
 }

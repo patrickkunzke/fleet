@@ -26,10 +26,20 @@ function chiefSees(): Snapshot {
 /** A board that answers the view's reads with `seen`, and records a go. */
 function board(on: On, seen: { now: Snapshot }) {
   const gone: string[][] = []
+  const drawn: string[][] = []
   on('process.run', ($, e) => {
     const argv = [...e.argv]
     let stdout = JSON.stringify({ agent: 'chief', text: null, waiting: 0, awaiting_go: null })
     if (argv[2] === 'snapshot') stdout = JSON.stringify(seen.now)
+    if (argv[2] === 'graph') {
+      drawn.push(argv)
+      stdout = JSON.stringify({ lines: [
+        [{ t: '╭──────────╮' }],
+        [{ t: '│ ' }, { t: '◆ chief', fg: '#d97757', bold: true }, { t: ' │' }],
+        [],
+        [{ t: '│ ○ billing   ' }, { t: '◇ needs a go', fg: '#d97757' }],
+      ] })
+    }
     if (argv[2] === 'go') gone.push(argv)
     return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
@@ -43,21 +53,25 @@ function board(on: On, seen: { now: Snapshot }) {
     toasts.push(e.text)
     return { value: undefined }
   })
-  return { gone, toasts }
+  return { gone, toasts, drawn }
 }
 
-test("the chief's pane shows the crew, and a waiting agent gets its go from it", async ($, on) => {
+test("the chief's pane draws fleet's graph at its width, and a waiting agent gets its go from it", async ($, on) => {
   mock.env(on, { FLEET_DB: '/tmp/fleet.db' })
   const clock = mock.clock(on)
   const seen = { now: chiefSees() }
-  const { gone } = board(on, seen)
+  const { gone, drawn } = board(on, seen)
 
   await $.session.start(start)
   await clock.advance(3_000)
-
   const ui = await $.ui.mount({ plugin: 'fleet', surface: 'terminal', component: 'Pane', requestId: 'fleet', props: { bodyColumns: 100 } as never })
-  expect((await ui.find({ text: /needs a go/ }))?.text).toContain('needs a go')
-  expect(await ui.find({ text: /slack_send_message/ })).toBeDefined()
+  expect(drawn).toEqual([], 'no graph is drawn for a pane nobody opened')
+
+  // The next read draws the graph to the pane's width.
+  await clock.advance(3_000)
+  expect(drawn.at(-1)?.slice(3, 6)).toEqual(['--width', '100', '--height'])
+  expect((await ui.find({ text: /◆ chief/ }))?.text).toContain('◆ chief')
+  expect(await ui.find({ text: /◇ needs a go/ })).toBeDefined()
   expect(await ui.find({ text: /share the column — needs the flag/ })).toBeDefined()
   expect(await ui.find({ text: /plan: add the column/ })).toBeDefined()
 

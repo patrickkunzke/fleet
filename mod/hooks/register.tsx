@@ -33,7 +33,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { SnapAgent, Snapshot } from '../types'
+import type { GraphSpan, Snapshot } from '../types'
 
 /** How often the mailbox is checked. Well inside the board's fifteen. */
 const EVERY = 3_000
@@ -339,12 +339,26 @@ const HIGH = 80
 
 const snapshot = atom({ plugin: 'fleet', key: 'snapshot' } as const, null)
 const brief = atom({ plugin: 'fleet', key: 'brief' } as const, null)
+const graph = atom({ plugin: 'fleet', key: 'graph' } as const, null)
 
 /** The board as `session` sees it; undefined when it cannot be read. */
 async function look($: EngineInterface, session: string): Promise<Snapshot | undefined> {
   try {
     const out = await $.process.run(['fleet', 'board', 'snapshot', '--session', session], { timeoutMs: 10_000 })
     return out.exitCode === 0 ? (JSON.parse(out.stdout) as Snapshot) : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The fleet view's graph at `width` by `height`, drawn by fleet itself so
+ * the pane shows what the herdr tab shows; undefined when it cannot be read.
+ */
+async function drawGraph($: EngineInterface, width: number, height: number): Promise<GraphSpan[][] | undefined> {
+  try {
+    const out = await $.process.run(['fleet', 'board', 'graph', '--width', String(width), '--height', String(height)], { timeoutMs: 10_000 })
+    return out.exitCode === 0 ? (JSON.parse(out.stdout) as { lines: GraphSpan[][] }).lines : undefined
   } catch {
     return undefined
   }
@@ -358,31 +372,6 @@ async function give($: EngineInterface, task: string) {
   } catch {
     $.ui.toast(`${task}: fleet could not be run`)
   }
-}
-
-/** What an agent is doing, in a few words, and the colour to say it in. */
-function state(a: SnapAgent): [string, string | undefined] {
-  if (a.waiting_for) return [`! ${a.waiting_for}`, 'red']
-  if (a.awaiting_go && a.presence === 'waiting') return ['◇ needs a go', 'red']
-  if (a.awaiting_go && a.presence === 'working') return ['● planning', 'yellow']
-  switch (a.presence) {
-    case 'working':
-      return [`● ${a.tool ? toolName(a.tool) : 'working'}`, 'yellow']
-    case 'waiting':
-      return ['○ waiting', 'green']
-    case 'gone':
-      return ['× ended', undefined]
-    default:
-      return ['· not started', undefined]
-  }
-}
-
-/** `mcp__claude_ai_Slack__slack_send_message` as `slack_send_message`. */
-function toolName(tool: string): string {
-  if (!tool.startsWith('mcp__')) return tool
-  const rest = tool.slice('mcp__'.length)
-  const at = rest.indexOf('__')
-  return at < 0 ? rest : rest.slice(at + 2)
 }
 
 /** What needs the user, for the band and its count. */
@@ -443,6 +432,9 @@ export const register: Register = on => {
   // Set once the board says this session is a worker: it draws nothing.
   let isWorker = false
   let looking = false
+  // The pane's size when it last drew, so the graph is drawn to fit it.
+  // Undefined until the pane has been opened: no graph is drawn for nobody.
+  let paneSize: { width: number; height: number } | undefined
   // What has been toasted already: see notify.
   let seen: Set<string> | undefined
 
@@ -543,6 +535,10 @@ export const register: Register = on => {
         if (s.me?.role !== 'chief') return
         await update($, snapshot, () => s)
         seen = notify($, s, seen)
+        if (paneSize) {
+          const lines = await drawGraph($, paneSize.width, paneSize.height)
+          if (lines) await update($, graph, () => lines)
+        }
       } finally {
         looking = false
       }
@@ -717,30 +713,33 @@ export const register: Register = on => {
     const s = await read($, snapshot)
     if (!s) return <Text dimColor>Reading the board…</Text>
     const width = Math.max(40, e.props.bodyColumns ?? 80)
+    // The graph takes what the tasks and messages beneath it leave.
+    const rows = e.viewport?.rows ?? 30
+    const wanted = { width, height: Math.max(12, rows - 12) }
+    if (!paneSize || paneSize.width !== wanted.width || paneSize.height !== wanted.height) paneSize = wanted
+    const lines = await read($, graph)
     const nameWidth = Math.min(18, Math.max(6, ...s.agents.map(a => a.name.length)) + 1)
-    const messages = s.events.filter(ev => ev.kind === 'message').slice(0, 6)
+    const messages = s.events.filter(ev => ev.kind === 'message').slice(0, 4)
+    const waiting = s.agents.filter(a => a.awaiting_go && a.presence === 'waiting')
 
     return (
       <Box flexDirection="column" width={width}>
-        <Text bold>Crew</Text>
-        {s.agents.length === 0 && <Text dimColor>No agents yet: the chief starts them with fleet spawn.</Text>}
-        {s.agents.map(a => {
-          const [said, colour] = state(a)
-          const full = a.context !== null && a.context >= HIGH
-          return (
-            <Box key={`agent-${a.name}`} flexDirection="row" gap={1}>
-              <Text bold={a.role === 'chief'}>{pad(a.name, nameWidth)}</Text>
-              <Text color={colour}>{pad(said, 22)}</Text>
-              <Text color={full ? 'red' : undefined} dimColor={!full}>
-                {a.context === null ? '    ' : pad(`${a.context}%`, 4)}
-              </Text>
-              <Text dimColor wrap="truncate-end">{a.task ?? ''}</Text>
-              {a.awaiting_go && a.presence === 'waiting' && (
-                <Button key={`go-${a.name}`} label={`go ${a.awaiting_go}`} onPress={() => give($, a.awaiting_go ?? '')} />
-              )}
-            </Box>
-          )
-        })}
+        {!lines && <Text dimColor>Drawing the crew…</Text>}
+        {lines?.map((line, i) => (
+          <Text key={`graph-${i}`} wrap="truncate-end">
+            {line.length === 0 ? ' ' : line.map(span => (
+              <Text color={span.fg} bold={span.bold} dimColor={span.dim}>{span.t}</Text>
+            ))}
+          </Text>
+        ))}
+        {waiting.length > 0 && (
+          <Box flexDirection="row" gap={1}>
+            <Text>Waiting for a go:</Text>
+            {waiting.map(a => (
+              <Button key={`go-${a.name}`} label={`go ${a.awaiting_go}`} onPress={() => give($, a.awaiting_go ?? '')} />
+            ))}
+          </Box>
+        )}
         {s.agents.some(a => a.target?.startsWith('bg:')) && (
           <Text dimColor>`claude agents` opens any of them; `claude attach &lt;id&gt;` one.</Text>
         )}

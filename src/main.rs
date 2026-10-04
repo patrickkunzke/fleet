@@ -304,6 +304,15 @@ enum BoardCmd {
         #[arg(long)]
         session: Option<String>,
     },
+    /// The fleet view's graph, drawn at a pane's size, as JSON lines of
+    /// styled spans: what fleet's mod shows in the chief's `/fleet` pane.
+    #[command(hide = true)]
+    Graph {
+        #[arg(long, default_value_t = 100)]
+        width: u16,
+        #[arg(long, default_value_t = 30)]
+        height: u16,
+    },
     /// What fleet's mod asks before an edit: who this session is, its open
     /// tasks, and whether one has a go-ahead. With --user-approves, the
     /// person typed a prompt in this pane, which is a go-ahead. Always JSON.
@@ -950,6 +959,14 @@ fn board(cmd: BoardCmd, path: Option<PathBuf>, fleet: Option<String>) -> Result<
                     println!("      nobody has claimed it yet; whoever does may start at once");
                 }
             }
+        }
+
+        BoardCmd::Graph { width, height } => {
+            // The chief's run, when it is one: the graph is of this stretch
+            // of work, as in the fleet view.
+            let run = std::env::var("FLEET_RUN").ok().and_then(|v| v.parse::<i64>().ok());
+            let lines = snapshot::graph(&db, width, height, run)?;
+            println!("{}", serde_json::to_string(&serde_json::json!({ "lines": lines }))?);
         }
 
         BoardCmd::Snapshot { session } => {

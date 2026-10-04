@@ -89,10 +89,11 @@ you; `claude attach <id>`, which `fleet spawn` prints, opens one to talk to.
 
 The chief's own session draws the fleet, in place of the fleet tab:
 
-- **`/fleet`** opens a pane beside the conversation: the crew, with what each
-  agent is doing, how full its context is and what it waits for; the open
-  tasks; and the latest messages. A worker waiting for its go has a button
-  that gives it.
+- **`/fleet`** opens a pane beside the conversation with the fleet view's
+  graph, drawn by fleet at the pane's size: the chief over its crew, each
+  card with what the agent is doing, how full its context is and its task,
+  and the lines between them weighted by traffic. Under it, a button for
+  each worker waiting for its go, the open tasks and the latest messages.
 - **A band above the prompt** keeps count, and names who needs something:
   `fleet · 3 agents · 1 working · 4 open · billing needs a go · accounts at 84%`.
 - **Toasts** say what herdr would have notified: a task blocked, in review or

@@ -37,6 +37,9 @@ export type Snapshot = {
   events: SnapEvent[]
 }
 
+/** One run of cells in one style, as `fleet board graph` draws them. */
+export type GraphSpan = { t: string; fg?: string; bold?: boolean; dim?: boolean }
+
 declare module 'claude-code' {
   interface PluginState {
     fleet: {
@@ -44,6 +47,8 @@ declare module 'claude-code' {
       /** The brief a session made the chief with /fleet start received as a
        *  turn, kept to put back after compaction. */
       brief: string | null
+      /** The fleet view's graph, drawn by fleet at the pane's size. */
+      graph: GraphSpan[][] | null
     }
   }
 }
