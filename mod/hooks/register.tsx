@@ -818,13 +818,26 @@ export const register: Register = on => {
     const { Box, Text } = $.ui.resolve(e)
     const want = needs(s)
     const working = crew.filter(a => a.presence === 'working').length
+    const idle = crew.filter(a => a.presence === 'waiting').length
     const open = s.tasks.length
 
+    // A card: the fleet's numbers, and under them, only when there is any,
+    // what needs the user. The border turns yellow with it.
     return (
-      <Box flexDirection="row">
-        <Text dimColor>{`fleet · ${crew.length} agent${crew.length === 1 ? '' : 's'} · ${working} working · ${open} open`}</Text>
-        {want.length > 0 && <Text color="red">{` · ${want.join(' · ')}`}</Text>}
-        <Text dimColor> · /fleet</Text>
+      <Box flexDirection="column" borderStyle="round" borderColor={want.length > 0 ? 'yellow' : 'gray'} paddingX={1}>
+        <Box flexDirection="row" columnGap={3}>
+          <Text bold>fleet</Text>
+          <Text>{`${crew.length} agent${crew.length === 1 ? '' : 's'}`}</Text>
+          <Text><Text color="green">●</Text>{` ${working} working`}</Text>
+          <Text><Text dimColor>○</Text>{` ${idle} idle`}</Text>
+          <Text>{`${open} open`}</Text>
+          <Text dimColor>/fleet</Text>
+        </Box>
+        {want.length > 0 && (
+          <Box flexDirection="row" flexWrap="wrap" columnGap={3}>
+            {want.map(w => <Text color="yellow">{`▲ ${w}`}</Text>)}
+          </Box>
+        )}
       </Box>
     )
   })
