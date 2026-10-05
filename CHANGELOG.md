@@ -4,6 +4,18 @@ Every release of fleet. Each section is written when a pull request with a
 `feat`, `fix` or `perf` commit is merged; see
 [Releases](README.md#releases).
 
+## [0.16.0](https://github.com/patrickkunzke/fleet/releases/tag/v0.16.0) — 2026-10-05
+
+### Features
+
+- **mod:** Draw the fleet view's graph in the /fleet pane
+- **mod:** Show the whole fleet view in the /fleet pane
+- **mod:** Make the /fleet pane the live fleet view, keys and all
+
+### Fixes
+
+- Keep a chief's /fleet pane to its own run, and its messages out of herdr
+
 ## [0.15.0](https://github.com/patrickkunzke/fleet/releases/tag/v0.15.0) — 2026-10-03
 
 ### Features
