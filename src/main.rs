@@ -999,7 +999,8 @@ fn board(cmd: BoardCmd, path: Option<PathBuf>, fleet: Option<String>) -> Result<
         }
 
         BoardCmd::Snapshot { session } => {
-            println!("{}", serde_json::to_string(&snapshot::take(&db, session.as_deref())?)?);
+            let run = std::env::var("FLEET_RUN").ok().and_then(|v| v.parse::<i64>().ok());
+            println!("{}", serde_json::to_string(&snapshot::take(&db, session.as_deref(), run)?)?);
         }
 
         BoardCmd::Gate { session, user_approves } => {

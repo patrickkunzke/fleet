@@ -106,6 +106,9 @@ pub struct App {
     /// Drawn into another program's pane, which takes none of the view's
     /// keys: the key bar is left off, the rule above it kept.
     embedded: bool,
+    /// Only the agents of `run`: a chief's own pane shows its crew, not every
+    /// fleet that has run in the workspace. The fleet tab shows them all.
+    only_run: bool,
     /// The list of earlier runs to bring back, while it is open.
     resume_picker: Option<resume::ResumePicker>,
     /// The repository picker, while it is open. An overlay rather than a
@@ -155,6 +158,7 @@ impl App {
             picker: None,
             run: None,
             embedded: false,
+            only_run: false,
             resume_picker: None,
             tasks: Vec::new(),
             background: Vec::new(),
@@ -180,6 +184,11 @@ impl App {
         match self.db.agents() {
             Ok(agents) => {
                 self.rows = crew::merge(&agents, &sessions);
+                // Without a run there is nothing to keep it to: everyone.
+                if self.only_run && self.run.is_some() {
+                    let members = self.run_members();
+                    self.rows.retain(|r| members.contains(&r.name));
+                }
                 self.apply_herdr();
                 // Only clear what refresh itself reported. Anything else on
                 // screen was said by an action, and a refresh two ticks
@@ -534,6 +543,14 @@ impl App {
             }
             Err(e) => self.status = Some(e.to_string()),
         }
+    }
+
+    /// The names of the agents in this view's run: none when it has no run.
+    fn run_members(&self) -> Vec<String> {
+        self.run
+            .and_then(|id| self.db.run(id).ok().flatten())
+            .map(|run| run.agents.into_iter().filter(|a| !a.retired).map(|a| a.name).collect())
+            .unwrap_or_default()
     }
 
     /// Clear out agents that are finished with.
@@ -1024,6 +1041,7 @@ impl App {
 pub fn frame(db: Db, db_path: PathBuf, root: Option<PathBuf>, run: Option<i64>, width: u16, height: u16) -> Result<Buffer> {
     let mut app = App::new(db, db_path, root, None);
     app.embedded = true;
+    app.only_run = true;
     app.run = run.or_else(|| app.workspace().and_then(|w| app.db.latest_run(&w).ok().flatten()));
     app.refresh();
     app.select_chief();
@@ -1078,6 +1096,7 @@ pub fn follow(
     let _remove = Remove(control.to_path_buf());
 
     let mut app = App::new(db, db_path, root, host);
+    app.only_run = true;
     app.run = run.or_else(|| app.workspace().and_then(|w| app.db.latest_run(&w).ok().flatten()));
     app.refresh();
     app.select_chief();
@@ -1618,6 +1637,28 @@ mod tests {
         let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap_or_default();
         assert!(calls.contains("agent focus billing-svc"), "{calls}");
         assert_eq!(app.view, View::Graph, "fleet stays as it was, a tab away");
+    }
+
+    #[test]
+    fn a_chiefs_own_view_shows_its_run_and_not_the_workspaces_others() {
+        let db = Db::open_in_memory().unwrap();
+        let old = db.start_run("/w").unwrap();
+        db.upsert_agent("setting-svc", None, Some("/w/setting"), Some("sid-old"), Some("herdr:setting-svc"), None).unwrap();
+        db.join_run(old, "setting-svc", "worker", "/w/setting").unwrap();
+        let mine = db.start_run("/w").unwrap();
+        db.upsert_agent("chief", Some("chief"), Some("/w"), Some("sid-chief"), None, None).unwrap();
+        db.join_run(mine, "chief", "chief", "/w").unwrap();
+        db.upsert_agent("orchard", None, Some("/w/orchard"), Some("sid-o"), None, None).unwrap();
+        db.join_run(mine, "orchard", "worker", "/w/orchard").unwrap();
+
+        let mut app = App::new(db, PathBuf::from(":memory:"), Some(PathBuf::from("/w")), None);
+        app.run = Some(mine);
+        app.refresh();
+        assert_eq!(app.rows.len(), 3, "the tab shows the workspace's every agent");
+        app.only_run = true;
+        app.refresh();
+        let names: Vec<_> = app.rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["chief", "orchard"], "the chief's pane, its own run");
     }
 
     #[test]

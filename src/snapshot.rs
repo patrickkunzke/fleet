@@ -76,8 +76,17 @@ pub struct Notice {
 }
 
 /// The fleet as `session` sees it.
-pub fn take(db: &Db, session: Option<&str>) -> anyhow::Result<Snapshot> {
-    let agents = db.agents()?;
+pub fn take(db: &Db, session: Option<&str>, run: Option<i64>) -> anyhow::Result<Snapshot> {
+    // The chief's own run, when it says which: its crew, not every fleet
+    // that has run in the workspace.
+    let members: Option<Vec<String>> = run
+        .and_then(|id| db.run(id).ok().flatten())
+        .map(|r| r.agents.into_iter().filter(|a| !a.retired).map(|a| a.name).collect());
+    let agents: Vec<_> = db
+        .agents()?
+        .into_iter()
+        .filter(|a| members.as_ref().is_none_or(|m| m.contains(&a.name)))
+        .collect();
     let mut reg = Registry::new(registry::default_dir());
     reg.refresh();
     let sessions: Vec<_> = reg.sessions().cloned().collect();
@@ -228,7 +237,7 @@ mod tests {
         db.claim("ENG-1-1", "billing").unwrap();
         db.transition("ENG-1-1", db::State::Blocked, Some("needs the flag")).unwrap();
 
-        let snap = take(&db, Some("sid-chief")).unwrap();
+        let snap = take(&db, Some("sid-chief"), None).unwrap();
         let me = snap.me.unwrap();
         assert_eq!((me.name.as_str(), me.role.as_str()), ("chief", "chief"));
         let billing = snap.agents.iter().find(|a| a.name == "billing").unwrap();
@@ -236,7 +245,7 @@ mod tests {
         assert_eq!(snap.tasks[0].note.as_deref(), Some("needs the flag"));
         let blocked = snap.events.iter().find(|e| e.summary.starts_with("blocked")).unwrap();
         assert_eq!(blocked.notice.as_ref().unwrap().title, "fleet · ENG-1-1 is blocked");
-        assert!(take(&db, Some("sid-x")).unwrap().me.is_none(), "a session the board does not know is nobody");
+        assert!(take(&db, Some("sid-x"), None).unwrap().me.is_none(), "a session the board does not know is nobody");
     }
 
     #[test]
