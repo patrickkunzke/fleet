@@ -4,6 +4,16 @@ Every release of fleet. Each section is written when a pull request with a
 `feat`, `fix` or `perf` commit is merged; see
 [Releases](README.md#releases).
 
+## [0.17.0](https://github.com/patrickkunzke/fleet/releases/tag/v0.17.0) — 2026-10-05
+
+### Features
+
+- **mod:** Bordered status card for the fleet band
+
+### Fixes
+
+- **mod:** Stretch the band card to the band's full width
+
 ## [0.16.1](https://github.com/patrickkunzke/fleet/releases/tag/v0.16.1) — 2026-10-05
 
 ### Fixes
