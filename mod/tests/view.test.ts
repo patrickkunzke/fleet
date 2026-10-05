@@ -26,15 +26,31 @@ function chiefSees(): Snapshot {
 /** A board that answers the view's reads with `seen`, and records a go. */
 function board(on: On, seen: { now: Snapshot }) {
   const gone: string[][] = []
+  const sent: string[][] = []
+  const followed: string[][] = []
+  on('process.spawn', async function* ($, e) {
+    followed.push([...e.argv])
+    const frame = { lines: [
+      [],
+      [{ t: '  fleet  /w/acme' }],
+      [{ t: '│ ' }, { t: '◆ chief', fg: '#d97757', bold: true }, { t: ' │  TASKS' }],
+    ] }
+    yield { stream: 'stdout' as const, text: JSON.stringify(frame) + '\n' }
+    // A followed view runs until it is quit: this one, until the test ends.
+    await new Promise(() => {})
+    return { code: 0, signal: null }
+  })
   on('process.run', ($, e) => {
     const argv = [...e.argv]
     let stdout = JSON.stringify({ agent: 'chief', text: null, waiting: 0, awaiting_go: null })
     if (argv[2] === 'snapshot') stdout = JSON.stringify(seen.now)
     if (argv[2] === 'go') gone.push(argv)
+    if (argv[2] === 'view-send') sent.push(argv.slice(5))
     return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('session.id', () => ({ value: 'sid-chief' }))
   on('session.start', ($, e) => ({ cwd: e.cwd }))
+  on('session.root', () => ({ value: '/w/acme' }))
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200_000, percent: 31 }, rateLimits: [] } }))
   on('command.register', () => ({ value: undefined }))
   on('ui.status', () => ({ value: undefined }))
@@ -43,23 +59,33 @@ function board(on: On, seen: { now: Snapshot }) {
     toasts.push(e.text)
     return { value: undefined }
   })
-  return { gone, toasts }
+  return { gone, toasts, sent, followed }
 }
 
-test("the chief's pane shows the crew, and a waiting agent gets its go from it", async ($, on) => {
-  mock.env(on, { FLEET_DB: '/tmp/fleet.db' })
+test("the chief's pane is the fleet tab, live: frames in, keys and clicks out", async ($, on) => {
+  mock.env(on, { FLEET_DB: '/tmp/fleet.db', HOME: '/home/me' })
   const clock = mock.clock(on)
   const seen = { now: chiefSees() }
-  const { gone } = board(on, seen)
+  const { gone, sent, followed } = board(on, seen)
 
   await $.session.start(start)
   await clock.advance(3_000)
+  const ui = await $.ui.mount({ plugin: 'fleet', surface: 'terminal', component: 'Pane', requestId: 'fleet', props: { bodyColumns: 120 } as never })
+  expect(followed).toEqual([], 'nothing runs before the pane asks for a frame')
 
-  const ui = await $.ui.mount({ plugin: 'fleet', surface: 'terminal', component: 'Pane', requestId: 'fleet', props: { bodyColumns: 100 } as never })
-  expect((await ui.find({ text: /needs a go/ }))?.text).toContain('needs a go')
-  expect(await ui.find({ text: /slack_send_message/ })).toBeDefined()
-  expect(await ui.find({ text: /share the column — needs the flag/ })).toBeDefined()
-  expect(await ui.find({ text: /plan: add the column/ })).toBeDefined()
+  // The view asks for a frame with its size: fleet's view starts, followed.
+  await ui.post({ t: 'tick', w: 118, h: 28 })
+  expect(followed[0]).toEqual(['fleet', 'board', 'view', '--root', '/w/acme', '--width', '118', '--height', '28', '--follow', '--control', '/home/me/.claude-fleet/views/sid-chie.sock'])
+  await ui.post({ t: 'tick', w: 118, h: 28 })
+  expect((await ui.find({ text: /◆ chief/, in: 'fleet-view' }))?.text).toContain('◆ chief')
+  expect(await ui.find({ text: /TASKS/, in: 'fleet-view' })).toBeDefined()
+
+  // Its keys and clicks go to the view, as the tab's do.
+  await ui.post({ t: 'key', key: 'l', ctrl: false, shift: false, meta: false })
+  await ui.post({ t: 'key', key: 'return', ctrl: false, shift: false, meta: false })
+  await ui.post({ t: 'click', x: 30, y: 7 })
+  await ui.post({ t: 'tick', w: 140, h: 30 })
+  expect(sent).toEqual([['key', 'l'], ['key', 'return'], ['click', '30', '7'], ['resize', '140', '30']])
 
   await ui.press({ key: 'go-billing' })
   expect(gone).toEqual([['fleet', 'board', 'go', 'ENG-1-1']])

@@ -33,7 +33,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { SnapAgent, Snapshot } from '../types'
+import type { GraphSpan, Snapshot } from '../types'
 
 /** How often the mailbox is checked. Well inside the board's fifteen. */
 const EVERY = 3_000
@@ -350,6 +350,22 @@ async function look($: EngineInterface, session: string): Promise<Snapshot | und
   }
 }
 
+/** A key as `fleet board view-send` names it, with its modifiers. */
+function keyWords(e: { key: string; ctrl: boolean; shift: boolean; meta: boolean }): string[] | undefined {
+  const name = e.key === ' ' ? 'space' : e.key
+  if (!name || /\s/.test(name)) return undefined
+  return ['key', name, ...(e.ctrl ? ['ctrl'] : []), ...(e.shift ? ['shift'] : []), ...(e.meta ? ['alt'] : [])]
+}
+
+/** Send the followed view one message: a key, a click or its size. */
+async function sendView($: EngineInterface, control: string, words: string[]) {
+  try {
+    await $.process.run(['fleet', 'board', 'view-send', '--control', control, ...words], { timeoutMs: 5_000 })
+  } catch {
+    // The view has ended: the next tick starts another.
+  }
+}
+
 /** Give a waiting agent its go, as the chief would with `fleet board go`. */
 async function give($: EngineInterface, task: string) {
   try {
@@ -358,31 +374,6 @@ async function give($: EngineInterface, task: string) {
   } catch {
     $.ui.toast(`${task}: fleet could not be run`)
   }
-}
-
-/** What an agent is doing, in a few words, and the colour to say it in. */
-function state(a: SnapAgent): [string, string | undefined] {
-  if (a.waiting_for) return [`! ${a.waiting_for}`, 'red']
-  if (a.awaiting_go && a.presence === 'waiting') return ['◇ needs a go', 'red']
-  if (a.awaiting_go && a.presence === 'working') return ['● planning', 'yellow']
-  switch (a.presence) {
-    case 'working':
-      return [`● ${a.tool ? toolName(a.tool) : 'working'}`, 'yellow']
-    case 'waiting':
-      return ['○ waiting', 'green']
-    case 'gone':
-      return ['× ended', undefined]
-    default:
-      return ['· not started', undefined]
-  }
-}
-
-/** `mcp__claude_ai_Slack__slack_send_message` as `slack_send_message`. */
-function toolName(tool: string): string {
-  if (!tool.startsWith('mcp__')) return tool
-  const rest = tool.slice('mcp__'.length)
-  const at = rest.indexOf('__')
-  return at < 0 ? rest : rest.slice(at + 2)
 }
 
 /** What needs the user, for the band and its count. */
@@ -394,10 +385,6 @@ function needs(s: Snapshot): string[] {
     if (a.context !== null && a.context >= HIGH) out.push(`${a.name} at ${a.context}%`)
   }
   return out
-}
-
-function pad(text: string, width: number): string {
-  return text.length >= width ? text.slice(0, width) : text + ' '.repeat(width - text.length)
 }
 
 /**
@@ -443,6 +430,13 @@ export const register: Register = on => {
   // Set once the board says this session is a worker: it draws nothing.
   let isWorker = false
   let looking = false
+  // The fleet view behind the pane: `fleet board view --follow`, started
+  // when the pane first asks for a frame and stopped when it closes. Its
+  // newest frame, numbered, and the number the pane last got.
+  let view: { control: string; size: { w: number; h: number } } | undefined
+  let frame: GraphSpan[][] = []
+  let frameNumber = 0
+  let shownNumber = -1
   // What has been toasted already: see notify.
   let seen: Set<string> | undefined
 
@@ -543,6 +537,7 @@ export const register: Register = on => {
         if (s.me?.role !== 'chief') return
         await update($, snapshot, () => s)
         seen = notify($, s, seen)
+
       } finally {
         looking = false
       }
@@ -713,59 +708,106 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Button, Text } = $.ui.resolve(e)
+    const { Box, Button, Client, Text } = $.ui.resolve(e)
     const s = await read($, snapshot)
     if (!s) return <Text dimColor>Reading the board…</Text>
-    const width = Math.max(40, e.props.bodyColumns ?? 80)
-    const nameWidth = Math.min(18, Math.max(6, ...s.agents.map(a => a.name.length)) + 1)
-    const messages = s.events.filter(ev => ev.kind === 'message').slice(0, 6)
-
+    const waiting = s.agents.filter(a => a.awaiting_go && a.presence === 'waiting')
+    // The fleet tab, live: fleet draws it, the Client shows it and takes its
+    // keys. Beneath it, while a worker waits, the go the tab gives by keys.
+    // The rows the pane shows, not the terminal's: the prompt and the
+    // status take the bottom of the screen.
+    const shown = e.props.scroll?.bodyRows ?? (e.viewport?.rows ?? 30) - 8
+    const rows = Math.max(10, shown - (waiting.length > 0 ? 1 : 0))
     return (
-      <Box flexDirection="column" width={width}>
-        <Text bold>Crew</Text>
-        {s.agents.length === 0 && <Text dimColor>No agents yet: the chief starts them with fleet spawn.</Text>}
-        {s.agents.map(a => {
-          const [said, colour] = state(a)
-          const full = a.context !== null && a.context >= HIGH
-          return (
-            <Box key={`agent-${a.name}`} flexDirection="row" gap={1}>
-              <Text bold={a.role === 'chief'}>{pad(a.name, nameWidth)}</Text>
-              <Text color={colour}>{pad(said, 22)}</Text>
-              <Text color={full ? 'red' : undefined} dimColor={!full}>
-                {a.context === null ? '    ' : pad(`${a.context}%`, 4)}
-              </Text>
-              <Text dimColor wrap="truncate-end">{a.task ?? ''}</Text>
-              {a.awaiting_go && a.presence === 'waiting' && (
-                <Button key={`go-${a.name}`} label={`go ${a.awaiting_go}`} onPress={() => give($, a.awaiting_go ?? '')} />
-              )}
-            </Box>
-          )
-        })}
-        {s.agents.some(a => a.target?.startsWith('bg:')) && (
-          <Text dimColor>`claude agents` opens any of them; `claude attach &lt;id&gt;` one.</Text>
-        )}
-        <Text> </Text>
-        <Text bold>Open tasks</Text>
-        {s.tasks.length === 0 && <Text dimColor>Nothing open.</Text>}
-        {s.tasks.map(t => (
-          <Box key={`task-${t.key}`} flexDirection="row" gap={1}>
-            <Text>{pad(t.key, 12)}</Text>
-            <Text color={t.state === 'blocked' ? 'red' : t.state === 'running' ? 'yellow' : undefined}>{pad(t.state, 8)}</Text>
-            <Text dimColor>{pad(t.agent ?? '', nameWidth)}</Text>
-            <Text wrap="truncate-end">{t.note ? `${t.title} — ${t.note}` : t.title}</Text>
+      <Box flexDirection="column" width={Math.max(40, e.props.bodyColumns ?? 80)}>
+        <Client key="fleet-view" module="./view.tsx" props={{ lines: frame }} width="100%" height={rows} />
+        {waiting.length > 0 && (
+          <Box flexDirection="row" gap={1}>
+            <Text>  Waiting for a go:</Text>
+            {waiting.map(a => (
+              <Button key={`go-${a.name}`} label={`go ${a.awaiting_go}`} onPress={() => give($, a.awaiting_go ?? '')} />
+            ))}
           </Box>
-        ))}
-        <Text> </Text>
-        <Text bold>Latest messages</Text>
-        {messages.length === 0 && <Text dimColor>None yet.</Text>}
-        {messages.map(m => (
-          <Text key={`msg-${m.key}`} wrap="truncate-end">
-            <Text dimColor>{`${m.from ?? '?'} → ${m.to ?? '?'}: `}</Text>
-            {m.summary}
-          </Text>
-        ))}
+        )}
       </Box>
     )
+  })
+
+  // What the pane's view posts: a tick asking for a newer frame, with its
+  // size; a key; a click.
+  on('ui.message', async ($, e, next) => {
+    const data = e.data as { t?: string; w?: number; h?: number; key?: string; ctrl?: boolean; shift?: boolean; meta?: boolean; x?: number; y?: number }
+    if (!active || !session) return next(e)
+    if (data.t === 'tick' && typeof data.w === 'number' && typeof data.h === 'number' && data.w > 0 && data.h > 0) {
+      const size = { w: data.w, h: data.h }
+      if (!view) {
+        const home = (await $.env.get('HOME')) ?? '/tmp'
+        // Short: a socket's path has a hundred characters or so to fit in.
+        const control = `${home}/.claude-fleet/views/${session.slice(0, 8)}.sock`
+        const root = await $.session.root()
+        view = { control, size }
+        const argv = ['fleet', 'board', 'view', '--root', root, '--width', String(size.w), '--height', String(size.h), '--follow', '--control', control]
+        void (async () => {
+          let pending = ''
+          try {
+            for await (const piece of $.process.spawn({ argv })) {
+              if (piece.stream !== 'stdout') continue
+              pending += piece.text
+              let end = pending.indexOf('\n')
+              while (end >= 0) {
+                const line = pending.slice(0, end)
+                pending = pending.slice(end + 1)
+                try {
+                  frame = (JSON.parse(line) as { lines: GraphSpan[][] }).lines
+                  frameNumber += 1
+                } catch {
+                  // Not a frame: nothing to draw.
+                }
+                end = pending.indexOf('\n')
+              }
+            }
+            // It ended by itself: the view was quit, as `q` quits the fleet
+            // tab. The pane goes with it.
+            view = undefined
+            await $.ui.close({ id: PANE })
+          } catch {
+            // It could not start, or it died: the next tick starts another.
+          } finally {
+            view = undefined
+          }
+        })()
+      } else if (view.size.w !== size.w || view.size.h !== size.h) {
+        view.size = size
+        await sendView($, view.control, ['resize', String(size.w), String(size.h)])
+      }
+      if (frameNumber !== shownNumber) {
+        shownNumber = frameNumber
+        return { props: { lines: frame } }
+      }
+      return {}
+    }
+    if (!view) return {}
+    if (data.t === 'key' && typeof data.key === 'string') {
+      const words = keyWords({ key: data.key, ctrl: data.ctrl === true, shift: data.shift === true, meta: data.meta === true })
+      if (words) await sendView($, view.control, words)
+      return {}
+    }
+    if (data.t === 'click' && typeof data.x === 'number' && typeof data.y === 'number') {
+      await sendView($, view.control, ['click', String(data.x), String(data.y)])
+      return {}
+    }
+    return next(e)
+  })
+
+  // The pane closed: the view behind it has no one to draw for.
+  on('ui.close', async ($, e, next) => {
+    const closed = await next(e)
+    if (view && (e as { id?: string }).id === PANE) {
+      await sendView($, view.control, ['quit'])
+      frame = []
+      shownNumber = -1
+    }
+    return closed
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {

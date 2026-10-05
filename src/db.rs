@@ -660,6 +660,13 @@ impl Db {
         self.log_event("note", Some(name), None, None, "agent retired", None, None)
     }
 
+    /// Forget where `name` was reached: a chief started outside herdr is in
+    /// no herdr tab, whatever the chief before it was.
+    pub fn clear_target(&self, name: &str) -> Result<()> {
+        self.conn.execute("UPDATE agents SET target = NULL WHERE name = ?1", params![name])?;
+        Ok(())
+    }
+
     /// Retire `name` so that a fresh session can carry on under the same
     /// name: its session is let go of, so the new one is the only one the
     /// board knows by it. Returns the session it had.

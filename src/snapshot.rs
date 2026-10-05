@@ -76,8 +76,17 @@ pub struct Notice {
 }
 
 /// The fleet as `session` sees it.
-pub fn take(db: &Db, session: Option<&str>) -> anyhow::Result<Snapshot> {
-    let agents = db.agents()?;
+pub fn take(db: &Db, session: Option<&str>, run: Option<i64>) -> anyhow::Result<Snapshot> {
+    // The chief's own run, when it says which: its crew, not every fleet
+    // that has run in the workspace.
+    let members: Option<Vec<String>> = run
+        .and_then(|id| db.run(id).ok().flatten())
+        .map(|r| r.agents.into_iter().filter(|a| !a.retired).map(|a| a.name).collect());
+    let agents: Vec<_> = db
+        .agents()?
+        .into_iter()
+        .filter(|a| members.as_ref().is_none_or(|m| m.contains(&a.name)))
+        .collect();
     let mut reg = Registry::new(registry::default_dir());
     reg.refresh();
     let sessions: Vec<_> = reg.sessions().cloned().collect();
@@ -158,6 +167,62 @@ pub fn take(db: &Db, session: Option<&str>) -> anyhow::Result<Snapshot> {
     Ok(Snapshot { me, agents, tasks, events })
 }
 
+/// One run of cells in one style: what the mod draws as one `Text`.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct Span {
+    pub t: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fg: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub bold: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub dim: bool,
+}
+
+/// The fleet view as the fleet tab draws it, at `width` by `height` cells,
+/// as lines of styled spans: the same picture, from the same code, for a
+/// pane that draws text rather than a terminal frame.
+pub fn view(db: Db, db_path: std::path::PathBuf, root: std::path::PathBuf, run: Option<i64>, width: u16, height: u16) -> anyhow::Result<Vec<Vec<Span>>> {
+    let buf = crate::ui::frame(db, db_path, Some(root), run, width.max(40), height.max(10))?;
+    Ok(spans(&buf))
+}
+
+/// A drawn buffer as lines of runs of cells in one style each, the trailing
+/// blank run of each line left off.
+pub fn spans(buf: &ratatui::buffer::Buffer) -> Vec<Vec<Span>> {
+    use ratatui::style::Modifier;
+    let area = buf.area;
+    let mut lines: Vec<Vec<Span>> = Vec::new();
+    for y in area.top()..area.bottom() {
+        let mut line: Vec<Span> = Vec::new();
+        for x in area.left()..area.right() {
+            let cell = &buf[(x, y)];
+            let fg = colour(cell.fg);
+            let bold = cell.modifier.contains(Modifier::BOLD);
+            let dim = cell.modifier.contains(Modifier::DIM);
+            match line.last_mut() {
+                Some(last) if last.fg == fg && last.bold == bold && last.dim == dim => last.t.push_str(cell.symbol()),
+                _ => line.push(Span { t: cell.symbol().to_string(), fg, bold, dim }),
+            }
+        }
+        if line.last().is_some_and(|s| s.t.trim().is_empty()) {
+            line.pop();
+        }
+        lines.push(line);
+    }
+    lines
+}
+
+/// A cell's colour as the mod's `Text` takes it, or none for the default.
+fn colour(c: ratatui::style::Color) -> Option<String> {
+    use ratatui::style::Color;
+    match c {
+        Color::Rgb(r, g, b) => Some(format!("#{r:02x}{g:02x}{b:02x}")),
+        Color::Reset => None,
+        other => Some(other.to_string().to_lowercase()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,7 +237,7 @@ mod tests {
         db.claim("ENG-1-1", "billing").unwrap();
         db.transition("ENG-1-1", db::State::Blocked, Some("needs the flag")).unwrap();
 
-        let snap = take(&db, Some("sid-chief")).unwrap();
+        let snap = take(&db, Some("sid-chief"), None).unwrap();
         let me = snap.me.unwrap();
         assert_eq!((me.name.as_str(), me.role.as_str()), ("chief", "chief"));
         let billing = snap.agents.iter().find(|a| a.name == "billing").unwrap();
@@ -180,6 +245,27 @@ mod tests {
         assert_eq!(snap.tasks[0].note.as_deref(), Some("needs the flag"));
         let blocked = snap.events.iter().find(|e| e.summary.starts_with("blocked")).unwrap();
         assert_eq!(blocked.notice.as_ref().unwrap().title, "fleet · ENG-1-1 is blocked");
-        assert!(take(&db, Some("sid-x")).unwrap().me.is_none(), "a session the board does not know is nobody");
+        assert!(take(&db, Some("sid-x"), None).unwrap().me.is_none(), "a session the board does not know is nobody");
+    }
+
+    #[test]
+    fn the_pane_gets_the_whole_fleet_view_without_its_key_bar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fleet.db");
+        let db = Db::open(&path).unwrap();
+        db.upsert_agent("chief", Some("chief"), Some("/w/acme"), Some("sid-chief"), None, None).unwrap();
+        db.upsert_agent("billing", None, Some("/w/billing"), Some("sid-1"), None, None).unwrap();
+        db.add_task(&db::NewTask { key: "ENG-1-1", title: "write notes", repo: "/w/billing", ..Default::default() }).unwrap();
+        let lines = view(db, path, std::path::PathBuf::from("/w/acme"), None, 120, 30).unwrap();
+        let text: Vec<String> = lines.iter().map(|l| l.iter().map(|s| s.t.as_str()).collect()).collect();
+        let all = text.join("\n");
+        assert_eq!(lines.len(), 30, "the pane's height, as the tab fills its own");
+        assert!(text[1].contains("fleet") && text[1].contains("agents"), "the header:\n{all}");
+        assert!(all.contains("◆ chief") && all.contains("billing"), "the graph:\n{all}");
+        assert!(all.contains("TASKS") && all.contains("write notes"), "the board beside it:\n{all}");
+        assert!(!all.contains("q quit"), "no key bar: the pane takes none of its keys:\n{all}");
+        assert!(text.iter().all(|l| l.chars().count() <= 120));
+        let chief = lines.iter().flatten().find(|s| s.t.contains("chief") && s.bold).unwrap();
+        assert!(chief.fg.as_deref().is_some_and(|c| c.starts_with('#')), "{chief:?}");
     }
 }

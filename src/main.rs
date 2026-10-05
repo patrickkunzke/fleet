@@ -304,6 +304,33 @@ enum BoardCmd {
         #[arg(long)]
         session: Option<String>,
     },
+    /// The fleet view, drawn at a pane's size, as JSON lines of styled
+    /// spans: what fleet's mod shows in the chief's `/fleet` pane.
+    #[command(hide = true)]
+    View {
+        /// The workspace, for the header.
+        #[arg(long)]
+        root: PathBuf,
+        #[arg(long, default_value_t = 120)]
+        width: u16,
+        #[arg(long, default_value_t = 30)]
+        height: u16,
+        /// Keep drawing: a frame per line whenever the view changes, with
+        /// the view's keys taken from the socket at --control.
+        #[arg(long, requires = "control")]
+        follow: bool,
+        /// Where a followed view listens for keys, clicks and its size.
+        #[arg(long)]
+        control: Option<PathBuf>,
+    },
+    /// Send a followed view one key, click or size: `key l`, `click 12 7`,
+    /// `resize 120 40`.
+    #[command(hide = true)]
+    ViewSend {
+        #[arg(long)]
+        control: PathBuf,
+        message: Vec<String>,
+    },
     /// What fleet's mod asks before an edit: who this session is, its open
     /// tasks, and whether one has a go-ahead. With --user-approves, the
     /// person typed a prompt in this pane, which is a go-ahead. Always JSON.
@@ -952,8 +979,28 @@ fn board(cmd: BoardCmd, path: Option<PathBuf>, fleet: Option<String>) -> Result<
             }
         }
 
+        BoardCmd::View { root, width, height, follow, control } => {
+            // The chief's run, when it is one: the view is of this stretch of
+            // work, as the fleet tab's is.
+            let run = std::env::var("FLEET_RUN").ok().and_then(|v| v.parse::<i64>().ok());
+            if let (true, Some(control)) = (follow, control) {
+                // Where the view's keys start and close agents: herdr, or
+                // background sessions, as for `fleet spawn`.
+                let host = Host::detect().ok().map(|h| h.in_fleet(Some(&path)));
+                return ui::follow(db, path.clone(), Some(root), run, host, (width, height), &control);
+            }
+            let lines = snapshot::view(db, path.clone(), root, run, width, height)?;
+            println!("{}", serde_json::to_string(&serde_json::json!({ "lines": lines }))?);
+            return Ok(());
+        }
+
+        BoardCmd::ViewSend { control, message } => {
+            ui::send_control(&control, &message.join(" "))?;
+        }
+
         BoardCmd::Snapshot { session } => {
-            println!("{}", serde_json::to_string(&snapshot::take(&db, session.as_deref())?)?);
+            let run = std::env::var("FLEET_RUN").ok().and_then(|v| v.parse::<i64>().ok());
+            println!("{}", serde_json::to_string(&snapshot::take(&db, session.as_deref(), run)?)?);
         }
 
         BoardCmd::Gate { session, user_approves } => {

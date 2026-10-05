@@ -37,6 +37,9 @@ export type Snapshot = {
   events: SnapEvent[]
 }
 
+/** One run of cells in one style, as `fleet board graph` draws them. */
+export type GraphSpan = { t: string; fg?: string; bold?: boolean; dim?: boolean }
+
 declare module 'claude-code' {
   interface PluginState {
     fleet: {

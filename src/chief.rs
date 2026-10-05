@@ -166,6 +166,9 @@ pub fn prepare(db: &Db, root: &Path, mode: Mode, projects: &Path, plugin: Option
     };
 
     db.upsert_agent("chief", Some("chief"), Some(&root_text), Some(&session), None, None)?;
+    // In a terminal or a session of its own, never a herdr tab: a target
+    // left from a chief herdr started would send its messages there.
+    db.clear_target("chief")?;
     db.join_run(run, "chief", "chief", &root_text)?;
     db.set_run_session(run, "chief", &session)?;
     let said = match mode {
@@ -264,6 +267,15 @@ mod tests {
         let chief = db.agents().unwrap().into_iter().find(|a| a.role == "chief").unwrap();
         assert_eq!(chief.session_id.as_deref(), Some("sid-mine"));
         assert_eq!(live_chief(&db, &["sid-mine".into()]).unwrap().as_deref(), Some("sid-mine"));
+    }
+
+    #[test]
+    fn a_chief_outside_herdr_does_not_keep_the_last_chiefs_herdr_tab() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_agent("chief", Some("chief"), Some("/w/acme"), Some("sid-herdr"), Some("herdr:acme-chief"), None).unwrap();
+        prepare(&db, Path::new("/w/acme"), Mode::Adopt("sid-mine"), Path::new("/nowhere"), None).unwrap();
+        let chief = db.agents().unwrap().into_iter().find(|a| a.role == "chief").unwrap();
+        assert_eq!(chief.target, None);
     }
 
     #[test]
