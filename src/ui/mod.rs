@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -62,6 +62,8 @@ enum Msg {
     /// Time for the next frame of a message in flight. Far more frequent
     /// than the others, and draws only while one is.
     Frame,
+    /// The pane a followed view is drawn into changed size.
+    Resize(u16, u16),
 }
 
 pub struct App {
@@ -1030,6 +1032,212 @@ pub fn frame(db: Db, db_path: PathBuf, root: Option<PathBuf>, run: Option<i64>, 
     Ok(term.backend().buffer().clone())
 }
 
+/// The fleet view, followed: the same view as `fleet tui`, with the same
+/// threads waking it, drawn into a buffer of the pane's size instead of a
+/// terminal, each new frame written to stdout as one line of JSON. What
+/// fleet's mod shows in a chief's `/fleet` pane, so that pane is the fleet
+/// tab: live, and with its keys.
+///
+/// Keys, clicks and the pane's size arrive on a datagram socket at
+/// `control`, one message each (see [`control_message`]): a spawned
+/// process's stdin is closed after it starts, so it cannot be the way in.
+/// It ends when the view quits, when nothing reads its frames any more, or
+/// on `quit`; the socket goes with it.
+pub fn follow(
+    db: Db,
+    db_path: PathBuf,
+    root: Option<PathBuf>,
+    run: Option<i64>,
+    host: Option<Host>,
+    size: (u16, u16),
+    control: &Path,
+) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::net::UnixDatagram;
+
+    // A reader gone must be a failed write, not a signal: main lets SIGPIPE
+    // kill fleet, as a pipe into `head` should, which here would leave the
+    // socket behind for want of the cleanup below.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+
+    if let Some(dir) = control.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let _ = std::fs::remove_file(control);
+    let socket = UnixDatagram::bind(control).with_context(|| format!("listening at {}", control.display()))?;
+    // Gone with this process, however it ends: a stale socket would take
+    // the next view's keys into nothing.
+    struct Remove(PathBuf);
+    impl Drop for Remove {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _remove = Remove(control.to_path_buf());
+
+    let mut app = App::new(db, db_path, root, host);
+    app.run = run.or_else(|| app.workspace().and_then(|w| app.db.latest_run(&w).ok().flatten()));
+    app.refresh();
+    app.select_chief();
+
+    let rx = app.rx.take().expect("the app owns its channel until follow takes it");
+    let tx = app.tx.clone();
+    spawn_control(tx.clone(), socket);
+    spawn_registry(tx.clone());
+    spawn_board_watch(tx.clone(), &app.db_path);
+    spawn_frames(tx.clone());
+    if let Some(herdr) = app.host.as_ref().and_then(Host::herdr).map(|h| h.herdr.clone()) {
+        let back = tx.clone();
+        hosting::follow(herdr, move |agents| back.send(Msg::Agents(agents)).is_ok());
+    }
+    spawn_ticker(tx);
+
+    let (mut width, mut height) = (size.0.max(40), size.1.max(10));
+    let mut last: Option<String> = None;
+    let mut out = std::io::stdout().lock();
+    let mut emit = |app: &mut App, width: u16, height: u16| -> Result<bool> {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))?;
+        term.draw(|f| app.draw(f))?;
+        let lines = crate::snapshot::spans(term.backend().buffer());
+        let line = serde_json::to_string(&serde_json::json!({ "lines": lines }))?;
+        if last.as_deref() == Some(line.as_str()) {
+            return Ok(true);
+        }
+        // A reader gone is the end: there is no one to draw for.
+        let alive = writeln!(out, "{line}").and_then(|_| out.flush()).is_ok();
+        last = Some(line);
+        Ok(alive)
+    };
+    if !emit(&mut app, width, height)? {
+        return Ok(());
+    }
+    while let Ok(first) = rx.recv() {
+        let mut dirty = false;
+        let mut refresh = false;
+        let mut frame = false;
+        for msg in std::iter::once(first).chain(rx.try_iter()) {
+            match msg {
+                Msg::Key(key) => {
+                    app.on_key(key);
+                    dirty = true;
+                }
+                Msg::Paste => {}
+                Msg::Mouse(ev) => dirty |= app.on_mouse(ev),
+                Msg::Registry | Msg::Tick => refresh = true,
+                Msg::Agents(agents) => {
+                    app.herdr_agents = agents;
+                    refresh = true;
+                }
+                Msg::Frame => frame = true,
+                Msg::Resize(w, h) => {
+                    (width, height) = (w.max(40), h.max(10));
+                    dirty = true;
+                }
+            }
+            if app.quit {
+                return Ok(());
+            }
+        }
+        if refresh {
+            app.refresh();
+            dirty = true;
+        }
+        if frame && app.animating() {
+            dirty = true;
+        }
+        if dirty && !emit(&mut app, width, height)? {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+/// One message on a followed view's control socket, as the view's own
+/// event: `key <name> [ctrl] [shift] [alt]`, `click <column> <row>`,
+/// `resize <width> <height>`. `quit` ends it as `q` would. Anything else is
+/// None.
+fn control_message(text: &str) -> Option<Msg> {
+    let mut words = text.split_whitespace();
+    match words.next()? {
+        "key" => {
+            let name = words.next()?;
+            let mut modifiers = KeyModifiers::NONE;
+            for w in words {
+                match w {
+                    "ctrl" => modifiers |= KeyModifiers::CONTROL,
+                    "shift" => modifiers |= KeyModifiers::SHIFT,
+                    "alt" => modifiers |= KeyModifiers::ALT,
+                    _ => {}
+                }
+            }
+            let code = match name {
+                "up" => KeyCode::Up,
+                "down" => KeyCode::Down,
+                "left" => KeyCode::Left,
+                "right" => KeyCode::Right,
+                "return" | "enter" => KeyCode::Enter,
+                "escape" => KeyCode::Esc,
+                "tab" => KeyCode::Tab,
+                "backspace" => KeyCode::Backspace,
+                "delete" => KeyCode::Delete,
+                "home" => KeyCode::Home,
+                "end" => KeyCode::End,
+                "pageup" => KeyCode::PageUp,
+                "pagedown" => KeyCode::PageDown,
+                "space" => KeyCode::Char(' '),
+                other => {
+                    let mut chars = other.chars();
+                    let c = chars.next()?;
+                    if chars.next().is_some() {
+                        return None;
+                    }
+                    KeyCode::Char(c)
+                }
+            };
+            Some(Msg::Key(KeyEvent::new(code, modifiers)))
+        }
+        "click" => {
+            let column = words.next()?.parse().ok()?;
+            let row = words.next()?.parse().ok()?;
+            Some(Msg::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }))
+        }
+        "resize" => Some(Msg::Resize(words.next()?.parse().ok()?, words.next()?.parse().ok()?)),
+        "quit" => Some(Msg::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))),
+        _ => None,
+    }
+}
+
+/// Read a followed view's control socket into its event channel.
+fn spawn_control(tx: Sender<Msg>, socket: std::os::unix::net::UnixDatagram) {
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 256];
+        while let Ok(n) = socket.recv(&mut buf) {
+            let Some(msg) = control_message(&String::from_utf8_lossy(&buf[..n])) else {
+                continue;
+            };
+            if tx.send(msg).is_err() {
+                return;
+            }
+        }
+    });
+}
+
+/// Send one message to a followed view's control socket.
+pub fn send_control(control: &Path, text: &str) -> Result<()> {
+    let socket = std::os::unix::net::UnixDatagram::unbound()?;
+    socket
+        .send_to(text.as_bytes(), control)
+        .with_context(|| format!("no fleet view is listening at {}", control.display()))?;
+    Ok(())
+}
+
 pub fn run(db: Db, db_path: PathBuf, root: Option<PathBuf>, host: Host) -> Result<()> {
     let mut app = App::new(db, db_path, root, Some(host));
     app.refresh();
@@ -1108,6 +1316,9 @@ pub fn run(db: Db, db_path: PathBuf, root: Option<PathBuf>, host: Host) -> Resul
                         refresh = true;
                     }
                     Msg::Frame => frame = true,
+                    // Only a followed view has a pane to fit; a terminal
+                    // redraws to its own size.
+                    Msg::Resize(..) => dirty = true,
                 }
                 if app.quit {
                     break;
@@ -1407,6 +1618,40 @@ mod tests {
         let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap_or_default();
         assert!(calls.contains("agent focus billing-svc"), "{calls}");
         assert_eq!(app.view, View::Graph, "fleet stays as it was, a tab away");
+    }
+
+    #[test]
+    fn a_followed_views_control_messages_are_its_own_events() {
+        let key = |text: &str| match control_message(text) {
+            Some(Msg::Key(k)) => Some((k.code, k.modifiers)),
+            _ => None,
+        };
+        assert_eq!(key("key up"), Some((KeyCode::Up, KeyModifiers::NONE)));
+        assert_eq!(key("key return"), Some((KeyCode::Enter, KeyModifiers::NONE)));
+        assert_eq!(key("key l"), Some((KeyCode::Char('l'), KeyModifiers::NONE)));
+        assert_eq!(key("key c ctrl"), Some((KeyCode::Char('c'), KeyModifiers::CONTROL)));
+        assert_eq!(key("quit"), Some((KeyCode::Char('q'), KeyModifiers::NONE)));
+        assert_eq!(key("key nonsense"), None, "one character, or a key's name");
+        assert!(matches!(control_message("click 12 7"), Some(Msg::Mouse(m)) if m.column == 12 && m.row == 7));
+        assert!(matches!(control_message("resize 120 40"), Some(Msg::Resize(120, 40))));
+        assert!(control_message("resize x").is_none());
+        assert!(control_message("").is_none());
+    }
+
+    #[test]
+    fn a_followed_view_takes_its_keys_from_its_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let control = dir.path().join("view.sock");
+        let socket = std::os::unix::net::UnixDatagram::bind(&control).unwrap();
+        let (tx, rx) = channel();
+        spawn_control(tx, socket);
+        send_control(&control, "key l").unwrap();
+        send_control(&control, "not a message").unwrap();
+        send_control(&control, "resize 90 30").unwrap();
+        let got: Vec<Msg> = (0..2).map(|_| rx.recv_timeout(Duration::from_secs(2)).unwrap()).collect();
+        assert!(matches!(&got[0], Msg::Key(k) if k.code == KeyCode::Char('l')));
+        assert!(matches!(got[1], Msg::Resize(90, 30)), "what is not a message is skipped");
+        assert!(send_control(&dir.path().join("nobody.sock"), "key l").is_err());
     }
 
     fn herdr_agent(name: &str, pane: &str, status: &str) -> crate::herdr::Agent {

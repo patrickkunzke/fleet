@@ -339,7 +339,6 @@ const HIGH = 80
 
 const snapshot = atom({ plugin: 'fleet', key: 'snapshot' } as const, null)
 const brief = atom({ plugin: 'fleet', key: 'brief' } as const, null)
-const graph = atom({ plugin: 'fleet', key: 'graph' } as const, null)
 
 /** The board as `session` sees it; undefined when it cannot be read. */
 async function look($: EngineInterface, session: string): Promise<Snapshot | undefined> {
@@ -351,17 +350,19 @@ async function look($: EngineInterface, session: string): Promise<Snapshot | und
   }
 }
 
-/**
- * The fleet view at `width` by `height`, drawn by fleet itself so the pane
- * looks as the fleet tab does; undefined when it cannot be read.
- */
-async function drawView($: EngineInterface, root: string, width: number, height: number): Promise<GraphSpan[][] | undefined> {
+/** A key as `fleet board view-send` names it, with its modifiers. */
+function keyWords(e: { key: string; ctrl: boolean; shift: boolean; meta: boolean }): string[] | undefined {
+  const name = e.key === ' ' ? 'space' : e.key
+  if (!name || /\s/.test(name)) return undefined
+  return ['key', name, ...(e.ctrl ? ['ctrl'] : []), ...(e.shift ? ['shift'] : []), ...(e.meta ? ['alt'] : [])]
+}
+
+/** Send the followed view one message: a key, a click or its size. */
+async function sendView($: EngineInterface, control: string, words: string[]) {
   try {
-    const argv = ['fleet', 'board', 'view', '--root', root, '--width', String(width), '--height', String(height)]
-    const out = await $.process.run(argv, { timeoutMs: 10_000 })
-    return out.exitCode === 0 ? (JSON.parse(out.stdout) as { lines: GraphSpan[][] }).lines : undefined
+    await $.process.run(['fleet', 'board', 'view-send', '--control', control, ...words], { timeoutMs: 5_000 })
   } catch {
-    return undefined
+    // The view has ended: the next tick starts another.
   }
 }
 
@@ -429,11 +430,13 @@ export const register: Register = on => {
   // Set once the board says this session is a worker: it draws nothing.
   let isWorker = false
   let looking = false
-  // The pane's size when it last drew, so the view is drawn to fit it.
-  // Undefined until the pane has been opened: nothing is drawn for nobody.
-  let paneSize: { width: number; height: number } | undefined
-  // The session's root: the workspace, which the view's header names.
-  let workspace = ''
+  // The fleet view behind the pane: `fleet board view --follow`, started
+  // when the pane first asks for a frame and stopped when it closes. Its
+  // newest frame, numbered, and the number the pane last got.
+  let view: { control: string; size: { w: number; h: number } } | undefined
+  let frame: GraphSpan[][] = []
+  let frameNumber = 0
+  let shownNumber = -1
   // What has been toasted already: see notify.
   let seen: Set<string> | undefined
 
@@ -534,11 +537,7 @@ export const register: Register = on => {
         if (s.me?.role !== 'chief') return
         await update($, snapshot, () => s)
         seen = notify($, s, seen)
-        if (paneSize) {
-          if (!workspace) workspace = await $.session.root()
-          const lines = await drawView($, workspace, paneSize.width, paneSize.height)
-          if (lines) await update($, graph, () => lines)
-        }
+
       } finally {
         looking = false
       }
@@ -709,28 +708,19 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Button, Text } = $.ui.resolve(e)
+    const { Box, Button, Client, Text } = $.ui.resolve(e)
     const s = await read($, snapshot)
     if (!s) return <Text dimColor>Reading the board…</Text>
-    // The fleet tab's frame at the pane's size, less a row for the go
-    // buttons beneath it: the one thing the pane does that the tab does by
-    // keys.
-    const width = Math.max(40, e.props.bodyColumns ?? 80)
-    const wanted = { width, height: Math.max(10, (e.viewport?.rows ?? 30) - 3) }
-    if (!paneSize || paneSize.width !== wanted.width || paneSize.height !== wanted.height) paneSize = wanted
-    const lines = await read($, graph)
     const waiting = s.agents.filter(a => a.awaiting_go && a.presence === 'waiting')
-
+    // The fleet tab, live: fleet draws it, the Client shows it and takes its
+    // keys. Beneath it, while a worker waits, the go the tab gives by keys.
+    // The rows the pane shows, not the terminal's: the prompt and the
+    // status take the bottom of the screen.
+    const shown = e.props.scroll?.bodyRows ?? (e.viewport?.rows ?? 30) - 8
+    const rows = Math.max(10, shown - (waiting.length > 0 ? 1 : 0))
     return (
-      <Box flexDirection="column" width={width}>
-        {!lines && <Text dimColor>Drawing the fleet…</Text>}
-        {lines?.map((line, i) => (
-          <Text key={`view-${i}`} wrap="truncate-end">
-            {line.length === 0 ? ' ' : line.map(span => (
-              <Text color={span.fg} bold={span.bold} dimColor={span.dim}>{span.t}</Text>
-            ))}
-          </Text>
-        ))}
+      <Box flexDirection="column" width={Math.max(40, e.props.bodyColumns ?? 80)}>
+        <Client key="fleet-view" module="./view.tsx" props={{ lines: frame }} width="100%" height={rows} />
         {waiting.length > 0 && (
           <Box flexDirection="row" gap={1}>
             <Text>  Waiting for a go:</Text>
@@ -741,6 +731,83 @@ export const register: Register = on => {
         )}
       </Box>
     )
+  })
+
+  // What the pane's view posts: a tick asking for a newer frame, with its
+  // size; a key; a click.
+  on('ui.message', async ($, e, next) => {
+    const data = e.data as { t?: string; w?: number; h?: number; key?: string; ctrl?: boolean; shift?: boolean; meta?: boolean; x?: number; y?: number }
+    if (!active || !session) return next(e)
+    if (data.t === 'tick' && typeof data.w === 'number' && typeof data.h === 'number' && data.w > 0 && data.h > 0) {
+      const size = { w: data.w, h: data.h }
+      if (!view) {
+        const home = (await $.env.get('HOME')) ?? '/tmp'
+        // Short: a socket's path has a hundred characters or so to fit in.
+        const control = `${home}/.claude-fleet/views/${session.slice(0, 8)}.sock`
+        const root = await $.session.root()
+        view = { control, size }
+        const argv = ['fleet', 'board', 'view', '--root', root, '--width', String(size.w), '--height', String(size.h), '--follow', '--control', control]
+        void (async () => {
+          let pending = ''
+          try {
+            for await (const piece of $.process.spawn({ argv })) {
+              if (piece.stream !== 'stdout') continue
+              pending += piece.text
+              let end = pending.indexOf('\n')
+              while (end >= 0) {
+                const line = pending.slice(0, end)
+                pending = pending.slice(end + 1)
+                try {
+                  frame = (JSON.parse(line) as { lines: GraphSpan[][] }).lines
+                  frameNumber += 1
+                } catch {
+                  // Not a frame: nothing to draw.
+                }
+                end = pending.indexOf('\n')
+              }
+            }
+            // It ended by itself: the view was quit, as `q` quits the fleet
+            // tab. The pane goes with it.
+            view = undefined
+            await $.ui.close({ id: PANE })
+          } catch {
+            // It could not start, or it died: the next tick starts another.
+          } finally {
+            view = undefined
+          }
+        })()
+      } else if (view.size.w !== size.w || view.size.h !== size.h) {
+        view.size = size
+        await sendView($, view.control, ['resize', String(size.w), String(size.h)])
+      }
+      if (frameNumber !== shownNumber) {
+        shownNumber = frameNumber
+        return { props: { lines: frame } }
+      }
+      return {}
+    }
+    if (!view) return {}
+    if (data.t === 'key' && typeof data.key === 'string') {
+      const words = keyWords({ key: data.key, ctrl: data.ctrl === true, shift: data.shift === true, meta: data.meta === true })
+      if (words) await sendView($, view.control, words)
+      return {}
+    }
+    if (data.t === 'click' && typeof data.x === 'number' && typeof data.y === 'number') {
+      await sendView($, view.control, ['click', String(data.x), String(data.y)])
+      return {}
+    }
+    return next(e)
+  })
+
+  // The pane closed: the view behind it has no one to draw for.
+  on('ui.close', async ($, e, next) => {
+    const closed = await next(e)
+    if (view && (e as { id?: string }).id === PANE) {
+      await sendView($, view.control, ['quit'])
+      frame = []
+      shownNumber = -1
+    }
+    return closed
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {

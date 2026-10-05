@@ -180,7 +180,7 @@ pub fn view(db: Db, db_path: std::path::PathBuf, root: std::path::PathBuf, run: 
 
 /// A drawn buffer as lines of runs of cells in one style each, the trailing
 /// blank run of each line left off.
-fn spans(buf: &ratatui::buffer::Buffer) -> Vec<Vec<Span>> {
+pub fn spans(buf: &ratatui::buffer::Buffer) -> Vec<Vec<Span>> {
     use ratatui::style::Modifier;
     let area = buf.area;
     let mut lines: Vec<Vec<Span>> = Vec::new();

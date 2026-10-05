@@ -89,12 +89,13 @@ you; `claude attach <id>`, which `fleet spawn` prints, opens one to talk to.
 
 The chief's own session draws the fleet, in place of the fleet tab:
 
-- **`/fleet`** opens a pane beside the conversation with the fleet view, as
-  the fleet tab in herdr shows it, drawn by fleet at the pane's size: the
-  header with its counts, the chief over its crew with each card's state,
-  context and task, the lines weighted by traffic, and the tasks and
-  background processes. It has no key bar, since the pane takes none of the
-  view's keys; a worker waiting for its go has a button beneath it instead.
+- **`/fleet`** opens a pane beside the conversation with the fleet view: the
+  fleet tab in herdr, live and with its keys, drawn by fleet at the pane's
+  size. Click into it, and ↑↓ ←→ move between agents, `l` switches to the
+  log, `n` starts an agent, `x` retires one, `r` brings a crew back and `q`
+  closes it; a click on a card selects it. ↵ on a background agent says how
+  to open it (`claude attach <id>`), since there is no tab to switch to. A
+  worker waiting for its go has a button beneath the view.
 - **A band above the prompt** keeps count, and names who needs something:
   `fleet · 3 agents · 1 working · 4 open · billing needs a go · accounts at 84%`.
 - **Toasts** say what herdr would have notified: a task blocked, in review or
