@@ -822,9 +822,10 @@ export const register: Register = on => {
     const open = s.tasks.length
 
     // A card: the fleet's numbers, and under them, only when there is any,
-    // what needs the user. The border turns yellow with it.
+    // what needs the user. The border turns yellow with it. As wide as the
+    // band, not its text.
     return (
-      <Box flexDirection="column" borderStyle="round" borderColor={want.length > 0 ? 'yellow' : 'gray'} paddingX={1}>
+      <Box flexDirection="column" borderStyle="round" borderColor={want.length > 0 ? 'yellow' : 'gray'} paddingX={1} width={e.props.bodyColumns}>
         <Box flexDirection="row" columnGap={3}>
           <Text bold>fleet</Text>
           <Text>{`${crew.length} agent${crew.length === 1 ? '' : 's'}`}</Text>
