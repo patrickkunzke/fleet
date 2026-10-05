@@ -43,7 +43,9 @@ pub enum Install {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Installed {
     pub how: Install,
-    /// The manifest's `version`, which is the release's.
+    /// The version that runs: the release herdr installed, or for a linked
+    /// checkout what its built binary says it is, `not built` when there is
+    /// none.
     pub version: String,
 }
 
@@ -89,28 +91,30 @@ fn installed_from(json: &serde_json::Value) -> Result<Installed> {
         other => bail!("fleet is installed in a way update does not know: {}", other.unwrap_or("none")),
     };
     // herdr reports the manifest it read when it loaded the plugin. A linked
-    // checkout changes under it, by a pull and a build, until herdr restarts:
-    // there the manifest on disk is the version that runs.
-    let on_disk = match &how {
-        Install::Local { root } => std::fs::read_to_string(root.join("herdr-plugin.toml"))
-            .ok()
-            .and_then(|m| manifest_version(&m)),
-        Install::Github { .. } => None,
+    // checkout changes under it, by a pull and a build, until herdr restarts.
+    // Nor is its manifest the answer: a pull moves the manifest to the new
+    // version and leaves the binary as it was, which made update call a
+    // build from many releases ago up to date. What runs is the binary, so
+    // that is asked.
+    let version = match &how {
+        Install::Local { root } => built_version(root).unwrap_or_else(|| NOT_BUILT.into()),
+        Install::Github { .. } => text(&plugin["version"]).unwrap_or_else(|| env!("CARGO_PKG_VERSION").into()),
     };
-    Ok(Installed {
-        how,
-        version: on_disk
-            .or_else(|| text(&plugin["version"]))
-            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").into()),
-    })
+    Ok(Installed { how, version })
 }
 
-/// The `version = "…"` of a herdr-plugin.toml.
-fn manifest_version(manifest: &str) -> Option<String> {
-    manifest.lines().find_map(|l| {
-        let (key, value) = l.split_once('=')?;
-        (key.trim() == "version").then(|| value.trim().trim_matches('"').to_string())
-    })
+/// What a linked checkout reports when it has no binary that runs: not a
+/// release, so update builds one.
+const NOT_BUILT: &str = "not built";
+
+/// The version a checkout's built binary says it is.
+fn built_version(root: &Path) -> Option<String> {
+    let out = Command::new(root.join("target/release/fleet")).arg("--version").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let said = String::from_utf8_lossy(&out.stdout);
+    said.trim().strip_prefix("fleet ").map(|v| v.trim().to_string())
 }
 
 fn herdr_bin() -> String {
@@ -292,17 +296,41 @@ mod tests {
         assert_eq!(installed_from(&json).unwrap().how, Install::Local { root: "/code/fleet".into() });
     }
 
-    #[test]
-    fn a_linked_checkout_reports_the_version_on_disk_not_herdrs_old_reading() {
+    /// A linked checkout whose manifest says `manifest` and whose built
+    /// binary, if `built` is given, says it is that version.
+    fn checkout(manifest: &str, built: Option<&str>) -> (tempfile::TempDir, serde_json::Value) {
+        use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("herdr-plugin.toml"), "id = \"fleet\"\nmin_herdr_version = \"0.9.1\"\nversion = \"0.2.0\"\n").unwrap();
+        std::fs::write(root.path().join("herdr-plugin.toml"), format!("id = \"fleet\"\nversion = \"{manifest}\"\n")).unwrap();
+        if let Some(v) = built {
+            let bin = root.path().join("target/release/fleet");
+            std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+            std::fs::write(&bin, format!("#!/bin/sh\necho 'fleet {v}'\n")).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let json = serde_json::json!({"result": {"plugins": [{
             "plugin_id": "fleet",
             "plugin_root": root.path(),
             "version": "0.1.0",
             "source": {"kind": "local"},
         }]}});
-        assert_eq!(installed_from(&json).unwrap().version, "0.2.0");
+        (root, json)
+    }
+
+    #[test]
+    fn a_linked_checkout_reports_what_its_binary_is_not_what_was_pulled() {
+        // Pulled to 0.16.0, built at 0.4.0: what runs is 0.4.0, and that is
+        // behind, whatever the manifest says.
+        let (_root, json) = checkout("0.16.0", Some("0.4.0"));
+        assert_eq!(installed_from(&json).unwrap().version, "0.4.0");
+    }
+
+    #[test]
+    fn a_linked_checkout_with_nothing_built_is_not_up_to_date() {
+        let (_root, json) = checkout("0.16.0", None);
+        let installed = installed_from(&json).unwrap();
+        assert_eq!(installed.version, NOT_BUILT);
+        assert_eq!(parse(&installed.version), None, "not a release, so update builds");
     }
 
     #[test]
