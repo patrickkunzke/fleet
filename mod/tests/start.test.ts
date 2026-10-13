@@ -38,6 +38,7 @@ function session(on: On) {
     return { text: e.text }
   })
   on('ui.status', () => ({ value: undefined }))
+  on('prompt.read', () => ({ value: { text: '', cursor: 0 } }))
   on('tool.call', () => ({ result: 'ran' }))
   on('tool.check', () => ({ decision: 'ask' as const }))
   return { ran, set, submitted, registered }
