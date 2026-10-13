@@ -4,6 +4,12 @@ Every release of fleet. Each section is written when a pull request with a
 `feat`, `fix` or `perf` commit is merged; see
 [Releases](README.md#releases).
 
+## [0.17.1](https://github.com/patrickkunzke/fleet/releases/tag/v0.17.1) — 2026-10-13
+
+### Fixes
+
+- **mod:** Hold board messages while the prompt has a draft
+
 ## [0.17.0](https://github.com/patrickkunzke/fleet/releases/tag/v0.17.0) — 2026-10-05
 
 ### Features
