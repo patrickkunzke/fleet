@@ -26,14 +26,17 @@ function session(on: On, percent?: number) {
   const submitted: string[] = []
   on('prompt.submit', ($, e) => {
     submitted.push(e.text)
-    return { turnId: 't-1' }
+    return { text: e.text }
   })
+  // The prompt box, empty unless a test types into it.
+  let draft = ''
+  on('prompt.read', () => ({ value: { text: draft, cursor: draft.length } }))
   const status: (string | undefined)[] = []
   on('ui.status', ($, e) => {
     status.push(e.text)
     return { value: undefined }
   })
-  return { submitted, status }
+  return { submitted, status, type: (text: string) => { draft = text } }
 }
 
 const start = { cwd: '/repo', surface: 'terminal', isInteractive: true } as const
@@ -69,6 +72,27 @@ test('a busy session checks in without taking, and says what waits', async ($, o
   expect(runs[0]).not.toContain('--take')
   expect(submitted).toEqual([])
   expect(status.at(-1)).toBe('1 message waiting for this turn to end')
+})
+
+test('a draft in the prompt box holds messages back until it is sent', async ($, on) => {
+  mock.env(on, { FLEET_DB: '/tmp/fleet.db' })
+  const clock = mock.clock(on)
+  const held = ['[fleet · worker-1] done']
+  const runs = board(on, held)
+  const { submitted, status, type } = session(on)
+  type('can you also check the')
+
+  await $.session.start(start)
+  await clock.advance(3_000)
+
+  expect(runs.every(argv => !argv.includes('--take'))).toBe(true)
+  expect(submitted).toEqual([])
+  expect(status.at(-1)).toBe('1 message waiting for your draft to be sent')
+
+  type('')
+  await clock.advance(3_000)
+
+  expect(submitted).toEqual(['[fleet · worker-1] done'])
 })
 
 test('what waited through a turn is taken when the turn ends, not when a subagent does', async ($, on) => {

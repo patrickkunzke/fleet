@@ -478,7 +478,10 @@ export const register: Register = on => {
       if (!active || checking) return
       checking = true
       try {
-        const take = !busy && !pending
+        // A draft in the prompt box: the person is mid-sentence, and a
+        // message submitted now would go out with what they typed so far.
+        const drafting = (await $.prompt.read()).text.trim() !== ''
+        const take = !busy && !pending && !drafting
         const argv = ['fleet', 'board', 'inbox', '--session', id]
         if (take) argv.push('--take')
         const tool = running.at(-1)
@@ -504,7 +507,8 @@ export const register: Register = on => {
         const parts: string[] = []
         if (inbox.awaiting_go) parts.push(`waiting for a go on ${inbox.awaiting_go}`)
         if (inbox.waiting > 0) {
-          parts.push(`${inbox.waiting} ${inbox.waiting === 1 ? 'message' : 'messages'} waiting for this turn to end`)
+          const until = busy || pending ? 'this turn to end' : 'your draft to be sent'
+          parts.push(`${inbox.waiting} ${inbox.waiting === 1 ? 'message' : 'messages'} waiting for ${until}`)
         }
         $.ui.status(parts.length ? parts.join(' · ') : undefined)
       } catch {
