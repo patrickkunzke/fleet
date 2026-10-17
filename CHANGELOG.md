@@ -4,6 +4,23 @@ Every release of fleet. Each section is written when a pull request with a
 `feat`, `fix` or `perf` commit is merged; see
 [Releases](README.md#releases).
 
+## [0.18.0](https://github.com/patrickkunzke/fleet/releases/tag/v0.18.0) — 2026-10-17
+
+### Features
+
+- **mod:** Draw the fleet pane natively on desktop and mobile
+- **mod:** Start a fleet from a button, and open its pane by itself
+- **mod:** Say in the band that the fleet is starting
+
+### Fixes
+
+- **mod:** Start in sessions the desktop app hosts
+- **mod:** Drop the pane header's repeated title and dim an idle count
+- **mod:** Offer the pane again when the desktop puts it away
+- **background:** Name the repository to trust when a spawn is refused
+- **brief:** Give agents every file of the mod, not only its hooks module
+- **mod:** Keep each of the pane's latest messages on one line
+
 ## [0.17.2](https://github.com/patrickkunzke/fleet/releases/tag/v0.17.2) — 2026-10-17
 
 ### Fixes
