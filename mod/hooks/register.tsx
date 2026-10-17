@@ -35,6 +35,8 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { GraphSpan, Snapshot } from '../types'
 
+import { HIGH, crewPane } from './crew'
+
 /** How often the mailbox is checked. Well inside the board's fifteen. */
 const EVERY = 3_000
 
@@ -334,11 +336,12 @@ async function gate($: EngineInterface, session: string, approve = false): Promi
 }
 
 const PANE = 'fleet'
-/** From here an agent is close to compacting: the board's CONTEXT_HIGH. */
-const HIGH = 80
 
 const snapshot = atom({ plugin: 'fleet', key: 'snapshot' } as const, null)
 const brief = atom({ plugin: 'fleet', key: 'brief' } as const, null)
+const offer = atom({ plugin: 'fleet', key: 'offer' } as const, false)
+const paneOpen = atom({ plugin: 'fleet', key: 'paneOpen' } as const, false)
+const starting = atom({ plugin: 'fleet', key: 'starting' } as const, false)
 
 /** The board as `session` sees it; undefined when it cannot be read. */
 async function look($: EngineInterface, session: string): Promise<Snapshot | undefined> {
@@ -373,6 +376,114 @@ async function give($: EngineInterface, task: string) {
     $.ui.toast(out.exitCode === 0 ? `${task}: go given` : `${task}: ${out.stderr.trim() || 'the go did not go through'}`)
   } catch {
     $.ui.toast(`${task}: fleet could not be run`)
+  }
+}
+
+/** One directory a line; `#` starts a comment, and `~` is the home directory. */
+export function rootsFrom(text: string, home: string): string[] {
+  return text
+    .split('\n')
+    .map(l => (l.split('#')[0] ?? '').trim())
+    .filter(l => l !== '')
+    .map(l => (l === '~' || l.startsWith('~/') ? home + l.slice(1) : l))
+}
+
+/**
+ * Whether `root` is listed in ~/.claude-fleet/auto-open, the workspaces
+ * herdr opens in fleet mode: there the band offers to start a fleet. The
+ * same directory however it is spelled, as fleet matches it: macOS's /tmp is
+ * /private/tmp.
+ */
+async function listed($: EngineInterface, root: string): Promise<boolean> {
+  const home = await $.env.get('HOME')
+  if (!home) return false
+  let text: string
+  try {
+    const read = await $.fs.read(`${home}/.claude-fleet/auto-open`)
+    if (typeof read !== 'string') return false
+    text = read
+  } catch {
+    return false
+  }
+  const dirs = rootsFrom(text, home)
+  if (dirs.length === 0) return false
+  if (dirs.includes(root)) return true
+  try {
+    const out = await $.process.run(
+      ['sh', '-c', 'for d; do (cd "$d" 2>/dev/null && pwd -P) || echo; done', 'sh', root, ...dirs],
+      { timeoutMs: 5_000 },
+    )
+    const [want, ...got] = out.stdout.split('\n')
+    return want !== undefined && want !== '' && got.includes(want)
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Make `session` the chief of its workspace, as `/fleet start` does: put it
+ * on the board, give it the board's tools and fleet on its PATH, and submit
+ * the chief's brief. What went wrong, when it could not.
+ */
+async function adopt($: EngineInterface, session: string): Promise<{ root: string } | { problem: string }> {
+  const root = await $.session.root()
+  let adopted: Adopted
+  try {
+    const found = await findFleet($)
+    if ('problem' in found) return { problem: `${found.problem}\nInstall fleet another way (see its README), then run /fleet start again.` }
+    const out = await $.process.run([found.path, 'chief', '--adopt', session, '--root', root], { timeoutMs: 20_000 })
+    if (out.exitCode !== 0) return { problem: `fleet: ${(out.stderr || out.stdout).trim()}` }
+    adopted = JSON.parse(out.stdout) as Adopted
+  } catch (err) {
+    return { problem: `fleet could not be started: ${String(err)}` }
+  }
+  // What a session fleet starts is given on its command line: the board,
+  // the run, and fleet itself on PATH, for this session's processes and
+  // the agents it starts.
+  await $.env.set('FLEET_DB', adopted.board)
+  await $.env.set('FLEET_RUN', String(adopted.run))
+  if (adopted.bin) await $.env.set('PATH', `${adopted.bin}:${(await $.env.get('PATH')) ?? ''}`)
+  await registerTools($)
+  // The chief's brief, as a turn of its own: Claude Code keeps a mod
+  // installed by a user out of the system prompt. From a timer, since a
+  // command cannot wait on a turn while it holds this one.
+  $.clock.after(1, () => { void $.prompt.submit({ text: adopted.brief }) })
+  // Kept for compaction, which summarises a turn like any other.
+  await update($, brief, () => adopted.brief)
+  await update($, offer, () => false)
+  return { root }
+}
+
+/**
+ * Whether the fleet pane is up, as the engine has it: the desktop app's
+ * panel can be put away without the pane being closed, so `ui.close` alone
+ * does not say. Kept in `paneOpen`, which redraws the band when it changes.
+ */
+async function paneShown($: EngineInterface): Promise<boolean> {
+  try {
+    const up = (await $.ui.panes()).some(p => p.id === PANE && p.isShown && p.isPlaced)
+    if (up !== (await read($, paneOpen))) await update($, paneOpen, () => up)
+    return up
+  } catch {
+    return read($, paneOpen)
+  }
+}
+
+/** Open the fleet pane; whether it is drawn now. */
+async function openPane($: EngineInterface): Promise<boolean> {
+  const opened = await $.ui.open({ id: PANE, title: 'fleet' })
+  await update($, paneOpen, () => true)
+  return opened.isPlaced
+}
+
+/** Hand an agent nearly out of context to a fresh session of it. */
+async function handoff($: EngineInterface, agent: string) {
+  $.ui.toast(`${agent}: handing off to a fresh session…`)
+  try {
+    const out = await $.process.run(['fleet', 'handoff', agent], { timeoutMs: 120_000 })
+    $.ui.toast(out.exitCode === 0 ? `${agent}: handed off` : `${agent}: ${(out.stderr || out.stdout).trim() || 'the handoff did not go through'}`)
+  } catch {
+    $.ui.toast(`${agent}: fleet could not be run`)
   }
 }
 
@@ -455,97 +566,119 @@ export const register: Register = on => {
   const running: string[] = []
 
   on('session.start', async ($, e, next) => {
-    if (!e.isInteractive) return next(e)
-    const id = await $.session.id()
-    session = id
-    // /fleet, in every session with the plugin: in one fleet started it
-    // shows the fleet, in any other `/fleet start` makes it the chief.
-    try {
-      await $.command.register({ name: 'fleet', description: 'Show the fleet, or `/fleet start` to make this session its chief', argumentHint: '[start]' })
-    } catch {
-      // A command of that name already: the band and toasts still work.
-    }
-
-    // A session fleet started has a board from the start. Any other waits
-    // for /fleet start, and the timers below do nothing until then.
-    active = Boolean(await $.env.get('FLEET_DB'))
-    // The board as tools. Which ones the chief alone may use is settled when
-    // they are called: a session is put on the board, and so has a role,
-    // only after it starts.
-    if (active) await registerTools($)
-
-    const check = async () => {
-      if (!active || checking) return
-      checking = true
+    // The mod's work starts once a person can be at the session: at once in
+    // the terminal, and once a surface attaches where the desktop app hosts
+    // the session through the SDK, which starts it with no surface and not
+    // interactive. A `claude -p` run never has one, and is left alone.
+    const boot = async () => {
+      const id = await $.session.id()
+      session = id
+      // /fleet, in every session with the plugin: in one fleet started it
+      // shows the fleet, in any other `/fleet start` makes it the chief.
       try {
-        // A draft in the prompt box: the person is mid-sentence, and a
-        // message submitted now would go out with what they typed so far.
-        const drafting = (await $.prompt.read()).text.trim() !== ''
-        const take = !busy && !pending && !drafting
-        const argv = ['fleet', 'board', 'inbox', '--session', id]
-        if (take) argv.push('--take')
-        const tool = running.at(-1)
-        if (tool) argv.push('--tool', tool)
-        try {
-          const { context } = await $.session.usage()
-          if (context.percent !== undefined) argv.push('--context', String(Math.round(context.percent)))
-        } catch {
-          // No reading yet, before the first answer: nothing to say.
-        }
-        const out = await $.process.run(argv, { timeoutMs: 10_000 })
-        if (out.exitCode !== 0) return
-        const inbox = JSON.parse(out.stdout) as Inbox
-        if (inbox.text) {
-          pending = true
-          // Not awaited: it resolves when the turn starts, and the mailbox
-          // has to keep checking in meanwhile or the board stops trusting it.
-          $.prompt.submit({ text: inbox.text }).then(
-            () => { pending = false },
-            () => { pending = false },
-          )
-        }
-        const parts: string[] = []
-        if (inbox.awaiting_go) parts.push(`waiting for a go on ${inbox.awaiting_go}`)
-        if (inbox.waiting > 0) {
-          const until = busy || pending ? 'this turn to end' : 'your draft to be sent'
-          parts.push(`${inbox.waiting} ${inbox.waiting === 1 ? 'message' : 'messages'} waiting for ${until}`)
-        }
-        $.ui.status(parts.length ? parts.join(' · ') : undefined)
+        await $.command.register({ name: 'fleet', description: 'Show the fleet, or `/fleet start` to make this session its chief', argumentHint: '[start]' })
       } catch {
-        // fleet not on PATH, a board locked past the timeout, output that is
-        // not JSON: the next check tries again, and while none succeeds the
-        // board falls back to typing.
-      } finally {
-        checking = false
+        // A command of that name already: the band and toasts still work.
       }
+
+      // A session fleet started has a board from the start. Any other waits
+      // for /fleet start, and the timers below do nothing until then.
+      active = Boolean(await $.env.get('FLEET_DB'))
+      // A workspace listed in auto-open: the band offers to start a fleet.
+      if (!active) {
+        const offered = await listed($, await $.session.root())
+        await update($, offer, () => offered)
+      }
+      // The board as tools. Which ones the chief alone may use is settled when
+      // they are called: a session is put on the board, and so has a role,
+      // only after it starts.
+      if (active) await registerTools($)
+
+      const check = async () => {
+        if (!active || checking) return
+        checking = true
+        try {
+          // A draft in the prompt box: the person is mid-sentence, and a
+          // message submitted now would go out with what they typed so far.
+          const drafting = (await $.prompt.read()).text.trim() !== ''
+          const take = !busy && !pending && !drafting
+          const argv = ['fleet', 'board', 'inbox', '--session', id]
+          if (take) argv.push('--take')
+          const tool = running.at(-1)
+          if (tool) argv.push('--tool', tool)
+          try {
+            const { context } = await $.session.usage()
+            if (context.percent !== undefined) argv.push('--context', String(Math.round(context.percent)))
+          } catch {
+            // No reading yet, before the first answer: nothing to say.
+          }
+          const out = await $.process.run(argv, { timeoutMs: 10_000 })
+          if (out.exitCode !== 0) return
+          const inbox = JSON.parse(out.stdout) as Inbox
+          if (inbox.text) {
+            pending = true
+            // Not awaited: it resolves when the turn starts, and the mailbox
+            // has to keep checking in meanwhile or the board stops trusting it.
+            $.prompt.submit({ text: inbox.text }).then(
+              () => { pending = false },
+              () => { pending = false },
+            )
+          }
+          const parts: string[] = []
+          if (inbox.awaiting_go) parts.push(`waiting for a go on ${inbox.awaiting_go}`)
+          if (inbox.waiting > 0) {
+            const until = busy || pending ? 'this turn to end' : 'your draft to be sent'
+            parts.push(`${inbox.waiting} ${inbox.waiting === 1 ? 'message' : 'messages'} waiting for ${until}`)
+          }
+          $.ui.status(parts.length ? parts.join(' · ') : undefined)
+        } catch {
+          // fleet not on PATH, a board locked past the timeout, output that is
+          // not JSON: the next check tries again, and while none succeeds the
+          // board falls back to typing.
+        } finally {
+          checking = false
+        }
+      }
+
+      $.clock.every(EVERY, () => { void check() })
+      void check()
+
+      // The chief's view, in every fleet session, since which one is the chief
+      // is only known once the board has linked it.
+      const watch = $.clock.every(EVERY, async () => {
+        if (!active || isWorker || looking) return
+        looking = true
+        try {
+          const s = await look($, id)
+          if (!s) return
+          if (s.me?.role === 'worker') {
+            isWorker = true
+            watch.cancel()
+            return
+          }
+          // Not linked yet: a session is put on the board a few seconds after
+          // it starts.
+          if (s.me?.role !== 'chief') return
+          await update($, snapshot, () => s)
+          await paneShown($)
+          seen = notify($, s, seen)
+
+        } finally {
+          looking = false
+        }
+      })
     }
 
-    $.clock.every(EVERY, () => { void check() })
-    void check()
-
-    // The chief's view, in every fleet session, since which one is the chief
-    // is only known once the board has linked it.
-    const watch = $.clock.every(EVERY, async () => {
-      if (!active || isWorker || looking) return
-      looking = true
-      try {
-        const s = await look($, id)
-        if (!s) return
-        if (s.me?.role === 'worker') {
-          isWorker = true
-          watch.cancel()
-          return
-        }
-        // Not linked yet: a session is put on the board a few seconds after
-        // it starts.
-        if (s.me?.role !== 'chief') return
-        await update($, snapshot, () => s)
-        seen = notify($, s, seen)
-
-      } finally {
-        looking = false
-      }
-    })
+    // A surface already attached: the desktop app's session, reloaded.
+    if (e.isInteractive || (await $.session.surfaces()).length > 0) {
+      await boot()
+    } else {
+      const wait = $.clock.every(1_000, async () => {
+        if ((await $.session.surfaces()).length === 0) return
+        wait.cancel()
+        await boot()
+      })
+    }
     return next(e)
   })
 
@@ -678,42 +811,27 @@ export const register: Register = on => {
     if (e.args.trim() === 'start') {
       if (active) return { text: 'This session is part of a fleet already. /fleet shows it.' }
       if (!session) return { text: 'This session has not started yet.' }
-      const root = await $.session.root()
-      let adopted: Adopted
-      try {
-        const found = await findFleet($)
-        if ('problem' in found) return { text: `${found.problem}\nInstall fleet another way (see its README), then run /fleet start again.` }
-        const out = await $.process.run([found.path, 'chief', '--adopt', session, '--root', root], { timeoutMs: 20_000 })
-        if (out.exitCode !== 0) return { text: `fleet: ${(out.stderr || out.stdout).trim()}` }
-        adopted = JSON.parse(out.stdout) as Adopted
-      } catch (err) {
-        return { text: `fleet could not be started: ${String(err)}` }
-      }
-      // What a session fleet starts is given on its command line: the board,
-      // the run, and fleet itself on PATH, for this session's processes and
-      // the agents it starts.
-      await $.env.set('FLEET_DB', adopted.board)
-      await $.env.set('FLEET_RUN', String(adopted.run))
-      if (adopted.bin) await $.env.set('PATH', `${adopted.bin}:${(await $.env.get('PATH')) ?? ''}`)
-      await registerTools($)
+      const started = await adopt($, session)
+      if ('problem' in started) return { text: started.problem }
       active = true
-      // The chief's brief, as a turn of its own: Claude Code keeps a mod
-      // installed by a user out of the system prompt. From a timer, since a
-      // command cannot wait on a turn while it holds this one.
-      $.clock.after(1, () => { void $.prompt.submit({ text: adopted.brief }) })
-      // Kept for compaction, which summarises a turn like any other.
-      await update($, brief, () => adopted.brief)
-      return { text: `This session is the chief of ${root} now. Its brief follows; /fleet shows the crew.` }
+      await openPane($)
+      return { text: `This session is the chief of ${started.root} now. Its brief follows; the fleet pane shows the crew.` }
     }
     if (!active) return { text: 'This session is not part of a fleet. `/fleet start` makes it the chief of this workspace.' }
     if (isWorker) return { text: "The fleet is drawn in the chief's session." }
-    const opened = await $.ui.open({ id: PANE, title: 'fleet' })
-    return opened.isPlaced ? {} : { text: 'Widen the terminal to see the fleet pane.' }
+    return (await openPane($)) ? {} : { text: 'Widen the terminal to see the fleet pane.' }
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Button, Client, Text } = $.ui.resolve(e)
     const s = await read($, snapshot)
+    // The desktop app and the phone draw the fleet natively, from the
+    // snapshot: see crew.tsx.
+    if (e.surface !== 'terminal') {
+      const el = $.ui.resolve(e)
+      if (!s) return <el.Text dimColor>Reading the board…</el.Text>
+      return crewPane(el, s, { go: task => void give($, task), handoff: agent => void handoff($, agent) }, e.props.bodyColumns ?? 80)
+    }
+    const { Box, Button, Client, Text } = $.ui.resolve(e)
     if (!s) return <Text dimColor>Reading the board…</Text>
     const waiting = s.agents.filter(a => a.awaiting_go && a.presence === 'waiting')
     // The fleet tab, live: fleet draws it, the Client shows it and takes its
@@ -806,6 +924,7 @@ export const register: Register = on => {
   // The pane closed: the view behind it has no one to draw for.
   on('ui.close', async ($, e, next) => {
     const closed = await next(e)
+    if ((e as { id?: string }).id === PANE) await update($, paneOpen, () => false)
     if (view && (e as { id?: string }).id === PANE) {
       await sendView($, view.control, ['quit'])
       frame = []
@@ -816,10 +935,45 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (isWorker || e.props.hasSurvey) return next(e)
+    const { Box, Button, Text } = $.ui.resolve(e)
+
+    // A workspace listed in auto-open, not yet a fleet: one press starts it.
+    if (!active) {
+      if (!(await read($, offer))) return next(e)
+      const busy = await read($, starting)
+      // What /fleet start does, and the pane. It takes a few seconds, and
+      // the first time a download too, so the band says it is under way.
+      const start = async () => {
+        if ((await read($, starting)) || active || !session) return
+        await update($, starting, () => true)
+        try {
+          const started = await adopt($, session)
+          if ('problem' in started) {
+            $.ui.toast(started.problem)
+            return
+          }
+          active = true
+          await openPane($)
+        } finally {
+          await update($, starting, () => false)
+        }
+      }
+      return (
+        <Box flexDirection="row" columnGap={3} alignItems="center" borderStyle="round" borderColor="gray" paddingX={1} width={e.props.bodyColumns}>
+          <Text bold>fleet</Text>
+          {busy && <Text color="yellow">◌ Starting the fleet… the first time, fleet is downloaded too</Text>}
+          {!busy && <Text dimColor>This workspace runs as a fleet.</Text>}
+          {!busy && <Button key="fleet-start" variant="primary" label="Start fleet" onPress={() => void start()} />}
+        </Box>
+      )
+    }
+
     const s = await read($, snapshot)
-    const crew = s?.agents.filter(a => a.role === 'worker') ?? []
-    if (!s || crew.length === 0) return next(e)
-    const { Box, Text } = $.ui.resolve(e)
+    if (!s || s.me?.role !== 'chief') return next(e)
+    const crew = s.agents.filter(a => a.role === 'worker')
+    const isOpen = await paneShown($)
+    // Nothing to count and the pane is up: the band has nothing to add.
+    if (crew.length === 0 && isOpen) return next(e)
     const want = needs(s)
     const working = crew.filter(a => a.presence === 'working').length
     const idle = crew.filter(a => a.presence === 'waiting').length
@@ -836,7 +990,7 @@ export const register: Register = on => {
           <Text><Text color="green">●</Text>{` ${working} working`}</Text>
           <Text><Text dimColor>○</Text>{` ${idle} idle`}</Text>
           <Text>{`${open} open`}</Text>
-          <Text dimColor>/fleet</Text>
+          {isOpen ? <Text dimColor>/fleet</Text> : <Button key="fleet-open" label="Open fleet" onPress={() => void openPane($)} />}
         </Box>
         {want.length > 0 && (
           <Box flexDirection="row" flexWrap="wrap" columnGap={3}>

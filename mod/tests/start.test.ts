@@ -4,14 +4,16 @@ import type { On } from 'claude-code'
 const start = { cwd: '/w/acme', surface: 'terminal', isInteractive: true } as const
 
 /** An ordinary session, with fleet's plugin installed and no board yet. */
-function session(on: On) {
+function session(on: On, onRun?: (argv: string[]) => Promise<void>) {
   const ran: string[][] = []
   const set: Record<string, string | undefined> = {}
   const submitted: string[] = []
   const registered: string[] = []
-  on('process.run', ($, e) => {
+  const commands: string[] = []
+  on('process.run', async ($, e) => {
     const argv = [...e.argv]
     ran.push(argv)
+    if (onRun) await onRun(argv)
     const reply = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
     if (argv[1] === 'chief') {
       return reply(JSON.stringify({ board: '/home/me/.claude-fleet/fleets/acme/fleet.db', run: 7, bin: '/opt/fleet/bin', brief: 'You are the chief of staff…' }))
@@ -28,7 +30,10 @@ function session(on: On) {
   on('session.root', () => ({ value: '/w/acme' }))
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200_000, percent: 12 }, rateLimits: [] } }))
-  on('command.register', () => ({ value: undefined }))
+  on('command.register', ($, e) => {
+    commands.push(e.name)
+    return { value: undefined }
+  })
   on('tool.register', ($, e) => {
     registered.push(e.name)
     return { value: undefined }
@@ -38,10 +43,15 @@ function session(on: On) {
     return { text: e.text }
   })
   on('ui.status', () => ({ value: undefined }))
+  const opened: string[] = []
+  on('ui.open', ($, e) => {
+    opened.push(e.id)
+    return { value: { isPlaced: true as const } }
+  })
   on('prompt.read', () => ({ value: { text: '', cursor: 0 } }))
   on('tool.call', () => ({ result: 'ran' }))
   on('tool.check', () => ({ decision: 'ask' as const }))
-  return { ran, set, submitted, registered }
+  return { ran, set, submitted, registered, commands, opened }
 }
 
 test('an ordinary session with the plugin runs nothing until /fleet start', async ($, on) => {
@@ -138,7 +148,7 @@ test('/fleet start fetches the fleet that matches the plugin when it has none', 
     if (argv[1] === 'chief') return reply(0, JSON.stringify({ board: '/b/fleet.db', run: 1, bin: null, brief: 'brief' }))
     return reply(0, JSON.stringify({ agent: 'chief', text: null, waiting: 0, awaiting_go: null }))
   })
-  for (const [event, value] of [['env.set', undefined], ['session.id', 'sid-mine'], ['session.root', '/w/acme'], ['command.register', undefined], ['tool.register', undefined], ['ui.status', undefined]] as const) {
+  for (const [event, value] of [['env.set', undefined], ['session.id', 'sid-mine'], ['session.root', '/w/acme'], ['command.register', undefined], ['tool.register', undefined], ['ui.status', undefined], ['ui.open', { isPlaced: true }]] as const) {
     on(event, () => ({ value }) as never)
   }
   on('session.start', ($, e) => ({ cwd: e.cwd }))
@@ -151,4 +161,91 @@ test('/fleet start fetches the fleet that matches the plugin when it has none', 
   expect(adopt?.[0]).toMatch(/\/bin\/fleet$/)
   expect(fetched).toBe(true)
   expect(said.text).toContain('chief of /w/acme')
+})
+
+test('a session the desktop app hosts starts the mod once the app attaches; a -p run never does', async ($, on) => {
+  mock.env(on, { PATH: '/usr/bin', FLEET_BIN: 'fleet', FLEET_DB: '/tmp/fleet.db' })
+  const clock = mock.clock(on)
+  const { ran, commands } = session(on)
+  let surfaces: ('desktop')[] = []
+  on('session.surfaces', () => ({ value: surfaces }))
+
+  // Through the SDK, as the desktop app and `claude -p` both start it.
+  await $.session.start({ cwd: '/w/acme', surface: null, isInteractive: false })
+  await clock.advance(10_000)
+  expect(commands).toEqual([])
+  expect(ran).toEqual([])
+
+  surfaces = ['desktop']
+  await clock.advance(1_000)
+  expect(commands).toEqual(['fleet'])
+  await clock.advance(3_000)
+  expect(ran.some(argv => argv[2] === 'inbox')).toBe(true)
+})
+
+for (const surface of ['terminal', 'desktop'] as const) {
+  test(`on ${surface}, a workspace listed in auto-open offers to start a fleet, and one press does`, async ($, on) => {
+    mock.env(on, { PATH: '/usr/bin', FLEET_BIN: 'fleet', HOME: '/w' })
+    const clock = mock.clock(on)
+    // fleet takes its time to answer: the band is looked at meanwhile.
+    let answer = () => {}
+    let asked = () => {}
+    const isAsked = new Promise<void>(resolve => { asked = resolve })
+    const { ran, submitted, opened } = session(on, async argv => {
+      if (argv[1] !== 'chief') return
+      asked()
+      await new Promise<void>(resolve => { answer = resolve })
+    })
+    on('fs.read', ($, e) => ({ value: e.path === '/w/.claude-fleet/auto-open' ? '# fleets\n~/acme\n' : '' }) as never)
+
+    // Beneath the plugin, the engine's own band: nothing.
+    on('ui.render', { component: 'AbovePrompt' }, () => ({ type: 'Box', props: {}, children: [] }) as never)
+    await $.session.start({ ...start, surface })
+    const band = await $.ui.mount({ plugin: 'fleet', surface, component: 'AbovePrompt', props: { hasSurvey: false, bodyColumns: 100 } as never })
+    expect(await band.find({ key: 'fleet-start' })).toBeDefined()
+    expect(ran).toEqual([])
+
+    const pressed = band.press({ key: 'fleet-start' })
+    await isAsked
+    // While it starts, the band says so and offers no second press.
+    const meanwhile = await $.ui.mount({ plugin: 'fleet', surface, component: 'AbovePrompt', props: { hasSurvey: false, bodyColumns: 100 } as never })
+    expect(await meanwhile.find({ text: /Starting the fleet/ })).toBeDefined()
+    expect(await meanwhile.find({ key: 'fleet-start' })).toBeUndefined()
+    answer()
+    await pressed
+    // The rest of the start runs on after the press: wait for its pane.
+    for (let i = 0; i < 1_000 && opened.length === 0; i++) await Promise.resolve()
+    expect(ran.some(argv => argv[1] === 'chief' && argv[2] === '--adopt')).toBe(true)
+    expect(opened).toEqual(['fleet'])
+    const again = await $.ui.mount({ plugin: 'fleet', surface, component: 'AbovePrompt', props: { hasSurvey: false, bodyColumns: 100 } as never })
+    expect(await again.find({ key: 'fleet-start' })).toBeUndefined()
+    // The chief's brief follows, as after /fleet start.
+    await clock.advance(1_000)
+    expect(submitted).toEqual(['You are the chief of staff…'])
+  })
+}
+
+test('a workspace not listed in auto-open is offered nothing', async ($, on) => {
+  mock.env(on, { PATH: '/usr/bin', FLEET_BIN: 'fleet', HOME: '/w' })
+  mock.clock(on)
+  const { ran } = session(on)
+  on('fs.read', () => ({ value: '~/elsewhere\n' }) as never)
+  on('ui.render', { component: 'AbovePrompt' }, () => ({ type: 'Box', props: {}, children: [] }) as never)
+
+  await $.session.start(start)
+  const band = await $.ui.mount({ plugin: 'fleet', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false, bodyColumns: 100 } as never })
+  expect(await band.find({ key: 'fleet-start' })).toBeUndefined()
+  // Only the check that the two are not the same directory spelled apart.
+  expect(ran.map(argv => argv[0])).toEqual(['sh'])
+})
+
+test('/fleet start opens the fleet pane by itself', async ($, on) => {
+  mock.env(on, { PATH: '/usr/bin', FLEET_BIN: 'fleet' })
+  mock.clock(on)
+  const { opened } = session(on)
+
+  await $.session.start(start)
+  const said = await $.command.run({ command: 'fleet', args: 'start' } as never)
+  expect(said.text).toContain('the fleet pane shows the crew')
+  expect(opened).toEqual(['fleet'])
 })

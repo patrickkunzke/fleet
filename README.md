@@ -73,11 +73,17 @@ with fleet's plugin loaded, in the workspace:
 ```
 
 The session is put on the board as the chief of a new run, gets the board's
-tools and the fleet view, and receives the chief's brief as a turn. Claude
+tools and the fleet view, which opens beside the conversation, and receives
+the chief's brief as a turn. Claude
 Code keeps a plugin you install out of the system prompt, so the brief is
 part of the conversation; when the conversation is compacted, fleet puts the
 brief back at the head of what is kept. The plugin does nothing in a session
 until `/fleet start`.
+
+In a workspace listed in `~/.claude-fleet/auto-open` (see
+[Quick start](#quick-start)), the band above the prompt offers it as a
+button: **Start fleet** does what `/fleet start` does. Anywhere else, nothing
+shows until you type it.
 
 fleet runs the agents the chief starts as Claude Code
 [background sessions](https://code.claude.com/docs/en/agent-view) instead of
@@ -95,9 +101,13 @@ The chief's own session draws the fleet, in place of the fleet tab:
   log, `n` starts an agent, `x` retires one, `r` brings a crew back and `q`
   closes it; a click on a card selects it. ↵ on a background agent says how
   to open it (`claude attach <id>`), since there is no tab to switch to. A
-  worker waiting for its go has a button beneath the view.
+  worker waiting for its go has a button beneath the view. In the Claude
+  desktop app and on the phone the pane is drawn natively instead: the crew
+  as a graph, a card for each agent with a button for its go and, past 80%
+  context, one to hand it off, the open tasks and the latest messages.
 - **A band above the prompt** keeps count, and names who needs something:
-  `fleet · 3 agents · 1 working · 4 open · billing needs a go · accounts at 84%`.
+  `fleet · 3 agents · 1 working · 4 open · billing needs a go · accounts at 84%`,
+  with an **Open fleet** button while the pane is closed.
 - **Toasts** say what herdr would have notified: a task blocked, in review or
   done, an agent waiting for a go or stopped at a permission prompt, one
   nearly out of context.
@@ -106,10 +116,11 @@ The chief's own session draws the fleet, in place of the fleet tab:
 
 Two things to know:
 
-- **Trust the workspace once.** Claude Code refuses to start a background
-  session in a folder it has not been trusted in. Trust carries down to the
-  folders inside, so running `claude` once in the workspace and accepting the
-  prompt covers every repository in it.
+- **Trust each repository once.** Claude Code refuses to start a background
+  session in a folder it has not been trusted in. Trust in the workspace does
+  not carry into a repository inside it that has a git root of its own, so
+  run `claude` once in each repository an agent will work in and accept the
+  prompt. When a spawn is refused, fleet names the repository to trust.
 - **Messages need the mod.** A background session has no prompt to type a
   message at, so an agent whose mod is not checking in (mods turned off, or
   Claude Code older than v2.1.287) only finds its messages on the board.
@@ -263,7 +274,9 @@ echo '~/Code/acme' >> ~/.claude-fleet/auto-open
 ```
 
 It matches the workspace's own directory exactly, so a workspace opened in
-one repository inside it stays an ordinary one.
+one repository inside it stays an ordinary one. Outside herdr, a Claude Code
+session started in a listed directory offers a **Start fleet** button above
+its prompt instead.
 
 ## The fleet view
 
