@@ -158,9 +158,8 @@ export function crewPane(el: ElementTable<'mobile'>, s: Snapshot, act: CrewActio
   return (
     <Box flexDirection="column" gap={1} paddingX={1}>
       <Box flexDirection="row" columnGap={2} flexWrap="wrap" alignItems="center">
-        <Text bold>fleet</Text>
         <Text dimColor>{`${crew.length} ${crew.length === 1 ? 'agent' : 'agents'}`}</Text>
-        <Text color="yellow">{`● ${working} working`}</Text>
+        {working > 0 ? <Text color="yellow">{`● ${working} working`}</Text> : <Text dimColor>0 working</Text>}
         <Text dimColor>{`${s.tasks.length} open`}</Text>
         {needing.length > 0 && <Text color="yellow" bold>{`▲ ${needing.length} need${needing.length === 1 ? 's' : ''} you`}</Text>}
       </Box>
