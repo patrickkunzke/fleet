@@ -110,7 +110,7 @@ impl Background {
             .output()
             .with_context(|| format!("running {} --bg", self.program))?;
         let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-        let id = started(&said)?;
+        let id = started(&said, repo)?;
         Ok(Placed::background(format!("{PREFIX}{id}"), format!("background session {id}")))
     }
 
@@ -163,10 +163,10 @@ fn parse_list(json: &str) -> Result<Vec<Listed>> {
     serde_json::from_str(json).context("reading claude agents --json")
 }
 
-/// The id `claude --bg` started, from what it printed: `backgrounded ·
-/// 5cba7f8f · billing`. It exits 0 when it refuses, too, so the words are
-/// what say whether it started.
-fn started(said: &str) -> Result<String> {
+/// The id `claude --bg` started in `repo`, from what it printed:
+/// `backgrounded · 5cba7f8f · billing`. It exits 0 when it refuses, too, so
+/// the words are what say whether it started.
+fn started(said: &str, repo: &Path) -> Result<String> {
     if let Some(id) = said
         .lines()
         .find_map(|l| l.trim().strip_prefix("backgrounded · "))
@@ -177,9 +177,13 @@ fn started(said: &str) -> Result<String> {
         return Ok(id.to_string());
     }
     if said.contains("Workspace not trusted") {
+        // Trust in the workspace does not carry into a repository inside it
+        // that is a git repository of its own: each one is trusted by itself.
         bail!(
-            "Claude Code has not been trusted in this repository, or a folder above it. \
-             Run `claude` in the workspace once and accept the trust prompt: that covers every repository in it"
+            "Claude Code has not been trusted in {repo}. Run `claude` there once and accept \
+             the trust prompt, then try again. Trusting the workspace above it does not cover \
+             a repository with a git root of its own",
+            repo = repo.display()
         );
     }
     bail!("claude --bg did not start a session: {}", said.trim())
@@ -192,18 +196,19 @@ mod tests {
     #[test]
     fn the_id_is_read_from_what_claude_bg_printed() {
         let said = "backgrounded · 5cba7f8f · billing\n  claude agents             list sessions\n  claude attach 5cba7f8f    open in this terminal\n";
-        assert_eq!(started(said).unwrap(), "5cba7f8f");
+        assert_eq!(started(said, Path::new("/w/billing")).unwrap(), "5cba7f8f");
         let woke = "note: woke session 5cba7f8f with its saved options (--name, --plugin-dir).\nbackgrounded · 5cba7f8f · billing\n";
-        assert_eq!(started(woke).unwrap(), "5cba7f8f", "a wake says so first");
+        assert_eq!(started(woke, Path::new("/w/billing")).unwrap(), "5cba7f8f", "a wake says so first");
     }
 
     #[test]
     fn an_untrusted_repository_is_said_plainly_though_claude_exits_0() {
-        let err = started("Workspace not trusted. Run `claude` in /w/x once and accept the trust prompt, then retry.\n")
+        let err = started("Workspace not trusted. Run `claude` in /w/x once and accept the trust prompt, then retry.\n", Path::new("/w/x"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("trust prompt"), "{err}");
-        assert!(started("something else\n").is_err());
+        assert!(err.contains("trusted in /w/x."), "names the repository to trust: {err}");
+        assert!(started("something else\n", Path::new("/w/x")).is_err());
     }
 
     #[test]

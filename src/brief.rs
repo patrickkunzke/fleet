@@ -282,8 +282,16 @@ const SKILL: &str = include_str!("../mod/skills/board/SKILL.md");
 
 /// The mod that delivers board messages from inside the agent's session.
 /// `mod/` is a plugin of its own, so `claude plugin test mod` runs its tests;
-/// what an agent is started with is these two files beside the skill.
-const MOD_HOOKS: &str = include_str!("../mod/hooks/hooks.json");
+/// what an agent is started with is every file of its `hooks/` beside the
+/// skill. Claude Code reads the hooks module with every module it imports or
+/// draws with, and refuses all of it when one is missing, so none is left out.
+const MOD_HOOKS: &[(&str, &str)] = &[
+    ("hooks.json", include_str!("../mod/hooks/hooks.json")),
+    ("register.tsx", include_str!("../mod/hooks/register.tsx")),
+    ("view.tsx", include_str!("../mod/hooks/view.tsx")),
+    ("crew.tsx", include_str!("../mod/hooks/crew.tsx")),
+];
+#[cfg(test)]
 const MOD_REGISTER: &str = include_str!("../mod/hooks/register.tsx");
 /// The types of what the mod keeps in its state, which Claude Code holds it to.
 const MOD_TYPES: &str = include_str!("../mod/types/index.d.ts");
@@ -310,8 +318,9 @@ pub fn write_plugin(dir: &Path) -> std::io::Result<std::path::PathBuf> {
     });
     put(&dir.join(".claude-plugin/plugin.json"), &format!("{manifest:#}\n"))?;
     put(&dir.join("skills/board/SKILL.md"), SKILL)?;
-    put(&dir.join("hooks/hooks.json"), MOD_HOOKS)?;
-    put(&dir.join("hooks/register.tsx"), MOD_REGISTER)?;
+    for (name, text) in MOD_HOOKS {
+        put(&dir.join("hooks").join(name), text)?;
+    }
     put(&dir.join("types/index.d.ts"), MOD_TYPES)?;
     // The module's name before it drew anything: hooks.json no longer names
     // it, and a copy left beside the new one only misleads.
@@ -815,6 +824,20 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(plugin.join(".claude-plugin/plugin.json")).unwrap()).unwrap();
         let types = std::fs::read_to_string(plugin.join(manifest["types"].as_str().unwrap())).unwrap();
         assert!(types.contains("snapshot: Snapshot | null"), "the state it keeps is declared");
+
+        // Every file of the mod's hooks: a module that draws with one left
+        // out is refused whole, and the agent runs with no mod at all.
+        let mut shipped: Vec<String> = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/mod/hooks"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        shipped.sort();
+        let mut written: Vec<String> = std::fs::read_dir(plugin.join("hooks"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        written.sort();
+        assert_eq!(written, shipped, "every file in mod/hooks is in MOD_HOOKS");
 
         std::fs::write(plugin.join("hooks/register.ts"), "old").unwrap();
         write_plugin(dir.path()).unwrap();
