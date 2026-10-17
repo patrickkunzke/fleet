@@ -341,6 +341,7 @@ const snapshot = atom({ plugin: 'fleet', key: 'snapshot' } as const, null)
 const brief = atom({ plugin: 'fleet', key: 'brief' } as const, null)
 const offer = atom({ plugin: 'fleet', key: 'offer' } as const, false)
 const paneOpen = atom({ plugin: 'fleet', key: 'paneOpen' } as const, false)
+const starting = atom({ plugin: 'fleet', key: 'starting' } as const, false)
 
 /** The board as `session` sees it; undefined when it cannot be read. */
 async function look($: EngineInterface, session: string): Promise<Snapshot | undefined> {
@@ -916,9 +917,6 @@ export const register: Register = on => {
     return closed
   })
 
-  // A press on the band's Start fleet: what /fleet start does, and the pane.
-  let starting = false
-
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (isWorker || e.props.hasSurvey) return next(e)
     const { Box, Button, Text } = $.ui.resolve(e)
@@ -926,9 +924,12 @@ export const register: Register = on => {
     // A workspace listed in auto-open, not yet a fleet: one press starts it.
     if (!active) {
       if (!(await read($, offer))) return next(e)
+      const busy = await read($, starting)
+      // What /fleet start does, and the pane. It takes a few seconds, and
+      // the first time a download too, so the band says it is under way.
       const start = async () => {
-        if (starting || active || !session) return
-        starting = true
+        if ((await read($, starting)) || active || !session) return
+        await update($, starting, () => true)
         try {
           const started = await adopt($, session)
           if ('problem' in started) {
@@ -938,14 +939,15 @@ export const register: Register = on => {
           active = true
           await openPane($)
         } finally {
-          starting = false
+          await update($, starting, () => false)
         }
       }
       return (
         <Box flexDirection="row" columnGap={3} alignItems="center" borderStyle="round" borderColor="gray" paddingX={1} width={e.props.bodyColumns}>
           <Text bold>fleet</Text>
-          <Text dimColor>This workspace runs as a fleet.</Text>
-          <Button key="fleet-start" variant="primary" label="Start fleet" onPress={() => void start()} />
+          {busy && <Text color="yellow">◌ Starting the fleet… the first time, fleet is downloaded too</Text>}
+          {!busy && <Text dimColor>This workspace runs as a fleet.</Text>}
+          {!busy && <Button key="fleet-start" variant="primary" label="Start fleet" onPress={() => void start()} />}
         </Box>
       )
     }

@@ -4,15 +4,16 @@ import type { On } from 'claude-code'
 const start = { cwd: '/w/acme', surface: 'terminal', isInteractive: true } as const
 
 /** An ordinary session, with fleet's plugin installed and no board yet. */
-function session(on: On) {
+function session(on: On, onRun?: (argv: string[]) => Promise<void>) {
   const ran: string[][] = []
   const set: Record<string, string | undefined> = {}
   const submitted: string[] = []
   const registered: string[] = []
   const commands: string[] = []
-  on('process.run', ($, e) => {
+  on('process.run', async ($, e) => {
     const argv = [...e.argv]
     ran.push(argv)
+    if (onRun) await onRun(argv)
     const reply = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
     if (argv[1] === 'chief') {
       return reply(JSON.stringify({ board: '/home/me/.claude-fleet/fleets/acme/fleet.db', run: 7, bin: '/opt/fleet/bin', brief: 'You are the chief of staff…' }))
@@ -186,7 +187,15 @@ for (const surface of ['terminal', 'desktop'] as const) {
   test(`on ${surface}, a workspace listed in auto-open offers to start a fleet, and one press does`, async ($, on) => {
     mock.env(on, { PATH: '/usr/bin', FLEET_BIN: 'fleet', HOME: '/w' })
     const clock = mock.clock(on)
-    const { ran, submitted, opened } = session(on)
+    // fleet takes its time to answer: the band is looked at meanwhile.
+    let answer = () => {}
+    let asked = () => {}
+    const isAsked = new Promise<void>(resolve => { asked = resolve })
+    const { ran, submitted, opened } = session(on, async argv => {
+      if (argv[1] !== 'chief') return
+      asked()
+      await new Promise<void>(resolve => { answer = resolve })
+    })
     on('fs.read', ($, e) => ({ value: e.path === '/w/.claude-fleet/auto-open' ? '# fleets\n~/acme\n' : '' }) as never)
 
     // Beneath the plugin, the engine's own band: nothing.
@@ -196,7 +205,16 @@ for (const surface of ['terminal', 'desktop'] as const) {
     expect(await band.find({ key: 'fleet-start' })).toBeDefined()
     expect(ran).toEqual([])
 
-    await band.press({ key: 'fleet-start' })
+    const pressed = band.press({ key: 'fleet-start' })
+    await isAsked
+    // While it starts, the band says so and offers no second press.
+    const meanwhile = await $.ui.mount({ plugin: 'fleet', surface, component: 'AbovePrompt', props: { hasSurvey: false, bodyColumns: 100 } as never })
+    expect(await meanwhile.find({ text: /Starting the fleet/ })).toBeDefined()
+    expect(await meanwhile.find({ key: 'fleet-start' })).toBeUndefined()
+    answer()
+    await pressed
+    // The rest of the start runs on after the press: wait for its pane.
+    for (let i = 0; i < 1_000 && opened.length === 0; i++) await Promise.resolve()
     expect(ran.some(argv => argv[1] === 'chief' && argv[2] === '--adopt')).toBe(true)
     expect(opened).toEqual(['fleet'])
     const again = await $.ui.mount({ plugin: 'fleet', surface, component: 'AbovePrompt', props: { hasSurvey: false, bodyColumns: 100 } as never })

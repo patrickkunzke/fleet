@@ -52,6 +52,8 @@ declare module 'claude-code' {
       offer: boolean
       /** The fleet pane is open, so the band need not offer to open it. */
       paneOpen: boolean
+      /** The band's Start fleet was pressed and the fleet is still starting. */
+      starting: boolean
     }
   }
 }
