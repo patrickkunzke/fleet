@@ -35,6 +35,8 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { GraphSpan, Snapshot } from '../types'
 
+import { HIGH, crewPane } from './crew'
+
 /** How often the mailbox is checked. Well inside the board's fifteen. */
 const EVERY = 3_000
 
@@ -334,8 +336,6 @@ async function gate($: EngineInterface, session: string, approve = false): Promi
 }
 
 const PANE = 'fleet'
-/** From here an agent is close to compacting: the board's CONTEXT_HIGH. */
-const HIGH = 80
 
 const snapshot = atom({ plugin: 'fleet', key: 'snapshot' } as const, null)
 const brief = atom({ plugin: 'fleet', key: 'brief' } as const, null)
@@ -373,6 +373,17 @@ async function give($: EngineInterface, task: string) {
     $.ui.toast(out.exitCode === 0 ? `${task}: go given` : `${task}: ${out.stderr.trim() || 'the go did not go through'}`)
   } catch {
     $.ui.toast(`${task}: fleet could not be run`)
+  }
+}
+
+/** Hand an agent nearly out of context to a fresh session of it. */
+async function handoff($: EngineInterface, agent: string) {
+  $.ui.toast(`${agent}: handing off to a fresh session…`)
+  try {
+    const out = await $.process.run(['fleet', 'handoff', agent], { timeoutMs: 120_000 })
+    $.ui.toast(out.exitCode === 0 ? `${agent}: handed off` : `${agent}: ${(out.stderr || out.stdout).trim() || 'the handoff did not go through'}`)
+  } catch {
+    $.ui.toast(`${agent}: fleet could not be run`)
   }
 }
 
@@ -712,8 +723,15 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Button, Client, Text } = $.ui.resolve(e)
     const s = await read($, snapshot)
+    // The desktop app and the phone draw the fleet natively, from the
+    // snapshot: see crew.tsx.
+    if (e.surface !== 'terminal') {
+      const el = $.ui.resolve(e)
+      if (!s) return <el.Text dimColor>Reading the board…</el.Text>
+      return crewPane(el, s, { go: task => void give($, task), handoff: agent => void handoff($, agent) }, e.props.bodyColumns ?? 80)
+    }
+    const { Box, Button, Client, Text } = $.ui.resolve(e)
     if (!s) return <Text dimColor>Reading the board…</Text>
     const waiting = s.agents.filter(a => a.awaiting_go && a.presence === 'waiting')
     // The fleet tab, live: fleet draws it, the Client shows it and takes its

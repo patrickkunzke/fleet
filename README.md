@@ -95,7 +95,10 @@ The chief's own session draws the fleet, in place of the fleet tab:
   log, `n` starts an agent, `x` retires one, `r` brings a crew back and `q`
   closes it; a click on a card selects it. ↵ on a background agent says how
   to open it (`claude attach <id>`), since there is no tab to switch to. A
-  worker waiting for its go has a button beneath the view.
+  worker waiting for its go has a button beneath the view. In the Claude
+  desktop app and on the phone the pane is drawn natively instead: the crew
+  as a graph, a card for each agent with a button for its go and, past 80%
+  context, one to hand it off, the open tasks and the latest messages.
 - **A band above the prompt** keeps count, and names who needs something:
   `fleet · 3 agents · 1 working · 4 open · billing needs a go · accounts at 84%`.
 - **Toasts** say what herdr would have notified: a task blocked, in review or

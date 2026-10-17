@@ -26,6 +26,7 @@ function chiefSees(): Snapshot {
 /** A board that answers the view's reads with `seen`, and records a go. */
 function board(on: On, seen: { now: Snapshot }) {
   const gone: string[][] = []
+  const handed: string[][] = []
   const sent: string[][] = []
   const followed: string[][] = []
   on('process.spawn', async function* ($, e) {
@@ -45,6 +46,7 @@ function board(on: On, seen: { now: Snapshot }) {
     let stdout = JSON.stringify({ agent: 'chief', text: null, waiting: 0, awaiting_go: null })
     if (argv[2] === 'snapshot') stdout = JSON.stringify(seen.now)
     if (argv[2] === 'go') gone.push(argv)
+    if (argv[1] === 'handoff') handed.push(argv)
     if (argv[2] === 'view-send') sent.push(argv.slice(5))
     return { value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
@@ -59,7 +61,7 @@ function board(on: On, seen: { now: Snapshot }) {
     toasts.push(e.text)
     return { value: undefined }
   })
-  return { gone, toasts, sent, followed }
+  return { gone, handed, toasts, sent, followed }
 }
 
 test("the chief's pane is the fleet tab, live: frames in, keys and clicks out", async ($, on) => {
@@ -145,3 +147,40 @@ test("a worker's session stops reading once the board says it is one", async ($,
   await clock.advance(9_000)
   expect(reads).toBe(1)
 })
+
+for (const surface of ['desktop', 'mobile'] as const) {
+  test(`on ${surface} the pane is drawn natively from the board, with its buttons`, async ($, on) => {
+    mock.env(on, { FLEET_DB: '/tmp/fleet.db', HOME: '/home/me' })
+    const clock = mock.clock(on)
+    const { gone, handed, followed } = board(on, { now: chiefSees() })
+
+    await $.session.start({ ...start, surface })
+    await clock.advance(3_000)
+    const ui = await $.ui.mount({ plugin: 'fleet', surface, component: 'Pane', requestId: 'fleet', props: { bodyColumns: 90 } as never })
+
+    // The crew as a graph, described for a reader that cannot see it.
+    const svg = await ui.find({ type: 'Svg' })
+    expect(svg).toBeDefined()
+    expect(String(svg?.props?.alt)).toContain('billing ◇ needs a go')
+    expect(String(svg?.props?.source)).toContain('<svg')
+
+    const said = (await ui.findAll({ type: 'Text' })).map(t => t.text).join(' | ')
+    expect(said).toContain('2 agents')
+    expect(said).toContain('◇ needs a go')
+    expect(said).toContain('● slack_send_message')
+    expect(said).toContain('84% context')
+    expect(said).toContain('claude attach 5cba7f8f')
+    expect(said).toContain('needs the flag')
+    expect(said).toContain('plan: add the column')
+
+    // Nothing of the terminal's: no fleet view behind it.
+    expect(await ui.find({ type: 'Client' })).toBeUndefined()
+    await clock.advance(3_000)
+    expect(followed).toEqual([])
+
+    await ui.press({ key: 'go-billing' })
+    expect(gone).toEqual([['fleet', 'board', 'go', 'ENG-1-1']])
+    await ui.press({ key: 'handoff-accounts' })
+    expect(handed).toEqual([['fleet', 'handoff', 'accounts']])
+  })
+}
