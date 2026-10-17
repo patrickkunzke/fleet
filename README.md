@@ -73,11 +73,17 @@ with fleet's plugin loaded, in the workspace:
 ```
 
 The session is put on the board as the chief of a new run, gets the board's
-tools and the fleet view, and receives the chief's brief as a turn. Claude
+tools and the fleet view, which opens beside the conversation, and receives
+the chief's brief as a turn. Claude
 Code keeps a plugin you install out of the system prompt, so the brief is
 part of the conversation; when the conversation is compacted, fleet puts the
 brief back at the head of what is kept. The plugin does nothing in a session
 until `/fleet start`.
+
+In a workspace listed in `~/.claude-fleet/auto-open` (see
+[Quick start](#quick-start)), the band above the prompt offers it as a
+button: **Start fleet** does what `/fleet start` does. Anywhere else, nothing
+shows until you type it.
 
 fleet runs the agents the chief starts as Claude Code
 [background sessions](https://code.claude.com/docs/en/agent-view) instead of
@@ -100,7 +106,8 @@ The chief's own session draws the fleet, in place of the fleet tab:
   as a graph, a card for each agent with a button for its go and, past 80%
   context, one to hand it off, the open tasks and the latest messages.
 - **A band above the prompt** keeps count, and names who needs something:
-  `fleet · 3 agents · 1 working · 4 open · billing needs a go · accounts at 84%`.
+  `fleet · 3 agents · 1 working · 4 open · billing needs a go · accounts at 84%`,
+  with an **Open fleet** button while the pane is closed.
 - **Toasts** say what herdr would have notified: a task blocked, in review or
   done, an agent waiting for a go or stopped at a permission prompt, one
   nearly out of context.
@@ -266,7 +273,9 @@ echo '~/Code/acme' >> ~/.claude-fleet/auto-open
 ```
 
 It matches the workspace's own directory exactly, so a workspace opened in
-one repository inside it stays an ordinary one.
+one repository inside it stays an ordinary one. Outside herdr, a Claude Code
+session started in a listed directory offers a **Start fleet** button above
+its prompt instead.
 
 ## The fleet view
 

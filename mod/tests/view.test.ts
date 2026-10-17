@@ -56,12 +56,17 @@ function board(on: On, seen: { now: Snapshot }) {
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200_000, percent: 31 }, rateLimits: [] } }))
   on('command.register', () => ({ value: undefined }))
   on('ui.status', () => ({ value: undefined }))
+  const opened: string[] = []
+  on('ui.open', ($, e) => {
+    opened.push(e.id)
+    return { value: { isPlaced: true as const } }
+  })
   const toasts: string[] = []
   on('ui.toast', ($, e) => {
     toasts.push(e.text)
     return { value: undefined }
   })
-  return { gone, handed, toasts, sent, followed }
+  return { gone, handed, toasts, sent, followed, opened }
 }
 
 test("the chief's pane is the fleet tab, live: frames in, keys and clicks out", async ($, on) => {
@@ -184,3 +189,19 @@ for (const surface of ['desktop', 'mobile'] as const) {
     expect(handed).toEqual([['fleet', 'handoff', 'accounts']])
   })
 }
+
+test("the band opens the fleet pane while it is closed, and says /fleet once it is open", async ($, on) => {
+  mock.env(on, { FLEET_DB: '/tmp/fleet.db' })
+  const clock = mock.clock(on)
+  const { opened } = board(on, { now: chiefSees() })
+
+  await $.session.start(start)
+  await clock.advance(3_000)
+  const band = await $.ui.mount({ plugin: 'fleet', surface: 'desktop', component: 'AbovePrompt', props: { hasSurvey: false, bodyColumns: 120 } as never })
+  await band.press({ key: 'fleet-open' })
+  expect(opened).toEqual(['fleet'])
+
+  const after = await $.ui.mount({ plugin: 'fleet', surface: 'desktop', component: 'AbovePrompt', props: { hasSurvey: false, bodyColumns: 120 } as never })
+  expect(await after.find({ key: 'fleet-open' })).toBeUndefined()
+  expect(await after.find({ text: '/fleet' })).toBeDefined()
+})
