@@ -152,3 +152,40 @@ test('/fleet start fetches the fleet that matches the plugin when it has none', 
   expect(fetched).toBe(true)
   expect(said.text).toContain('chief of /w/acme')
 })
+
+test('/fleet start fetches the fleet again when the one it has is another version', async ($, on) => {
+  mock.env(on, { PATH: '/usr/bin' })
+  mock.clock(on)
+  const ran: string[][] = []
+  let installed = '0.16.1'
+  on('fs.read', ($, e) => {
+    if (e.path.endsWith('/.claude-plugin/plugin.json')) return { value: JSON.stringify({ name: 'fleet', version: '0.17.2' }) }
+    throw new Error(`unexpected read of ${e.path}`)
+  })
+  on('process.run', ($, e) => {
+    const argv = [...e.argv]
+    ran.push(argv)
+    const reply = (exitCode: number, stdout = '') => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+    if (argv[0] === 'test') return reply(0)
+    if (argv[1] === '--version') return reply(0, `fleet ${installed}\n`)
+    if (argv[0] === 'sh' && argv[1].endsWith('/scripts/fetch-fleet.sh')) {
+      installed = '0.17.2'
+      return reply(0)
+    }
+    if (argv[1] === 'chief') return reply(0, JSON.stringify({ board: '/b/fleet.db', run: 1, bin: null, brief: 'brief' }))
+    return reply(0, JSON.stringify({ agent: 'chief', text: null, waiting: 0, awaiting_go: null }))
+  })
+  for (const [event, value] of [['env.set', undefined], ['session.id', 'sid-mine'], ['session.root', '/w/acme'], ['command.register', undefined], ['tool.register', undefined], ['ui.status', undefined]] as const) {
+    on(event, () => ({ value }) as never)
+  }
+  on('session.start', ($, e) => ({ cwd: e.cwd }))
+  on('prompt.submit', ($, e) => ({ text: e.text }))
+
+  await $.session.start(start)
+  const said = await $.command.run({ command: 'fleet', args: 'start' } as never)
+
+  expect(installed).toBe('0.17.2')
+  const adopt = ran.find(argv => argv[1] === 'chief')
+  expect(adopt?.[0]).toMatch(/\/bin\/fleet$/)
+  expect(said.text).toContain('chief of /w/acme')
+})

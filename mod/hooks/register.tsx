@@ -290,19 +290,45 @@ async function registerTools($: EngineInterface) {
  * Where the `fleet` to start with is, or why there is none. The one that
  * matches this plugin first, so the mod and the board agree on what they
  * say to each other: FLEET_BIN when set, for working on fleet itself; then
- * the copy in this plugin's folder, fetched now if it is not there yet; and
- * only then whatever fleet is on PATH.
+ * the copy in this plugin's folder, fetched now if it is not there yet or
+ * is another version than the plugin's; and only then whatever fleet is on
+ * PATH, or the other version when there is none.
  */
 async function findFleet($: EngineInterface): Promise<{ path: string } | { problem: string }> {
   const given = await $.env.get('FLEET_BIN')
   if (given) return { path: given }
   const own = `${$.plugin.root}/bin/fleet`
-  if ((await $.process.run(['test', '-x', own])).exitCode === 0) return { path: own }
+  const there = (await $.process.run(['test', '-x', own])).exitCode === 0
+  if (there) {
+    const wanted = await pluginVersion($)
+    if (!wanted || (await versionOf($, own)) === `fleet ${wanted}`) return { path: own }
+  }
   const fetched = await $.process.run(['sh', `${$.plugin.root}/scripts/fetch-fleet.sh`], { timeoutMs: 120_000 })
   if (fetched.exitCode === 0) return { path: own }
   const onPath = await $.process.run(['sh', '-c', 'command -v fleet'])
   if (onPath.exitCode === 0 && onPath.stdout.trim()) return { path: onPath.stdout.trim() }
+  if (there) return { path: own }
   return { problem: (fetched.stderr || fetched.stdout).trim() || 'fleet could not be downloaded' }
+}
+
+/** The plugin's version, as its manifest names it: fleet's own, too. */
+async function pluginVersion($: EngineInterface): Promise<string | undefined> {
+  try {
+    const manifest = JSON.parse(await $.fs.read(`${$.plugin.root}/.claude-plugin/plugin.json`)) as { version?: unknown }
+    return typeof manifest.version === 'string' ? manifest.version : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** What `fleet --version` says, as `fleet 0.17.2`; undefined when it does not run. */
+async function versionOf($: EngineInterface, fleet: string): Promise<string | undefined> {
+  try {
+    const out = await $.process.run([fleet, '--version'], { timeoutMs: 10_000 })
+    return out.exitCode === 0 ? out.stdout.trim() : undefined
+  } catch {
+    return undefined
+  }
 }
 
 /** What `fleet chief --adopt` prints. */
