@@ -1,18 +1,23 @@
 //! `fleet update`: bring the installed plugin to the newest release, and the
 //! cheap "a newer version is out" check the doctor runs.
 //!
-//! herdr has no update command. Installing again is how a plugin moves:
-//! herdr builds the new commit in a temporary checkout and swaps it in at the
-//! same plugin root only when the build passes, so a failed update leaves the
-//! old fleet working. The root is named after the plugin's id, not its
-//! commit, so the `fleet` on an agent's PATH is the new one after the swap.
-//!
-//! A release is a `vX.Y.Z` tag. Two ways fleet can be installed:
-//! - `herdr plugin install patrickkunzke/fleet`: install again, at the newest
-//!   tag, through herdr, which shows what it is about to run.
+//! A release is a `vX.Y.Z` tag, and the `release` branch is the newest one
+//! whose prebuilt binaries are up: CI moves it once they are. Two ways fleet
+//! can be installed:
+//! - `herdr plugin install patrickkunzke/fleet --ref release`: install again
+//!   at `release`, through herdr, which shows what it is about to run. herdr
+//!   records the ref, so `herdr plugin update` (herdr 0.9.4 or newer) follows
+//!   the branch from then on. A tag would pin it: herdr refetches the tag and
+//!   finds nothing new. Before there is a `release` branch, the newest tag.
 //! - `herdr plugin link <checkout>`: `git pull --ff-only` on `main` and the
 //!   build step, `scripts/install.sh`, which herdr does not run for a linked
 //!   plugin.
+//!
+//! herdr 0.9.4 and newer build an update in a new directory and leave the old
+//! one in place while its server runs, so a fleet already running (the view,
+//! the agents, with the old directory on their PATH) keeps its own version
+//! until it is started again. Older herdr swaps the new build in at the same
+//! directory. Either way a failed build leaves the fleet you had.
 //!
 //! Adapted from herdr-projects (`src/update.rs`), Copyright (c) 2026 Elias
 //! Stravik, MIT licensed — see NOTICE.
@@ -26,6 +31,8 @@ use anyhow::{Context, Result, bail};
 use crate::herdr;
 
 const PLUGIN_ID: &str = "fleet";
+/// The branch CI keeps at the newest release with its binaries up.
+const RELEASE_BRANCH: &str = "release";
 
 /// The doctor's check runs on every doctor and must not hold it up offline.
 const QUICK: Duration = Duration::from_secs(5);
@@ -63,13 +70,45 @@ fn show((a, b, c): Version) -> String {
     format!("{a}.{b}.{c}")
 }
 
-/// The highest release in `git ls-remote --tags --refs` output.
+/// The newest release in `git ls-remote --tags --refs` output.
 fn newest_tag(ls_remote: &str) -> Option<Version> {
     ls_remote
         .lines()
         .filter_map(|l| l.split_whitespace().nth(1)?.strip_prefix("refs/tags/v"))
         .filter_map(parse)
         .max()
+}
+
+/// A release to install, and the ref herdr installs it at.
+#[derive(Debug, Clone, PartialEq)]
+struct Release {
+    version: Version,
+    reference: String,
+}
+
+/// The newest release in `git ls-remote` output for the release branch and
+/// the tags: the one `release` is at, when it is at a release; the newest
+/// tag otherwise.
+fn newest(ls_remote: &str) -> Option<Release> {
+    let refs: Vec<(&str, &str)> = ls_remote
+        .lines()
+        .filter_map(|l| {
+            let mut parts = l.split_whitespace();
+            Some((parts.next()?, parts.next()?))
+        })
+        .collect();
+    let branch = refs.iter().find(|(_, name)| *name == format!("refs/heads/{RELEASE_BRANCH}"));
+    let at_branch = branch.and_then(|(sha, _)| {
+        refs.iter()
+            .filter(|(at, _)| at == sha)
+            .filter_map(|(_, name)| name.strip_prefix("refs/tags/v"))
+            .filter_map(|v| parse(v.strip_suffix("^{}").unwrap_or(v)))
+            .max()
+    });
+    match at_branch {
+        Some(version) => Some(Release { version, reference: RELEASE_BRANCH.into() }),
+        None => newest_tag(ls_remote).map(|version| Release { version, reference: format!("v{}", show(version)) }),
+    }
 }
 
 /// fleet's row in `herdr plugin list --plugin fleet --json`.
@@ -134,11 +173,14 @@ pub fn installed(timeout: Duration) -> Result<Installed> {
 
 /// The newest release where this install comes from; `None` when there are
 /// no release tags yet.
-fn latest(how: &Install, timeout: Duration) -> Result<Option<Version>> {
+fn latest(how: &Install, timeout: Duration) -> Result<Option<Release>> {
     let mut cmd = Command::new("git");
     match how {
         Install::Github { owner, repo } => {
-            cmd.args(["ls-remote", "--tags", "--refs", &format!("https://github.com/{owner}/{repo}.git")]);
+            // Not --refs: an annotated tag's commit is its `^{}` line, and
+            // that is what the branch is at.
+            cmd.args(["ls-remote", &format!("https://github.com/{owner}/{repo}.git")]);
+            cmd.args([format!("refs/heads/{RELEASE_BRANCH}"), "refs/tags/v*".into()]);
         }
         Install::Local { root } => {
             cmd.arg("-C").arg(root).args(["ls-remote", "--tags", "--refs", "origin"]);
@@ -153,7 +195,11 @@ fn latest(how: &Install, timeout: Duration) -> Result<Option<Version>> {
     if !out.success {
         bail!("git ls-remote failed: {}", out.stderr.trim());
     }
-    Ok(newest_tag(&out.stdout))
+    Ok(match how {
+        Install::Github { .. } => newest(&out.stdout),
+        // A checkout pulls main, whatever `release` is at.
+        Install::Local { .. } => newest_tag(&out.stdout).map(|version| Release { version, reference: "main".into() }),
+    })
 }
 
 /// For the doctor: the newer release, when there is one. Offline, no git, or
@@ -161,7 +207,7 @@ fn latest(how: &Install, timeout: Duration) -> Result<Option<Version>> {
 pub fn newer() -> Option<(String, String)> {
     let installed = installed(QUICK).ok()?;
     let current = parse(&installed.version)?;
-    let latest = latest(&installed.how, QUICK).ok()??;
+    let latest = latest(&installed.how, QUICK).ok()??.version;
     (latest > current).then(|| (installed.version, show(latest)))
 }
 
@@ -197,7 +243,7 @@ pub fn update(check: bool, yes: bool) -> Result<()> {
     let installed = installed(SLOW)?;
     let current = parse(&installed.version);
     println!("installed: {}", installed.version);
-    let Some(latest) = latest(&installed.how, SLOW)? else {
+    let Some(Release { version: latest, reference }) = latest(&installed.how, SLOW)? else {
         println!("no release has been published yet");
         return Ok(());
     };
@@ -211,14 +257,13 @@ pub fn update(check: bool, yes: bool) -> Result<()> {
         return Ok(());
     }
 
-    let tag = format!("v{}", show(latest));
     match &installed.how {
         Install::Github { owner, repo } => {
             // herdr asks before it runs anything: the commit, the build, the
             // actions. --yes is for a script that has already decided.
-            println!("\ninstalling {owner}/{repo} {tag} with herdr…");
+            println!("\ninstalling {owner}/{repo} at {reference} with herdr…");
             let mut cmd = Command::new(herdr_bin());
-            cmd.args(["plugin", "install", &format!("{owner}/{repo}"), "--ref", &tag]);
+            cmd.args(["plugin", "install", &format!("{owner}/{repo}"), "--ref", &reference]);
             if yes {
                 cmd.arg("--yes");
             }
@@ -238,12 +283,12 @@ pub fn update(check: bool, yes: bool) -> Result<()> {
     }
 
     println!(
-        "\nfleet {} is installed.\n\
-         - A fleet view that is already open still runs {}: press q in it, then prefix+f.\n\
-         - Agents use the new `fleet` from their next command, and get the new /board skill when they are next started.\n\
+        "\nfleet {new} is installed.\n\
+         - A fleet view that is already open still runs {old}: press q in it, then prefix+f.\n\
+         - Agents already running may keep {old} until they are next started; new agents get {new}.\n\
          - Run the \"fleet: check the setup\" action to see whether the new version wants anything changed.",
-        show(latest),
-        installed.version,
+        new = show(latest),
+        old = installed.version,
     );
     Ok(())
 }
@@ -266,6 +311,28 @@ mod tests {
         let out = "a\trefs/tags/v0.9.0\nb\trefs/tags/v0.10.0\nc\trefs/tags/v0.11.0-rc1\nd\trefs/tags/latest\n";
         assert_eq!(newest_tag(out), Some((0, 10, 0)));
         assert_eq!(newest_tag(""), None);
+    }
+
+    #[test]
+    fn the_release_branch_names_the_release_to_install() {
+        // v0.17.1 is tagged, but its binaries are not up yet: `release` is
+        // still at v0.17.0, an annotated tag, so it matches the peeled line.
+        let out = "b1\trefs/heads/release\n\
+                   a0\trefs/tags/v0.16.0\n\
+                   t1\trefs/tags/v0.17.0\n\
+                   b1\trefs/tags/v0.17.0^{}\n\
+                   c2\trefs/tags/v0.17.1\n";
+        assert_eq!(newest(out), Some(Release { version: (0, 17, 0), reference: "release".into() }));
+    }
+
+    #[test]
+    fn without_a_release_branch_the_newest_tag_is_installed() {
+        let out = "a0\trefs/tags/v0.16.0\nc2\trefs/tags/v0.17.1\n";
+        assert_eq!(newest(out), Some(Release { version: (0, 17, 1), reference: "v0.17.1".into() }));
+        // A branch at no release says nothing about the version.
+        let moved = format!("ff\trefs/heads/release\n{out}");
+        assert_eq!(newest(&moved), Some(Release { version: (0, 17, 1), reference: "v0.17.1".into() }));
+        assert_eq!(newest(""), None);
     }
 
     #[test]

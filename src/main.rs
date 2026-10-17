@@ -143,8 +143,8 @@ enum Command {
     },
     /// Every fleet there is, and the directory each one covers.
     Fleets,
-    /// Install the newest release of fleet. herdr has no update command;
-    /// this installs again, at the newest release, through herdr.
+    /// Install the newest release of fleet: again, through herdr, at the
+    /// `release` branch, which `herdr plugin update` follows from then on.
     Update {
         /// Only say which version is installed and which is the newest.
         #[arg(long)]
