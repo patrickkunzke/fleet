@@ -116,10 +116,11 @@ The chief's own session draws the fleet, in place of the fleet tab:
 
 Two things to know:
 
-- **Trust the workspace once.** Claude Code refuses to start a background
-  session in a folder it has not been trusted in. Trust carries down to the
-  folders inside, so running `claude` once in the workspace and accepting the
-  prompt covers every repository in it.
+- **Trust each repository once.** Claude Code refuses to start a background
+  session in a folder it has not been trusted in. Trust in the workspace does
+  not carry into a repository inside it that has a git root of its own, so
+  run `claude` once in each repository an agent will work in and accept the
+  prompt. When a spawn is refused, fleet names the repository to trust.
 - **Messages need the mod.** A background session has no prompt to type a
   message at, so an agent whose mod is not checking in (mods turned off, or
   Claude Code older than v2.1.287) only finds its messages on the board.
