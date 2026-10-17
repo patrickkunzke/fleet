@@ -9,6 +9,7 @@ function session(on: On) {
   const set: Record<string, string | undefined> = {}
   const submitted: string[] = []
   const registered: string[] = []
+  const commands: string[] = []
   on('process.run', ($, e) => {
     const argv = [...e.argv]
     ran.push(argv)
@@ -28,7 +29,10 @@ function session(on: On) {
   on('session.root', () => ({ value: '/w/acme' }))
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200_000, percent: 12 }, rateLimits: [] } }))
-  on('command.register', () => ({ value: undefined }))
+  on('command.register', ($, e) => {
+    commands.push(e.name)
+    return { value: undefined }
+  })
   on('tool.register', ($, e) => {
     registered.push(e.name)
     return { value: undefined }
@@ -41,7 +45,7 @@ function session(on: On) {
   on('prompt.read', () => ({ value: { text: '', cursor: 0 } }))
   on('tool.call', () => ({ result: 'ran' }))
   on('tool.check', () => ({ decision: 'ask' as const }))
-  return { ran, set, submitted, registered }
+  return { ran, set, submitted, registered, commands }
 }
 
 test('an ordinary session with the plugin runs nothing until /fleet start', async ($, on) => {
@@ -151,4 +155,24 @@ test('/fleet start fetches the fleet that matches the plugin when it has none', 
   expect(adopt?.[0]).toMatch(/\/bin\/fleet$/)
   expect(fetched).toBe(true)
   expect(said.text).toContain('chief of /w/acme')
+})
+
+test('a session the desktop app hosts starts the mod once the app attaches; a -p run never does', async ($, on) => {
+  mock.env(on, { PATH: '/usr/bin', FLEET_BIN: 'fleet', FLEET_DB: '/tmp/fleet.db' })
+  const clock = mock.clock(on)
+  const { ran, commands } = session(on)
+  let surfaces: ('desktop')[] = []
+  on('session.surfaces', () => ({ value: surfaces }))
+
+  // Through the SDK, as the desktop app and `claude -p` both start it.
+  await $.session.start({ cwd: '/w/acme', surface: null, isInteractive: false })
+  await clock.advance(10_000)
+  expect(commands).toEqual([])
+  expect(ran).toEqual([])
+
+  surfaces = ['desktop']
+  await clock.advance(1_000)
+  expect(commands).toEqual(['fleet'])
+  await clock.advance(3_000)
+  expect(ran.some(argv => argv[2] === 'inbox')).toBe(true)
 })

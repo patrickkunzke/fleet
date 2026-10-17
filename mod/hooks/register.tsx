@@ -466,97 +466,113 @@ export const register: Register = on => {
   const running: string[] = []
 
   on('session.start', async ($, e, next) => {
-    if (!e.isInteractive) return next(e)
-    const id = await $.session.id()
-    session = id
-    // /fleet, in every session with the plugin: in one fleet started it
-    // shows the fleet, in any other `/fleet start` makes it the chief.
-    try {
-      await $.command.register({ name: 'fleet', description: 'Show the fleet, or `/fleet start` to make this session its chief', argumentHint: '[start]' })
-    } catch {
-      // A command of that name already: the band and toasts still work.
-    }
-
-    // A session fleet started has a board from the start. Any other waits
-    // for /fleet start, and the timers below do nothing until then.
-    active = Boolean(await $.env.get('FLEET_DB'))
-    // The board as tools. Which ones the chief alone may use is settled when
-    // they are called: a session is put on the board, and so has a role,
-    // only after it starts.
-    if (active) await registerTools($)
-
-    const check = async () => {
-      if (!active || checking) return
-      checking = true
+    // The mod's work starts once a person can be at the session: at once in
+    // the terminal, and once a surface attaches where the desktop app hosts
+    // the session through the SDK, which starts it with no surface and not
+    // interactive. A `claude -p` run never has one, and is left alone.
+    const boot = async () => {
+      const id = await $.session.id()
+      session = id
+      // /fleet, in every session with the plugin: in one fleet started it
+      // shows the fleet, in any other `/fleet start` makes it the chief.
       try {
-        // A draft in the prompt box: the person is mid-sentence, and a
-        // message submitted now would go out with what they typed so far.
-        const drafting = (await $.prompt.read()).text.trim() !== ''
-        const take = !busy && !pending && !drafting
-        const argv = ['fleet', 'board', 'inbox', '--session', id]
-        if (take) argv.push('--take')
-        const tool = running.at(-1)
-        if (tool) argv.push('--tool', tool)
-        try {
-          const { context } = await $.session.usage()
-          if (context.percent !== undefined) argv.push('--context', String(Math.round(context.percent)))
-        } catch {
-          // No reading yet, before the first answer: nothing to say.
-        }
-        const out = await $.process.run(argv, { timeoutMs: 10_000 })
-        if (out.exitCode !== 0) return
-        const inbox = JSON.parse(out.stdout) as Inbox
-        if (inbox.text) {
-          pending = true
-          // Not awaited: it resolves when the turn starts, and the mailbox
-          // has to keep checking in meanwhile or the board stops trusting it.
-          $.prompt.submit({ text: inbox.text }).then(
-            () => { pending = false },
-            () => { pending = false },
-          )
-        }
-        const parts: string[] = []
-        if (inbox.awaiting_go) parts.push(`waiting for a go on ${inbox.awaiting_go}`)
-        if (inbox.waiting > 0) {
-          const until = busy || pending ? 'this turn to end' : 'your draft to be sent'
-          parts.push(`${inbox.waiting} ${inbox.waiting === 1 ? 'message' : 'messages'} waiting for ${until}`)
-        }
-        $.ui.status(parts.length ? parts.join(' · ') : undefined)
+        await $.command.register({ name: 'fleet', description: 'Show the fleet, or `/fleet start` to make this session its chief', argumentHint: '[start]' })
       } catch {
-        // fleet not on PATH, a board locked past the timeout, output that is
-        // not JSON: the next check tries again, and while none succeeds the
-        // board falls back to typing.
-      } finally {
-        checking = false
+        // A command of that name already: the band and toasts still work.
       }
+
+      // A session fleet started has a board from the start. Any other waits
+      // for /fleet start, and the timers below do nothing until then.
+      active = Boolean(await $.env.get('FLEET_DB'))
+      // The board as tools. Which ones the chief alone may use is settled when
+      // they are called: a session is put on the board, and so has a role,
+      // only after it starts.
+      if (active) await registerTools($)
+
+      const check = async () => {
+        if (!active || checking) return
+        checking = true
+        try {
+          // A draft in the prompt box: the person is mid-sentence, and a
+          // message submitted now would go out with what they typed so far.
+          const drafting = (await $.prompt.read()).text.trim() !== ''
+          const take = !busy && !pending && !drafting
+          const argv = ['fleet', 'board', 'inbox', '--session', id]
+          if (take) argv.push('--take')
+          const tool = running.at(-1)
+          if (tool) argv.push('--tool', tool)
+          try {
+            const { context } = await $.session.usage()
+            if (context.percent !== undefined) argv.push('--context', String(Math.round(context.percent)))
+          } catch {
+            // No reading yet, before the first answer: nothing to say.
+          }
+          const out = await $.process.run(argv, { timeoutMs: 10_000 })
+          if (out.exitCode !== 0) return
+          const inbox = JSON.parse(out.stdout) as Inbox
+          if (inbox.text) {
+            pending = true
+            // Not awaited: it resolves when the turn starts, and the mailbox
+            // has to keep checking in meanwhile or the board stops trusting it.
+            $.prompt.submit({ text: inbox.text }).then(
+              () => { pending = false },
+              () => { pending = false },
+            )
+          }
+          const parts: string[] = []
+          if (inbox.awaiting_go) parts.push(`waiting for a go on ${inbox.awaiting_go}`)
+          if (inbox.waiting > 0) {
+            const until = busy || pending ? 'this turn to end' : 'your draft to be sent'
+            parts.push(`${inbox.waiting} ${inbox.waiting === 1 ? 'message' : 'messages'} waiting for ${until}`)
+          }
+          $.ui.status(parts.length ? parts.join(' · ') : undefined)
+        } catch {
+          // fleet not on PATH, a board locked past the timeout, output that is
+          // not JSON: the next check tries again, and while none succeeds the
+          // board falls back to typing.
+        } finally {
+          checking = false
+        }
+      }
+
+      $.clock.every(EVERY, () => { void check() })
+      void check()
+
+      // The chief's view, in every fleet session, since which one is the chief
+      // is only known once the board has linked it.
+      const watch = $.clock.every(EVERY, async () => {
+        if (!active || isWorker || looking) return
+        looking = true
+        try {
+          const s = await look($, id)
+          if (!s) return
+          if (s.me?.role === 'worker') {
+            isWorker = true
+            watch.cancel()
+            return
+          }
+          // Not linked yet: a session is put on the board a few seconds after
+          // it starts.
+          if (s.me?.role !== 'chief') return
+          await update($, snapshot, () => s)
+          seen = notify($, s, seen)
+
+        } finally {
+          looking = false
+        }
+      })
     }
 
-    $.clock.every(EVERY, () => { void check() })
-    void check()
-
-    // The chief's view, in every fleet session, since which one is the chief
-    // is only known once the board has linked it.
-    const watch = $.clock.every(EVERY, async () => {
-      if (!active || isWorker || looking) return
-      looking = true
-      try {
-        const s = await look($, id)
-        if (!s) return
-        if (s.me?.role === 'worker') {
-          isWorker = true
-          watch.cancel()
-          return
-        }
-        // Not linked yet: a session is put on the board a few seconds after
-        // it starts.
-        if (s.me?.role !== 'chief') return
-        await update($, snapshot, () => s)
-        seen = notify($, s, seen)
-
-      } finally {
-        looking = false
-      }
-    })
+    // A surface already attached: the desktop app's session, reloaded.
+    if (e.isInteractive || (await $.session.surfaces()).length > 0) {
+      await boot()
+    } else {
+      const wait = $.clock.every(1_000, async () => {
+        if ((await $.session.surfaces()).length === 0) return
+        wait.cancel()
+        await boot()
+      })
+    }
     return next(e)
   })
 
