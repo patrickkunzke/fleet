@@ -205,3 +205,22 @@ test("the band opens the fleet pane while it is closed, and says /fleet once it 
   expect(await after.find({ key: 'fleet-open' })).toBeUndefined()
   expect(await after.find({ text: '/fleet' })).toBeDefined()
 })
+
+test('the band offers the pane again when the desktop put it away without closing it', async ($, on) => {
+  mock.env(on, { FLEET_DB: '/tmp/fleet.db' })
+  const clock = mock.clock(on)
+  board(on, { now: chiefSees() })
+  let panes = [{ id: 'fleet', title: 'fleet', isShown: true, isFocused: false, isPlaced: true }]
+  on('ui.panes', () => ({ value: panes }))
+
+  await $.session.start(start)
+  await clock.advance(3_000)
+  const band = await $.ui.mount({ plugin: 'fleet', surface: 'desktop', component: 'AbovePrompt', props: { hasSurvey: false, bodyColumns: 120 } as never })
+  expect(await band.find({ key: 'fleet-open' })).toBeUndefined()
+
+  // No ui.close: the panel was put away, and the engine lists no pane.
+  panes = []
+  await clock.advance(3_000)
+  const later = await $.ui.mount({ plugin: 'fleet', surface: 'desktop', component: 'AbovePrompt', props: { hasSurvey: false, bodyColumns: 120 } as never })
+  expect(await later.find({ key: 'fleet-open' })).toBeDefined()
+})

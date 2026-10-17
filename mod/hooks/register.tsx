@@ -454,6 +454,21 @@ async function adopt($: EngineInterface, session: string): Promise<{ root: strin
   return { root }
 }
 
+/**
+ * Whether the fleet pane is up, as the engine has it: the desktop app's
+ * panel can be put away without the pane being closed, so `ui.close` alone
+ * does not say. Kept in `paneOpen`, which redraws the band when it changes.
+ */
+async function paneShown($: EngineInterface): Promise<boolean> {
+  try {
+    const up = (await $.ui.panes()).some(p => p.id === PANE && p.isShown && p.isPlaced)
+    if (up !== (await read($, paneOpen))) await update($, paneOpen, () => up)
+    return up
+  } catch {
+    return read($, paneOpen)
+  }
+}
+
 /** Open the fleet pane; whether it is drawn now. */
 async function openPane($: EngineInterface): Promise<boolean> {
   const opened = await $.ui.open({ id: PANE, title: 'fleet' })
@@ -645,6 +660,7 @@ export const register: Register = on => {
           // it starts.
           if (s.me?.role !== 'chief') return
           await update($, snapshot, () => s)
+          await paneShown($)
           seen = notify($, s, seen)
 
         } finally {
@@ -955,7 +971,7 @@ export const register: Register = on => {
     const s = await read($, snapshot)
     if (!s || s.me?.role !== 'chief') return next(e)
     const crew = s.agents.filter(a => a.role === 'worker')
-    const isOpen = await read($, paneOpen)
+    const isOpen = await paneShown($)
     // Nothing to count and the pane is up: the band has nothing to add.
     if (crew.length === 0 && isOpen) return next(e)
     const want = needs(s)
