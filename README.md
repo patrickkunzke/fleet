@@ -142,9 +142,10 @@ agents do from there.
 ### In herdr
 
 ```bash
-herdr plugin install patrickkunzke/fleet
+herdr plugin install patrickkunzke/fleet --ref release
 ```
 
+`release` is the branch at the newest release whose prebuilt binaries are up.
 herdr shows what it is about to run, clones the repository and runs its
 build step, `scripts/install.sh`. That downloads the release's prebuilt
 binary for your machine and checks it against the release's `SHA256SUMS`; it
@@ -189,40 +190,53 @@ skill loaded (as `fleet:board`, through Claude Code's `--plugin-dir`, for that
 session only) and fleet first on its PATH. Your own Claude Code sessions are
 left as they were: the board is for the crew.
 
-To run `fleet` from your own shell as well:
+To run `fleet` from your own shell as well, put this on your PATH as
+`~/.local/bin/fleet`:
 
-```bash
-ln -s "$(ls -d ~/.config/herdr/plugins/github/fleet-* | head -1)/target/release/fleet" ~/.local/bin/fleet
+```sh
+#!/bin/sh
+# fleet as herdr has it installed: herdr 0.9.4 and newer put every update
+# in a directory of its own, so a link to one would go stale.
+root=$(herdr plugin list --plugin fleet --json | sed -n 's/.*"plugin_root":"\([^"]*\)".*/\1/p')
+exec "$root/target/release/fleet" "$@"
 ```
-
-herdr keeps the plugin in the same directory across updates, so the link
-keeps working.
 
 ### Updating
 
-herdr has no update command of its own, so fleet has one:
+With herdr 0.9.4 or newer, and fleet installed at `release`:
+
+```bash
+herdr plugin update fleet
+```
+
+`herdr plugin update` follows the ref fleet was installed at. An install at a
+tag (`--ref v0.16.0`, which older `fleet update`s made) stays at that tag:
+run `fleet update` once to move it to `release`. On any herdr:
 
 ```bash
 fleet update --check   # the installed version and the newest release
 fleet update           # install the newest release
 ```
 
-It installs again through herdr at the newest release tag (`vX.Y.Z`), so
-herdr shows what it is about to run, as on the first install. herdr builds
-the new version beside the old one and swaps it in only when the build
-passes: a failed update leaves the fleet you had. For a checkout linked with
-`herdr plugin link`, it pulls `main` and builds instead, and stops if the
-checkout is on another branch or has uncommitted changes.
+It installs again through herdr at `release`, so herdr shows what it is about
+to run, as on the first install, and `herdr plugin update` follows the branch
+from then on. herdr builds the new version beside the old one and switches to
+it only when the build passes: a failed update leaves the fleet you had. For a
+checkout linked with `herdr plugin link`, it pulls `main` and builds instead,
+and stops if the checkout is on another branch or has uncommitted changes;
+`herdr plugin update` leaves a linked checkout alone.
 
 Without `fleet` on your PATH, the same thing by hand:
 
 ```bash
-herdr plugin install patrickkunzke/fleet
+herdr plugin install patrickkunzke/fleet --ref release
 ```
 
 After an update, a fleet view that is already open still runs the old
-version: press `q` in it, then `prefix+f`. The agents use the new `fleet` from
-their next command. The doctor action says when a newer release is out.
+version: press `q` in it, then `prefix+f`. Agents that are already running
+may keep the old `fleet` until they are next started: herdr 0.9.4 and newer
+leave the old version's directory in place, on their PATH, until its server
+stops. The doctor action says when a newer release is out.
 
 ## Quick start
 
@@ -510,11 +524,12 @@ It raises the version in `Cargo.toml`, `Cargo.lock` and `herdr-plugin.toml`,
 adds the release's section to [CHANGELOG.md](CHANGELOG.md) from the commits
 ([git-cliff](https://git-cliff.org), `cliff.toml`), commits that as
 `chore(release): vX.Y.Z`, tags it, and publishes the GitHub Release.
-`fleet update` moves users to it.
 
 Then `binaries.yml` builds fleet for macOS and Linux (static, musl), on arm64
 and x86_64, and uploads the four binaries and their `SHA256SUMS` to the
 release. That takes a few minutes; an install in between builds from source.
+Once they are up, it moves the `release` branch to the release, which is what
+`fleet update` and `herdr plugin update` install.
 To give an existing release its binaries, run the workflow by hand:
 `gh workflow run binaries.yml -f tag=v0.2.1`.
 

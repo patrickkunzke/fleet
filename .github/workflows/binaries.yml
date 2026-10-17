@@ -76,3 +76,27 @@ jobs:
           sha256sum fleet-* > SHA256SUMS
           cat SHA256SUMS
           gh release upload "$TAG" -R "$GITHUB_REPOSITORY" SHA256SUMS --clobber
+
+  # `release` is what `fleet update` installs and `herdr plugin update`
+  # follows from then on, so it moves only once the binaries and their sums
+  # are up: an update in between would build from source. A run by hand for
+  # an older release leaves it where it is.
+  release-branch:
+    needs: checksums
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          set -eu
+          newest=$(git ls-remote --tags --refs "https://github.com/$GITHUB_REPOSITORY.git" 'refs/tags/v*' |
+            sed 's|.*refs/tags/||' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
+          if [ "$TAG" != "$newest" ]; then
+            echo "$TAG is not the newest release ($newest); release stays where it is"
+            exit 0
+          fi
+          sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" -q .sha)
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/release" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/heads/release" -f sha="$sha" -F force=true >/dev/null
+          else
+            gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" -f ref=refs/heads/release -f sha="$sha" >/dev/null
+          fi
+          echo "release is at $TAG ($sha)"
