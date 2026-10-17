@@ -219,10 +219,10 @@ export function crewPane(el: ElementTable<'mobile'>, s: Snapshot, act: CrewActio
         <Box flexDirection="column">
           <Text bold dimColor>LATEST</Text>
           {s.events.filter(e => e.kind === 'message').slice(0, RECENT).map(e => (
-            <Box key={`event-${e.key}`} flexDirection="row" columnGap={1}>
-              <Text dimColor>{`${e.from ?? '?'} → ${e.to ?? '?'}`}</Text>
-              <Text wrap="truncate-end">{e.summary}</Text>
-            </Box>
+            <Text key={`event-${e.key}`} wrap="truncate-end">
+              <Text dimColor>{`${e.from ?? '?'} → ${e.to ?? '?'}  `}</Text>
+              {e.summary}
+            </Text>
           ))}
         </Box>
       )}
