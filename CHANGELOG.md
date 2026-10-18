@@ -4,6 +4,12 @@ Every release of fleet. Each section is written when a pull request with a
 `feat`, `fix` or `perf` commit is merged; see
 [Releases](README.md#releases).
 
+## [0.18.1](https://github.com/patrickkunzke/fleet/releases/tag/v0.18.1) — 2026-10-18
+
+### Fixes
+
+- **mod:** Fetch fleet again when bin/fleet is another version than the plugin
+
 ## [0.18.0](https://github.com/patrickkunzke/fleet/releases/tag/v0.18.0) — 2026-10-17
 
 ### Features
