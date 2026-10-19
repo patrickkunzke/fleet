@@ -111,52 +111,64 @@ works through the model.
 Updated after the probe (see "Probe results" below).
 
 Build (b) as a host that the user turns on, `FLEET_HOST=desktop`. Keep
-`background` as the default outside herdr. The chief runs in auto mode, and
-in auto mode only the model's own call to `start_session` gets through. So
-build `/fleet spawn` as a prompt command (a markdown command in the plugin)
-that the model carries out:
+`background` as the default outside herdr. The chief runs in auto mode.
 
-1. The user types `/fleet spawn <name>` (or `/fleet spawn` for every pending
-   agent) in the desktop chief. The command expands to a prompt that tells
-   the model to call `start_session` with `initiation: "user_asked"`, `cwd`
-   (the worker's repo, which can be any repo, not the chief's), `title`,
-   `name`, `prompt` and `background`. The arguments come from `fleet board
-   spawn --host desktop`, which registers the agent and prints them. The
-   model only copies them. The probe did this in auto mode, with no dialog
-   and no change of mode.
-2. The worker's brief cannot start with a slash command: the app wraps the
-   prompt. So the mod registers a tool, `mcp__fleet__join`, and the brief
-   tells the model to call it first with the run and the agent's name. The
-   tool does what `/fleet join` was meant to do: it records the worker's CLI
-   session id (`$.session.id()`), sets `FLEET_DB` and `FLEET_RUN`, and starts
-   the check-in. A `prompt.submit` hook that finds the join line in the
-   wrapped brief could do the same without the model. That is not tested.
-3. Store two ids on the board: the desktop id from the `start_session`
-   result (`local_…`, for `list_sessions`, `stop_session` and
-   `archive_session`) and the CLI session id from the join (for
-   `$.session.send`). They are different ids.
-4. Chief-to-worker messages go through `$.session.send({ to: { sessionId:
-   <CLI id> } })`. The model's SendMessage to the `local_…` id also works.
-5. A start that the chief wants on a turn the user did not start (a worker
-   reported "done") is not possible, not even as a card, because a card
-   cannot carry `cwd`. In that case the chief tells the user to run
-   `/fleet spawn <name>`. Add this to the chief's brief.
+The rule that shapes the design: the app starts a session only on a turn
+that the user's own message started. The chief's model may make the call
+itself, in auto mode, with no dialog. On a turn that a worker's report
+started, the app refuses the start and allows no card for another repo. So
+the chief starts every worker at the one moment the user is surely there:
+when the user approves the plan.
 
-Two things to settle while building:
+1. **Start all workers at plan approval.** The chief plans the epic and puts
+   it on the board, then shows the plan to the user. On the user's reply
+   ("go", or any approval), the chief runs `fleet board spawn --host desktop`
+   for each agent. The command registers the agent and prints the arguments
+   for `start_session`. The chief's model calls `start_session` once for each
+   worker on that same turn, with `initiation: "user_asked"` and `cwd` set to
+   the worker's repo. The repo can be any repo, not only the chief's. A
+   worker whose tasks are still blocked starts too and waits.
+2. **Workers join with a tool.** The brief cannot start with a slash command,
+   because the app wraps the prompt. So the mod registers `mcp__fleet__join`,
+   and the brief tells the model to call it first with the run and the
+   agent's name. The tool records the worker's CLI session id
+   (`$.session.id()`), sets `FLEET_DB` and `FLEET_RUN`, and starts the
+   check-in. A worker with nothing ready then ends its turn and stays idle.
+3. **Release waiting workers with a message.** When a blocker clears, the
+   chief's mod sends the worker "go" with `$.session.send({ to: { sessionId:
+   <CLI id> } })`. That starts a turn in the idle worker. The model's
+   SendMessage to the worker's `local_…` id also works.
+4. **Store two ids on the board.** The desktop id from the `start_session`
+   result (`local_…`) is for `list_sessions`, `stop_session` and
+   `archive_session`. The CLI session id from the join is for
+   `$.session.send`. They are different ids.
+5. **Fallback: ask the user.** When the plan changes and needs a worker that
+   nobody started, and the chief is on a turn that a worker's report started,
+   the chief asks the user. The user answers with a plain "yes", and the
+   chief starts the worker on that turn. A `/fleet spawn <name>` prompt
+   command (a markdown command in the plugin) does the same for a user who
+   wants to start one by hand.
 
-- **Auto mode.** A direct call from the mod (`$.mcp.call` or `$.tool.call`)
-  is refused in auto mode, because the classifier has no request to judge.
-  It works only in a chief that is not in auto mode. Do not make the mod
-  approve its own call in a `tool.check` hook to get past the classifier.
-  That is a bypass of auto mode, and the classifier refused even to write
-  that probe. A `/fleet spawn` that is a hooks command cannot hand the work
-  to the model either: `$.prompt.submit` from a `command.run` hook is
-  refused.
+Settle these while building:
+
+- **Messages on a worker's turn.** The probe sent messages only on turns the
+  user started. The refusal it found is for starting sessions, so a message
+  from the chief on a turn that a worker's report started should work. Test
+  it before relying on step 3.
+- **Trust.** Each repo needs one "Trust repository" click before the first
+  start. The chief should start one worker per untrusted repo first, so the
+  user sees each button once, and retry after the click.
+- **No direct calls from the mod.** A direct `$.mcp.call` or `$.tool.call` to
+  `start_session` is refused in auto mode, because the classifier has no
+  request to judge. Do not make the mod approve its own call in a
+  `tool.check` hook to get past the classifier. That is a bypass of auto
+  mode. `$.prompt.submit` from a `command.run` hook is refused too.
 - **Where the mod comes from.** A worker loads fleet's mod only from an
-  installed plugin or from the repo's project folder. The `start_session`
-  session gets a new worktree, and untracked files in the repo do not go into
-  it, but the probe mod in `<repo>/.claude/skills/` still loaded there. The
-  installed plugin (PR #25) is the safe source.
+  installed plugin or from the repo's project folder. The installed plugin
+  (PR #25) is the safe source.
+- **Idle workers.** A worker that waits costs nothing while it is idle, but
+  it is in the sidebar from the start. Its title should say that it waits,
+  for example `w3 (waiting on api)`.
 
 Until then, add the Import line to the README, so that the user can at least
 read retired workers' conversations in the sidebar.
