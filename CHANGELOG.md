@@ -4,6 +4,16 @@ Every release of fleet. Each section is written when a pull request with a
 `feat`, `fix` or `perf` commit is merged; see
 [Releases](README.md#releases).
 
+## [0.19.0](https://github.com/patrickkunzke/fleet/releases/tag/v0.19.0) — 2026-10-19
+
+### Features
+
+- Desktop host, workers as desktop app sessions the chief starts
+
+### Fixes
+
+- **mod:** Register the join tool before a surface attaches
+
 ## [0.18.1](https://github.com/patrickkunzke/fleet/releases/tag/v0.18.1) — 2026-10-18
 
 ### Fixes
