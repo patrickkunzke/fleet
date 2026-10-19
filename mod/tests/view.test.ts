@@ -98,21 +98,48 @@ test("the chief's pane is the fleet tab, live: frames in, keys and clicks out", 
   expect(gone).toEqual([['fleet', 'board', 'go', 'ENG-1-1']])
 })
 
-test("the band above the chief's prompt says who needs something", async ($, on) => {
+test("the band above the chief's prompt is one quiet line, and a second for the most urgent ask", async ($, on) => {
   mock.env(on, { FLEET_DB: '/tmp/fleet.db' })
   const clock = mock.clock(on)
-  board(on, { now: chiefSees() })
+  const { gone } = board(on, { now: chiefSees() })
 
   await $.session.start(start)
   await clock.advance(3_000)
 
-  const band = await $.ui.mount({ plugin: 'fleet', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false, bodyColumns: 120 } as never })
-  const said = (await band.findAll({ type: 'Text' })).map(t => t.text).join('')
-  expect(said).toContain('2 agents')
-  expect(said).toContain('1 working')
-  expect(said).toContain('2 open')
-  expect(said).toContain('billing needs a go')
-  expect(said).toContain('accounts at 84%')
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const band = await $.ui.mount({ plugin: 'fleet', surface, component: 'AbovePrompt', props: { hasSurvey: false, bodyColumns: 120 } as never })
+    const said = (await band.findAll({ type: 'Text' })).map(t => t.text).join('|')
+    // A dot per agent: billing waits for a go, accounts works.
+    expect(said).toContain('◆|●')
+    expect(said).toContain('1 working')
+    expect(said).toContain('0 idle')
+    expect(said).toContain('2 open')
+    // The go first, in billing's own words, and the handoff counted after it.
+    expect(said).toContain('▲ billing')
+    expect(said).toContain('plan: add the column')
+    expect(said).toContain('+1 more')
+    expect(said).not.toContain('84%')
+    expect(await band.find({ key: 'handoff-accounts' })).toBeUndefined()
+    await band.press({ key: 'go-billing' })
+  }
+  expect(gone).toEqual([['fleet', 'board', 'go', 'ENG-1-1'], ['fleet', 'board', 'go', 'ENG-1-1']])
+})
+
+test('with nothing waiting the band is the one line', async ($, on) => {
+  mock.env(on, { FLEET_DB: '/tmp/fleet.db' })
+  const clock = mock.clock(on)
+  const calm = chiefSees()
+  calm.agents[1]!.awaiting_go = null
+  calm.agents[2]!.context = 40
+  board(on, { now: calm })
+
+  await $.session.start(start)
+  await clock.advance(3_000)
+  const band = await $.ui.mount({ plugin: 'fleet', surface: 'desktop', component: 'AbovePrompt', props: { hasSurvey: false, bodyColumns: 120 } as never })
+  const said = (await band.findAll({ type: 'Text' })).map(t => t.text).join('|')
+  expect(said).not.toContain('▲')
+  expect(said).toContain('1 idle')
+  expect(await band.find({ key: 'fleet-open' })).toBeDefined()
 })
 
 test('what was already on the board is not news; what comes after is, once', async ($, on) => {
@@ -163,11 +190,17 @@ for (const surface of ['desktop', 'mobile'] as const) {
     await clock.advance(3_000)
     const ui = await $.ui.mount({ plugin: 'fleet', surface, component: 'Pane', requestId: 'fleet', props: { bodyColumns: 90 } as never })
 
-    // The crew as a graph, described for a reader that cannot see it.
-    const svg = await ui.find({ type: 'Svg' })
-    expect(svg).toBeDefined()
-    expect(String(svg?.props?.alt)).toContain('billing ◇ needs a go')
-    expect(String(svg?.props?.source)).toContain('<svg')
+    // The crew as a graph, described for a reader that cannot see it: on
+    // the desktop by default, off on a phone.
+    const svg = (await ui.findAll({ type: 'Svg' })).find(e => String(e.props?.alt).startsWith('The crew'))
+    if (surface === 'desktop') {
+      expect(String(svg?.props?.alt)).toContain('billing ◇ needs a go')
+      expect(String(svg?.props?.source)).toContain('<svg')
+    } else {
+      expect(svg).toBeUndefined()
+    }
+    // A context bar per agent.
+    expect((await ui.findAll({ type: 'Svg' })).some(e => e.props?.alt === '84% of its context used')).toBe(true)
 
     const said = (await ui.findAll({ type: 'Text' })).map(t => t.text).join(' | ')
     expect(said).toContain('2 agents')
@@ -177,6 +210,14 @@ for (const surface of ['desktop', 'mobile'] as const) {
     expect(said).toContain('claude attach 5cba7f8f')
     expect(said).toContain('needs the flag')
     expect(said).toContain('plan: add the column')
+    expect(said).toContain('NEEDS YOU')
+    expect(said).toContain('is at 84% context and will compact soon.')
+    expect(said).toContain('blocked · 1')
+    expect(said.indexOf('NEEDS YOU')).toBeLessThan(said.indexOf('CREW'))
+    expect(said.indexOf('CREW')).toBeLessThan(said.indexOf('TASKS'))
+    expect(said.indexOf('blocked · 1')).toBeLessThan(said.indexOf('queued · 1'))
+    expect(said.indexOf('TASKS')).toBeLessThan(said.indexOf('LATEST'))
+    expect((await ui.find({ type: 'Markdown' }))?.props?.text).toBe('### Fleet')
 
     // Nothing of the terminal's: no fleet view behind it.
     expect(await ui.find({ type: 'Client' })).toBeUndefined()
@@ -223,4 +264,75 @@ test('the band offers the pane again when the desktop put it away without closin
   await clock.advance(3_000)
   const later = await $.ui.mount({ plugin: 'fleet', surface: 'desktop', component: 'AbovePrompt', props: { hasSurvey: false, bodyColumns: 120 } as never })
   expect(await later.find({ key: 'fleet-open' })).toBeDefined()
+})
+
+/** The live graph in a mounted pane, if it is drawn. */
+async function crewGraph(ui: { findAll: (q: { type: 'Svg' }) => Promise<{ props?: Record<string, unknown> }[]> }) {
+  return (await ui.findAll({ type: 'Svg' })).find(e => String(e.props?.alt).startsWith('The crew'))
+}
+
+test('the Graph button shows and hides the graph, remembered for the workspace', async ($, on) => {
+  mock.env(on, { FLEET_DB: '/tmp/fleet.db', HOME: '/home/me' })
+  mock.store(on)
+  const clock = mock.clock(on)
+  board(on, { now: chiefSees() })
+
+  await $.session.start({ ...start, surface: 'desktop' })
+  await clock.advance(3_000)
+  const pane = { plugin: 'fleet', component: 'Pane', requestId: 'fleet', props: { bodyColumns: 90 } as never } as const
+  const ui = await $.ui.mount({ ...pane, surface: 'desktop' })
+  expect(await crewGraph(ui)).toBeDefined()
+  await ui.press({ key: 'fleet-graph' })
+  await clock.advance(10)
+  expect(await crewGraph(ui)).toBeUndefined()
+  await ui.unmount()
+  // Drawn again later, it is still off.
+  const again = await $.ui.mount({ ...pane, surface: 'desktop' })
+  expect(await crewGraph(again)).toBeUndefined()
+
+  // The phone keeps its own: off until pressed there.
+  const phone = await $.ui.mount({ ...pane, surface: 'mobile' })
+  expect(await crewGraph(phone)).toBeUndefined()
+  await phone.press({ key: 'fleet-graph' })
+  await clock.advance(10)
+  expect(await crewGraph(phone)).toBeDefined()
+  expect(await crewGraph(again)).toBeUndefined()
+})
+
+test('a new message travels the graph as a dot for a minute; what was there before does not', async ($, on) => {
+  mock.env(on, { FLEET_DB: '/tmp/fleet.db', HOME: '/home/me' })
+  mock.store(on)
+  const clock = mock.clock(on)
+  const seen = { now: chiefSees() }
+  board(on, seen)
+
+  await $.session.start({ ...start, surface: 'desktop' })
+  await clock.advance(3_000)
+  const pane = { plugin: 'fleet', surface: 'desktop', component: 'Pane', requestId: 'fleet', props: { bodyColumns: 90 } as never } as const
+  const ui = await $.ui.mount(pane)
+  const before = String((await crewGraph(ui))?.props?.source)
+  expect(before).not.toContain('class="dot')
+  expect(before).toContain('quiet · no messages')
+
+  const next = chiefSees()
+  next.events.unshift(
+    { key: 'e2', kind: 'message', from: 'chief', to: 'accounts', task: 'ENG-1-2', summary: 'the flag is on', notice: null },
+    { key: 'e3', kind: 'message', from: 'accounts', to: 'billing', task: null, summary: 'column shared', notice: null },
+    { key: 'e4', kind: 'message', from: 'billing', to: 'chief', task: 'ENG-1-1', summary: 'plan updated', notice: null },
+  )
+  seen.now = next
+  await clock.advance(3_000)
+  const g = await crewGraph(ui)
+  const live = String(g?.props?.source)
+  expect(live).toContain('class="dot down"')
+  expect(live).toContain('class="dot up"')
+  expect(live).toContain('@keyframes')
+  expect(live).toContain('live · 3 messages in the last minute')
+  expect(String(g?.props?.alt)).toContain('chief to accounts, accounts to billing, billing to chief')
+  // billing needs a go: its node pulses.
+  expect(live).toContain('class="pulse"')
+
+  await clock.advance(61_000)
+  const later = String((await crewGraph(ui))?.props?.source)
+  expect(later).not.toContain('class="dot')
 })

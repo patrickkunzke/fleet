@@ -35,7 +35,7 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { GraphSpan, Snapshot } from '../types'
 
-import { HIGH, crewPane } from './crew'
+import { HIGH, Seen, TONE, askButton, asks, crewPane, doing, dot } from './crew'
 
 /** How often the mailbox is checked. Well inside the board's fifteen. */
 const EVERY = 3_000
@@ -573,16 +573,6 @@ async function handoff($: EngineInterface, agent: string) {
 }
 
 /** What needs the user, for the band and its count. */
-function needs(s: Snapshot): string[] {
-  const out: string[] = []
-  for (const a of s.agents) {
-    if (a.waiting_for) out.push(`${a.name} at a ${a.waiting_for}`)
-    else if (a.awaiting_go && a.presence === 'waiting') out.push(`${a.name} needs a go`)
-    if (a.context !== null && a.context >= HIGH) out.push(`${a.name} at ${a.context}%`)
-  }
-  return out
-}
-
 /**
  * Toast what is new since `seen`, and return what holds now. `seen` is
  * undefined until the first read, which marks everything already there as
@@ -635,7 +625,10 @@ export const register: Register = on => {
   let shownNumber = -1
   // What has been toasted already: see notify.
   let seen: Set<string> | undefined
-
+  // When the pane first saw each message, for the graph's dots in flight,
+  // and the redraw that takes the youngest away once it has landed.
+  const arrived = new Seen()
+  let landing: { at: number; cancel: () => void } | undefined
 
   // A desktop worker, joined with `mcp__fleet__join`. Its messages come
   // from the chief's model, through the app: its mod leaves them on the board.
@@ -763,6 +756,7 @@ export const register: Register = on => {
           // Not linked yet: a session is put on the board a few seconds after
           // it starts.
           if (s.me?.role !== 'chief') return
+          arrived.track(s.events, await $.clock.now())
           await update($, snapshot, () => s)
           await paneShown($)
           seen = notify($, s, seen)
@@ -949,7 +943,35 @@ export const register: Register = on => {
     if (e.surface !== 'terminal') {
       const el = $.ui.resolve(e)
       if (!s) return <el.Text dimColor>Reading the board…</el.Text>
-      return crewPane(el, s, { go: task => void give($, task), handoff: agent => void handoff($, agent) }, e.props.bodyColumns ?? 80)
+      const now = await $.clock.now()
+      const at = arrived.track(s.events, now)
+      // The graph is remembered per workspace and surface; until it is
+      // pressed, it is on where there is room for it and off on a phone.
+      const key = `graph:${e.surface}:${await $.session.root()}`
+      const stored = await $.store.get(key).catch(() => undefined)
+      const showGraph = typeof stored === 'boolean' ? stored : e.surface !== 'mobile'
+      // Draw again once the youngest message in flight has landed.
+      const end = arrived.nextExpiry(now)
+      if (showGraph && end !== undefined && landing?.at !== end) {
+        landing?.cancel()
+        const timer = $.clock.after(end - now + 50, () => {
+          landing = undefined
+          $.ui.invalidate('ui.render')
+        })
+        landing = { at: end, cancel: () => timer.cancel() }
+      }
+      return crewPane(el, s, { go: task => void give($, task), handoff: agent => void handoff($, agent) }, {
+        columns: e.props.bodyColumns ?? 80,
+        showGraph,
+        toggleGraph: () => {
+          void (async () => {
+            await $.store.set(key, !showGraph).catch(() => undefined)
+            $.ui.invalidate('ui.render')
+          })()
+        },
+        seen: at,
+        now,
+      })
     }
     const { Box, Button, Client, Text } = $.ui.resolve(e)
     if (!s) return <Text dimColor>Reading the board…</Text>
@@ -1079,10 +1101,11 @@ export const register: Register = on => {
         }
       }
       return (
-        <Box flexDirection="row" columnGap={3} alignItems="center" borderStyle="round" borderColor="gray" paddingX={1} width={e.props.bodyColumns}>
+        <Box flexDirection="row" columnGap={2} alignItems="center" paddingX={1} width={e.props.bodyColumns}>
           <Text bold>fleet</Text>
-          {busy && <Text color="yellow">◌ Starting the fleet… the first time, fleet is downloaded too</Text>}
-          {!busy && <Text dimColor>This workspace runs as a fleet.</Text>}
+          {busy && <Text color="yellow">◌ Starting the fleet…</Text>}
+          {busy && <Text dimColor>The first start downloads fleet too.</Text>}
+          {!busy && <Box flexGrow={1}><Text dimColor>This workspace runs as a fleet.</Text></Box>}
           {!busy && <Button key="fleet-start" variant="primary" label="Start fleet" onPress={() => void start()} />}
         </Box>
       )
@@ -1094,27 +1117,42 @@ export const register: Register = on => {
     const isOpen = await paneShown($)
     // Nothing to count and the pane is up: the band has nothing to add.
     if (crew.length === 0 && isOpen) return next(e)
-    const want = needs(s)
+    const want = asks(s)
+    const top = want[0]
     const working = crew.filter(a => a.presence === 'working').length
-    const idle = crew.filter(a => a.presence === 'waiting').length
+    const idle = crew.filter(a => a.presence === 'waiting' && doing(a).tone === 'idle').length
     const open = s.tasks.length
+    const act = { go: (task: string) => void give($, task), handoff: (agent: string) => void handoff($, agent) }
+    const opener = isOpen ? <Text dimColor>/fleet</Text> : <Button key="fleet-open" label="Open fleet" onPress={() => void openPane($)} />
 
-    // A card: the fleet's numbers, and under them, only when there is any,
-    // what needs the user. The border turns yellow with it. As wide as the
-    // band, not its text.
+    // One quiet line while all is well: a dot per agent and the counts. Only
+    // the most urgent ask gets a second line, as a sentence with its button.
     return (
-      <Box flexDirection="column" borderStyle="round" borderColor={want.length > 0 ? 'yellow' : 'gray'} paddingX={1} width={e.props.bodyColumns}>
-        <Box flexDirection="row" columnGap={3}>
+      <Box flexDirection="column" paddingX={1} width={e.props.bodyColumns}>
+        <Box flexDirection="row" columnGap={2} alignItems="center">
           <Text bold>fleet</Text>
-          <Text>{`${crew.length} agent${crew.length === 1 ? '' : 's'}`}</Text>
-          <Text><Text color="green">●</Text>{` ${working} working`}</Text>
-          <Text><Text dimColor>○</Text>{` ${idle} idle`}</Text>
-          <Text>{`${open} open`}</Text>
-          {isOpen ? <Text dimColor>/fleet</Text> : <Button key="fleet-open" label="Open fleet" onPress={() => void openPane($)} />}
+          {crew.length === 0 ? (
+            <Box flexGrow={1}><Text dimColor>No agents yet. Tell the chief what you want done.</Text></Box>
+          ) : (
+            <Box flexDirection="row" columnGap={2} flexGrow={1} flexWrap="wrap">
+              <Text>{crew.map(a => <Text color={TONE[doing(a).tone]}>{dot(a)}</Text>)}</Text>
+              <Text>
+                {`${working} working`}
+                <Text dimColor> · </Text>
+                {`${idle} idle`}
+                <Text dimColor> · </Text>
+                {`${open} open`}
+              </Text>
+            </Box>
+          )}
+          {opener}
         </Box>
-        {want.length > 0 && (
-          <Box flexDirection="row" flexWrap="wrap" columnGap={3}>
-            {want.map(w => <Text color="yellow">{`▲ ${w}`}</Text>)}
+        {top && (
+          <Box flexDirection="row" columnGap={2} alignItems="center">
+            <Text color="yellow" bold>{`▲ ${top.agent}`}</Text>
+            <Box flexGrow={1} flexShrink={1}><Text>{top.text}</Text></Box>
+            {want.length > 1 && <Text dimColor>{`+${want.length - 1} more`}</Text>}
+            {askButton({ Button }, top, act, false)}
           </Box>
         )}
       </Box>
