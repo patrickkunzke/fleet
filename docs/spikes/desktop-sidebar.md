@@ -243,3 +243,43 @@ asked for. Two ways remain:
 If the mailbox works, the board does not need the CLI id to send messages.
 It still needs the id to link the session to its agent row. The mod uses the
 id for every inbox check (`--session`), so `join` must record it.
+
+So the desktop host releases a waiting worker through the chief's model: its
+`SendMessage` to the worker's `local_…` id, which the classifier judges like
+any other action of the chief's. The mailbox stays for background workers.
+
+## Built
+
+2026-10-19, on branch `feat/desktop-host`. What changed from the
+recommendation:
+
+- **Release by the chief's model, not by its mod.** `fleet board go` and
+  `fleet board msg` to a desktop worker record the message and print the
+  `SendMessage` the sender makes. A desktop worker's mod checks in but never
+  takes its inbox.
+- **`fleet spawn --host desktop`**, not `fleet board spawn`, next to the
+  other hosts. `FLEET_HOST=desktop` makes it the default, and it adds a
+  section to the chief's brief.
+- **`/fleet:spawn <name>`**, since a markdown command in a plugin is named
+  after the plugin.
+- **The join tool registers at session start.** The mod used to wait for a
+  surface before it did anything. A session that `start_session` starts has
+  none until the user opens it, so the first end-to-end run found no
+  `mcp__fleet__join`.
+
+The end-to-end run: this session was the chief, in auto mode, with
+`FLEET_HOST=desktop`, on a scratch fleet over `~/fleet-probe` with two tasks.
+E2E-2 in repo b waited on E2E-1 in repo a. The installed plugin was patched
+with the branch's mod and binary for the run, then restored.
+
+| Step | Turn started by | Result |
+| --- | --- | --- |
+| `fleet spawn wa/wb --host desktop`, then `start_session` with the printed arguments, then `fleet board agent <name> --target desktop:<local_id>` | the user's approval | Both started, nested under the chief. wb's title: `fleet: wb (waiting on E2E-1)`. |
+| The workers call `mcp__fleet__join` | the workers' first prompts | Both joined. The board holds each one's CLI id in `session_id` and its `local_…` id in the target. Each one sent its plan and waited. |
+| `fleet board go E2E-1`, then `SendMessage` to wa's `local_…` id | the workers' reports | wa started, committed `hello-a.txt` and marked E2E-1 done. |
+| `fleet board go E2E-2`, then `SendMessage` to wb | wa's report | wb committed `hello-b.txt` and marked E2E-2 done. |
+| `fleet board retire wa/wb` | wb's report | Each prints the `stop_session` and `archive_session` call to make. |
+
+Not tested: a chief that `/fleet start` made in the desktop app, rather than
+a session that ran fleet's commands itself; and compaction in a desktop
+worker.
