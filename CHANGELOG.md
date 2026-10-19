@@ -4,6 +4,12 @@ Every release of fleet. Each section is written when a pull request with a
 `feat`, `fix` or `perf` commit is merged; see
 [Releases](README.md#releases).
 
+## [0.20.0](https://github.com/patrickkunzke/fleet/releases/tag/v0.20.0) — 2026-10-19
+
+### Features
+
+- **mod:** Quiet band, roster pane and a live graph
+
 ## [0.19.0](https://github.com/patrickkunzke/fleet/releases/tag/v0.19.0) — 2026-10-19
 
 ### Features
