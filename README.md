@@ -128,6 +128,37 @@ Two things to know:
 `FLEET_HOST=herdr` or `FLEET_HOST=background` picks one instead of going by
 where fleet runs. The setup check's `running in` row says which it will use.
 
+### In the Claude desktop app's sidebar
+
+With `FLEET_HOST=desktop`, a chief in the Claude desktop app starts its
+agents as desktop sessions instead. Each one shows in the sidebar under the
+chief, where you open it and talk to it with a click. fleet cannot start a
+desktop session itself: the chief's model does, with the app's
+`start_session` tool, and the app allows that only on a turn your own
+message started. So the chief works this way:
+
+- It plans the whole piece of work on the board and shows you the plan. When
+  you approve it, it starts every worker the plan needs on that same turn,
+  also the ones whose tasks still wait. For each one,
+  `fleet spawn <name> --repo <path> --task <key> --host desktop` puts the
+  agent on the board and prints what the chief passes to `start_session`.
+- Each worker joins the board first, with fleet's `mcp__fleet__join` tool.
+  It reads its task, sends the chief its plan and waits for a go.
+- fleet cannot deliver a message to a desktop session. `fleet board go` and
+  `fleet board msg` record it and say what to send. The chief sends it with
+  `SendMessage` to the worker's `local_…` id, and that starts the worker's
+  turn.
+- When the plan needs a worker that nobody started, the chief asks you,
+  because the app refuses a start on a turn that a worker's report started.
+  You can also type `/fleet:spawn <name>`.
+- `fleet board retire` takes the worker off the board. The chief then stops
+  it with `stop_session` and archives it with `archive_session`.
+
+The app asks you to trust each repository once, before the first worker
+starts there. fleet must be installed as a Claude Code plugin, so that each
+worker loads its mod. After `fleet board retire`, the desktop app's Import
+also shows the conversations of background workers in the sidebar.
+
 ## Install
 
 ### As a Claude Code plugin, in any terminal
@@ -473,6 +504,7 @@ resumed into an empty session.
 | `~/.claude-fleet/auto-open` | directories whose new workspaces open in fleet mode |
 | `FLEET_CLAUDE` | the `claude` to start, by path. Otherwise `~/.local/bin/claude`, then whatever is on PATH |
 | `FLEET_DB` | the board a command uses. Set for every agent fleet starts |
+| `FLEET_HOST` | where agents run: `herdr`, `background` or `desktop`. Otherwise herdr inside it, background outside |
 | `FLEET_JSON=1` | JSON from `fleet board` reads |
 
 fleet keeps everything under `~/.claude-fleet`: each fleet's board, and the

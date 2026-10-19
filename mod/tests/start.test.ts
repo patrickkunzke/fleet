@@ -65,7 +65,8 @@ test('an ordinary session with the plugin runs nothing until /fleet start', asyn
 
   expect(edit.result).toBe('ran')
   expect(ran).toEqual([])
-  expect(registered).toEqual([])
+  // The join is there for a desktop session the chief starts; nothing else.
+  expect(registered).toEqual(['join'])
   const check = await $.tool.check({ tool: 'mcp__fleet__board_ls', input: {} })
   expect(check.decision).toBe('ask')
   const said = await $.command.run({ command: 'fleet', args: '' } as never)
