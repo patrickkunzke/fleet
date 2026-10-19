@@ -75,6 +75,23 @@ test('a desktop session joins the board with mcp__fleet__join', async ($, on) =>
   expect(again.result).toContain('already')
 })
 
+test('a desktop session nobody has opened yet joins, and starts checking in', async ($, on) => {
+  // The app starts it with no surface; the mod's work used to wait for one.
+  mock.env(on, { PATH: '/usr/bin', FLEET_BIN: 'fleet' })
+  const clock = mock.clock(on)
+  on('session.surfaces', () => ({ value: [] }))
+  const { ran, registered } = worker(on)
+
+  await $.session.start({ cwd: '/w/acme/api', surface: null, isInteractive: false } as never)
+  expect(registered).toEqual(['join'])
+  const joined = await $.tool.call({ tool: 'mcp__fleet__join', ...input } as never)
+
+  expect(joined.result).toContain('Joined')
+  expect(registered).toContain('board_done')
+  await clock.advance(3_000)
+  expect(ran.some(argv => argv[2] === 'inbox')).toBe(true)
+})
+
 test('a join the board refuses says why, and leaves the session out of the fleet', async ($, on) => {
   mock.env(on, { PATH: '/usr/bin', FLEET_BIN: 'fleet' })
   const clock = mock.clock(on)

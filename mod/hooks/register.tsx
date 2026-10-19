@@ -640,6 +640,10 @@ export const register: Register = on => {
   // A desktop worker, joined with `mcp__fleet__join`. Its messages come
   // from the chief's model, through the app: its mod leaves them on the board.
   let desktop = false
+  // The mod's work, started once: see session.start. A desktop worker's
+  // join starts it too, since nobody may have opened that session yet.
+  let boot: (() => Promise<void>) | undefined
+  let booted = false
 
   // A turn is running. Messages wait on the board until it ends, rather than
   // queueing up as prompts behind it.
@@ -659,7 +663,19 @@ export const register: Register = on => {
     // the terminal, and once a surface attaches where the desktop app hosts
     // the session through the SDK, which starts it with no surface and not
     // interactive. A `claude -p` run never has one, and is left alone.
-    const boot = async () => {
+    // How a desktop session the chief started joins its fleet: the app
+    // wraps the first prompt, so a slash command there never runs. At once,
+    // not at boot: the app starts that session with no surface, and it may
+    // have none until the user opens it.
+    try {
+      await $.tool.register(JOIN)
+    } catch {
+      // A name already taken: the session cannot join, and says so.
+    }
+
+    boot = async () => {
+      if (booted) return
+      booted = true
       const id = await $.session.id()
       session = id
       // /fleet, in every session with the plugin: in one fleet started it
@@ -669,14 +685,6 @@ export const register: Register = on => {
       } catch {
         // A command of that name already: the band and toasts still work.
       }
-      // How a desktop session the chief started joins its fleet: the app
-      // wraps the first prompt, so a slash command there never runs.
-      try {
-        await $.tool.register(JOIN)
-      } catch {
-        // A name already taken: the session cannot join, and says so.
-      }
-
       // A session fleet started has a board from the start. Any other waits
       // for /fleet start, and the timers below do nothing until then.
       active = Boolean(await $.env.get('FLEET_DB'))
@@ -770,9 +778,13 @@ export const register: Register = on => {
       await boot()
     } else {
       const wait = $.clock.every(1_000, async () => {
+        if (booted) {
+          wait.cancel()
+          return
+        }
         if ((await $.session.surfaces()).length === 0) return
         wait.cancel()
-        await boot()
+        await boot?.()
       })
     }
     return next(e)
@@ -802,12 +814,13 @@ export const register: Register = on => {
     if (main) running.push(e.tool)
     try {
       if (e.tool === TOOL_PREFIX + JOIN.name) {
-        if (!session) return { isError: true as const, result: 'fleet: this session has not started yet; try again in a moment' }
         if (active) return { isError: true as const, result: 'fleet: this session is part of a fleet already' }
-        const joined = await join($, session, e as unknown as Record<string, unknown>)
+        const joined = await join($, session ?? (await $.session.id()), e as unknown as Record<string, unknown>)
         if ('problem' in joined) return { isError: true as const, result: joined.problem }
-        active = true
         desktop = true
+        // Its check-in, the board's tools and the rest, now that it has a board.
+        await boot?.()
+        active = true
         return { result: `Joined the fleet's board (run ${joined.run}). The board's tools, mcp__fleet__board_*, are yours now. Carry on with your brief.` }
       }
       const boardTool = active && session && e.tool.startsWith(TOOL_PREFIX)
