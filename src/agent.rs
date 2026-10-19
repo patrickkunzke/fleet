@@ -145,7 +145,7 @@ pub fn variables(run: Option<i64>, board: Option<&Path>, bin: Option<&Path>) -> 
 
 /// Two agents in one repo is ordinary here, so a name is made unique rather
 /// than refused — but only when it is actually in use by a live agent.
-fn unique_name(db: &Db, wanted: &str) -> Result<String> {
+pub fn unique_name(db: &Db, wanted: &str) -> Result<String> {
     let taken: Vec<String> = db.agents()?.into_iter().map(|a| a.name).collect();
     if !taken.iter().any(|n| n == wanted) {
         return Ok(wanted.to_string());

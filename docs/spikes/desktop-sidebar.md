@@ -208,3 +208,78 @@ to start workers without leaving it. The chief session was in auto mode.
 Not tested: a `prompt.submit`
 hook that runs the join from the wrapped brief; `$.session.send` to a worker
 that is not idle.
+
+### Messages on a turn the user did not start
+
+2026-10-19, Claude Code 2.1.299, Claude desktop app (Code tab). The chief was
+a desktop session in auto mode. A throwaway mod, `fleet-probe3`, was in the
+chief's dev-mods folder. A copy was in `~/fleet-probe/{a,b}/.claude/skills/`.
+On a turn that the user started, the chief started two workers, w1 in repo a
+and w2 in repo b. Each one called the mod's `join` tool, reported its CLI
+session id and went idle. The workers' reports then started the chief's next
+turn. That turn was "another session's message", and all the tests below ran
+on it.
+
+| Test | Result |
+| --- | --- |
+| A. The mod's `$.session.send({ to: { sessionId: <w1 CLI id> } })`, from a mod tool that the model called | **Refused, twice:** `{ isDelivered: false, reason: 'The server-side auto mode classifier gave no verdict for SendMessage: the request that produced this action did not ask for one. …' }`. Nothing reached w1. |
+| C. The same send from a `$.clock.after` tick 90 s later, to w2 | **Refused** with the same reason. A clock tick belongs to no turn, so the refusal comes from auto mode, not from the kind of turn. The probe of 2026-10-19 that delivered by CLI id ran outside auto mode. |
+| B. The model's `SendMessage` to w2's `local_…` id | **Delivered:** `Forwarded to Claude Desktop's session messaging: Message delivered … its turn has started on it.` |
+| D. The model's `SendMessage` to w1's CLI session id | **Not reachable:** `No agent named '<CLI id>' is reachable.` The model reaches a desktop worker only by its `local_…` id. |
+
+So in auto mode, step 3 of the recommendation does not work as written. The
+chief's mod cannot send to a worker. Like `start_session`, the send goes
+through the classifier, and the classifier refuses an action that no request
+asked for. Two ways remain:
+
+- **The worker's own mailbox.** `fleet board go` and `fleet board msg` put the
+  message on the board. The worker's mod checks its inbox every three seconds
+  and submits what waits as a prompt in its own session. Background workers
+  get their messages this way today. No send crosses sessions, so the chief's
+  classifier is not involved. Not yet tested in a desktop worker.
+- **The chief's model.** `SendMessage` to the worker's `local_…` id works on
+  a worker's turn, as test B shows. The chief has to remember to do it.
+
+If the mailbox works, the board does not need the CLI id to send messages.
+It still needs the id to link the session to its agent row. The mod uses the
+id for every inbox check (`--session`), so `join` must record it.
+
+So the desktop host releases a waiting worker through the chief's model: its
+`SendMessage` to the worker's `local_…` id, which the classifier judges like
+any other action of the chief's. The mailbox stays for background workers.
+
+## Built
+
+2026-10-19, on branch `feat/desktop-host`. What changed from the
+recommendation:
+
+- **Release by the chief's model, not by its mod.** `fleet board go` and
+  `fleet board msg` to a desktop worker record the message and print the
+  `SendMessage` the sender makes. A desktop worker's mod checks in but never
+  takes its inbox.
+- **`fleet spawn --host desktop`**, not `fleet board spawn`, next to the
+  other hosts. `FLEET_HOST=desktop` makes it the default, and it adds a
+  section to the chief's brief.
+- **`/fleet:spawn <name>`**, since a markdown command in a plugin is named
+  after the plugin.
+- **The join tool registers at session start.** The mod used to wait for a
+  surface before it did anything. A session that `start_session` starts has
+  none until the user opens it, so the first end-to-end run found no
+  `mcp__fleet__join`.
+
+The end-to-end run: this session was the chief, in auto mode, with
+`FLEET_HOST=desktop`, on a scratch fleet over `~/fleet-probe` with two tasks.
+E2E-2 in repo b waited on E2E-1 in repo a. The installed plugin was patched
+with the branch's mod and binary for the run, then restored.
+
+| Step | Turn started by | Result |
+| --- | --- | --- |
+| `fleet spawn wa/wb --host desktop`, then `start_session` with the printed arguments, then `fleet board agent <name> --target desktop:<local_id>` | the user's approval | Both started, nested under the chief. wb's title: `fleet: wb (waiting on E2E-1)`. |
+| The workers call `mcp__fleet__join` | the workers' first prompts | Both joined. The board holds each one's CLI id in `session_id` and its `local_…` id in the target. Each one sent its plan and waited. |
+| `fleet board go E2E-1`, then `SendMessage` to wa's `local_…` id | the workers' reports | wa started, committed `hello-a.txt` and marked E2E-1 done. |
+| `fleet board go E2E-2`, then `SendMessage` to wb | wa's report | wb committed `hello-b.txt` and marked E2E-2 done. |
+| `fleet board retire wa/wb` | wb's report | Each prints the `stop_session` and `archive_session` call to make. |
+
+Not tested: a chief that `/fleet start` made in the desktop app, rather than
+a session that ran fleet's commands itself; and compaction in a desktop
+worker.

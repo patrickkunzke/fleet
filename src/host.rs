@@ -63,8 +63,10 @@ impl Host {
         match wanted.as_str() {
             "herdr" => return Ok(Host::Herdr(HerdrHost::from_env().context("FLEET_HOST=herdr, and this is not a herdr pane")?)),
             "background" => return Host::background(),
-            "" => {}
-            other => bail!("FLEET_HOST is '{other}': herdr or background"),
+            // Desktop sessions are started by the chief's model, not by
+            // fleet (desktop.rs): for the rest, the host fleet would pick.
+            "" | "desktop" => {}
+            other => bail!("FLEET_HOST is '{other}': herdr, background or desktop"),
         }
         match HerdrHost::from_env() {
             Some(h) => Ok(Host::Herdr(h)),

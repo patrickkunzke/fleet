@@ -7,6 +7,7 @@ mod background;
 mod brief;
 mod chief;
 mod db;
+mod desktop;
 mod herdr;
 mod host;
 mod msg;
@@ -106,6 +107,27 @@ enum Command {
         /// Seconds to wait for the agent to register itself.
         #[arg(long, default_value_t = 20)]
         timeout: u64,
+        /// Where the agent runs: `desktop` puts it on the board and prints
+        /// what the chief passes to the desktop app's `start_session`.
+        /// `FLEET_HOST` by default; herdr or background without it.
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long, env = "FLEET_DB")]
+        db: Option<PathBuf>,
+    },
+    /// What fleet's `mcp__fleet__join` tool runs: put a desktop session
+    /// on the board as the agent the chief started it for. Prints, as JSON,
+    /// what that session's mod needs.
+    #[command(hide = true)]
+    Join {
+        /// The agent, as `fleet spawn --host desktop` registered it.
+        name: String,
+        /// The session's CLI session id.
+        #[arg(long)]
+        session: String,
+        /// The run it joins.
+        #[arg(long)]
+        run: i64,
         #[arg(long, env = "FLEET_DB")]
         db: Option<PathBuf>,
     },
@@ -426,6 +448,20 @@ fn knock(
         // message going to an agent that does not exist.
         return format!("not delivered: no agent '{to}' on the board");
     };
+    // A desktop session's messages go through the sender's model: fleet
+    // cannot reach it, and its mailbox is for background sessions.
+    if let Some(target) = agent.target.as_deref().filter(|t| desktop::is_desktop(t)) {
+        let text = msg::prompt(&[db::Event {
+            ts: String::new(),
+            kind: "message".into(),
+            from_agent: Some(from.into()),
+            to_agent: Some(to.into()),
+            task_key: task.map(Into::into),
+            summary: summary.into(),
+            body: body.map(Into::into),
+        }]);
+        return desktop::deliver_yourself(to, target, &text);
+    }
     // A session whose mod is checking in takes the message itself, once it
     // is idle, rather than having it typed into a prompt it may be busy at.
     if db.mailbox_open(to, db::MAILBOX_QUIET).unwrap_or(false) {
@@ -516,8 +552,16 @@ fn main() -> Result<()> {
             role,
             command,
             timeout,
+            host,
             db,
-        } => spawn(&name, &repo, task.as_deref(), &role, command.as_deref(), timeout, db, None),
+        } => {
+            if role != "chief" && command.is_none() && desktop::wanted(host.as_deref())? {
+                spawn_desktop(&name, &repo, task.as_deref(), db)
+            } else {
+                spawn(&name, &repo, task.as_deref(), &role, command.as_deref(), timeout, db, None)
+            }
+        }
+        Command::Join { name, session, run, db } => join(&name, &session, run, db),
         Command::Chief { root, resume, adopt } => match adopt {
             Some(session) => chief::adopt(root, &session),
             None => chief::run(root, resume),
@@ -539,6 +583,12 @@ fn handoff(name: &str, note: Option<&str>, now: bool, timeout: u64, db_path: Opt
         .with_context(|| format!("no agent '{name}' on the board"))?;
     if agent.role == "chief" {
         bail!("the chief is not handed off this way: restart it from the fleet tab, and it reads the board afresh");
+    }
+    if agent.target.as_deref().is_some_and(desktop::is_desktop) {
+        bail!(
+            "{name} is a desktop session, which fleet cannot start: retire it, then start a fresh one \
+             with `fleet spawn {name} --host desktop` on a turn the user started"
+        );
     }
     let repo = PathBuf::from(agent.repo.as_deref().with_context(|| format!("{name} has no repository on the board"))?);
     if let Some(target) = agent.target.as_deref()
@@ -691,6 +741,96 @@ fn spawn(
     if background::is_background(&spawned.placed.target) {
         println!("      {}", background::Background::attach_hint(&spawned.placed.target));
     }
+    Ok(())
+}
+
+/// Put an agent on the board for the desktop app, and print what the
+/// chief passes to `start_session`: fleet cannot start a desktop session
+/// itself (see `desktop.rs`).
+fn spawn_desktop(name: &str, repo: &Path, task: Option<&str>, db_path: Option<PathBuf>) -> Result<()> {
+    let path = scope::board_for_command(db_path, None)?;
+    let db = Db::open(&path)?;
+    let assignment = task.map(|key| db.show(key)).transpose()?;
+    let repo = repo
+        .canonicalize()
+        .with_context(|| format!("no such repository: {}", repo.display()))?;
+    let run = match std::env::var("FLEET_RUN").ok().and_then(|v| v.parse::<i64>().ok()) {
+        Some(id) => id,
+        None => match db.run_for_repo(&repo.to_string_lossy())? {
+            Some(id) => id,
+            None => bail!("no run to join: start the chief first, with /fleet start"),
+        },
+    };
+    let name = agent::unique_name(&db, &desktop::session_name(name))?;
+    let brief = assignment.as_ref().map_or_else(
+        || brief::worker(&name, &repo, None, None),
+        |(t, body, _)| {
+            let approved = db.approved(&t.key).unwrap_or(false);
+            brief::worker_with(&name, &repo, Some(t), body.as_deref(), approved)
+        },
+    );
+    let waits_on = assignment.as_ref().map(|(t, _, _)| t.waiting_on.clone()).unwrap_or_default();
+    let repo_text = repo.to_string_lossy();
+    db.join_run(run, &name, "worker", &repo_text)?;
+    db.upsert_agent(&name, Some("worker"), Some(&repo_text), None, Some(desktop::PREFIX), None)?;
+    db.log_event("note", Some(&name), None, None, "registered for a desktop session", None, None)?;
+    if let Some(key) = task {
+        db.claim(key, &name)?;
+    }
+    let args = desktop::start_session(&name, &repo, &brief, &path, run, &waits_on);
+    if as_json() {
+        println!("{}", serde_json::to_string_pretty(&args)?);
+        return Ok(());
+    }
+    println!(
+        "{name} is on the board. Start it now, on this turn: call mcp__ccd_session__start_session \
+         with exactly these arguments.\n\n{}\n\n\
+         Then record the session_id it returns: `fleet board agent {name} --target desktop:<session_id>`. \
+         If it says the user must trust the repository first, tell the user, and call it again after \
+         they click Trust. If it refuses because this turn is not the user's, ask the user to say yes, \
+         and start it on their reply.",
+        serde_json::to_string_pretty(&args)?
+    );
+    Ok(())
+}
+
+/// Link a desktop session to the agent the chief registered it as, and
+/// print what its mod needs: the board, the run, fleet's directory and the
+/// agent's role, which the mod keeps through compaction.
+fn join(name: &str, session: &str, run: i64, db_path: Option<PathBuf>) -> Result<()> {
+    let path = scope::board_for_command(db_path, None)?;
+    let db = Db::open(&path)?;
+    let agent = db
+        .agents()?
+        .into_iter()
+        .find(|a| a.name == name)
+        .with_context(|| format!("no agent '{name}' on this board: the chief registers it with `fleet spawn {name} --host desktop`"))?;
+    if !agent.target.as_deref().is_some_and(desktop::is_desktop) {
+        bail!("{name} is not a desktop agent: it was started some other way");
+    }
+    if let Some(other) = agent.session_id.as_deref().filter(|s| *s != session) {
+        bail!("{name} has joined already, as session {other}");
+    }
+    agent::link(&db, name, session, Some(run))?;
+    db.log_event("note", Some(name), None, None, "joined from a desktop session", None, None)?;
+    let repo = PathBuf::from(agent.repo.as_deref().unwrap_or("."));
+    let task = db
+        .board()?
+        .into_iter()
+        .find(|t| t.agent.as_deref() == Some(name) && !matches!(t.state, db::State::Done | db::State::Dropped));
+    let shown = task.as_ref().map(|t| db.show(&t.key)).transpose()?;
+    let brief = match &shown {
+        Some((t, body, _)) => brief::worker_with(name, &repo, Some(t), body.as_deref(), db.approved(&t.key).unwrap_or(false)),
+        None => brief::worker(name, &repo, None, None),
+    };
+    let bin = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_string_lossy().into_owned()));
+    let out = serde_json::json!({
+        "board": path.to_string_lossy(),
+        "run": run,
+        "bin": bin,
+        "brief": brief.role,
+    });
+    println!("{out}");
     Ok(())
 }
 
@@ -893,6 +1033,7 @@ fn board(cmd: BoardCmd, path: Option<PathBuf>, fleet: Option<String>) -> Result<
             }
             let tab = match (keep_tab, target.as_deref()) {
                 (true, _) => "its tab is left open".to_string(),
+                (false, Some(t)) if desktop::is_desktop(t) => desktop::close_hint(t),
                 (false, Some(t)) if host::is_herdr(t) || background::is_background(t) => match Host::detect() {
                     Ok(host) => host.close(t).unwrap_or_else(|e| format!("it could not be closed: {e}")),
                     Err(_) => "its tab is left open: this is not herdr".into(),
