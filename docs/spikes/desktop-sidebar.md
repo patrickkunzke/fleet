@@ -108,25 +108,103 @@ works through the model.
 
 ## Recommendation
 
+Updated after the probe (see "Probe results" below).
+
 Build (b) as a host that the user turns on, `FLEET_HOST=desktop`. Keep
-`background` as the default outside herdr. Before building, run a small probe
-in a scratch fleet from a desktop chief. It needs about one hour:
+`background` as the default outside herdr. The chief runs in auto mode.
 
-1. The chief calls `start_session` with `cwd` set to a repo and the prompt
-   `/fleet join <run> <name>`. Check that the slash command runs, that the
-   installed mod loads and checks in, and that the worker is in the sidebar
-   under the chief.
-2. Call the same tool from the mod with `$.mcp.call`, and then with
-   `$.tool.call`, from a `/fleet spawn` command. Note what the app does with
-   `initiation`. Does it start the session, show a card, or refuse?
-3. Start a worker on a turn that a worker's message started. Check that it
-   becomes a card, and note what the chief has to tell the user.
-4. `$.session.send` from the chief's mod to the worker's `local_` id.
+The rule that shapes the design: the app starts a session only on a turn
+that the user's own message started. The chief's model may make the call
+itself, in auto mode, with no dialog. On a turn that a worker's report
+started, the app refuses the start and allows no card for another repo. So
+the chief starts every worker at the one moment the user is surely there:
+when the user approves the plan.
 
-If step 2 works, `fleet spawn` in a desktop chief becomes a mod command, and
-the model does not have to do anything. If step 2 does not work, the chief's
-brief tells it to call `start_session` itself after `fleet board spawn
---host desktop` registers the agent.
+1. **Start all workers at plan approval.** The chief plans the epic and puts
+   it on the board, then shows the plan to the user. On the user's reply
+   ("go", or any approval), the chief runs `fleet board spawn --host desktop`
+   for each agent. The command registers the agent and prints the arguments
+   for `start_session`. The chief's model calls `start_session` once for each
+   worker on that same turn, with `initiation: "user_asked"` and `cwd` set to
+   the worker's repo. The repo can be any repo, not only the chief's. A
+   worker whose tasks are still blocked starts too and waits.
+2. **Workers join with a tool.** The brief cannot start with a slash command,
+   because the app wraps the prompt. So the mod registers `mcp__fleet__join`,
+   and the brief tells the model to call it first with the run and the
+   agent's name. The tool records the worker's CLI session id
+   (`$.session.id()`), sets `FLEET_DB` and `FLEET_RUN`, and starts the
+   check-in. A worker with nothing ready then ends its turn and stays idle.
+3. **Release waiting workers with a message.** When a blocker clears, the
+   chief's mod sends the worker "go" with `$.session.send({ to: { sessionId:
+   <CLI id> } })`. That starts a turn in the idle worker. The model's
+   SendMessage to the worker's `local_…` id also works.
+4. **Store two ids on the board.** The desktop id from the `start_session`
+   result (`local_…`) is for `list_sessions`, `stop_session` and
+   `archive_session`. The CLI session id from the join is for
+   `$.session.send`. They are different ids.
+5. **Fallback: ask the user.** When the plan changes and needs a worker that
+   nobody started, and the chief is on a turn that a worker's report started,
+   the chief asks the user. The user answers with a plain "yes", and the
+   chief starts the worker on that turn. A `/fleet spawn <name>` prompt
+   command (a markdown command in the plugin) does the same for a user who
+   wants to start one by hand.
+
+Settle these while building:
+
+- **Messages on a worker's turn.** The probe sent messages only on turns the
+  user started. The refusal it found is for starting sessions, so a message
+  from the chief on a turn that a worker's report started should work. Test
+  it before relying on step 3.
+- **Trust.** Each repo needs one "Trust repository" click before the first
+  start. The chief should start one worker per untrusted repo first, so the
+  user sees each button once, and retry after the click.
+- **No direct calls from the mod.** A direct `$.mcp.call` or `$.tool.call` to
+  `start_session` is refused in auto mode, because the classifier has no
+  request to judge. Do not make the mod approve its own call in a
+  `tool.check` hook to get past the classifier. That is a bypass of auto
+  mode. `$.prompt.submit` from a `command.run` hook is refused too.
+- **Where the mod comes from.** A worker loads fleet's mod only from an
+  installed plugin or from the repo's project folder. The installed plugin
+  (PR #25) is the safe source.
+- **Idle workers.** A worker that waits costs nothing while it is idle, but
+  it is in the sidebar from the start. Its title should say that it waits,
+  for example `w3 (waiting on api)`.
 
 Until then, add the Import line to the README, so that the user can at least
 read retired workers' conversations in the sidebar.
+
+## Probe results
+
+2026-10-19, Claude Code 2.1.299, Claude desktop app (Code tab). A desktop
+session in this repo was the chief. A throwaway mod, `fleet-probe`, ran in it
+from the session's dev-mods folder (hot reload). A copy of the mod was in
+`~/fleet-probe/a/.claude/skills/` and `~/fleet-probe/b/.claude/skills/`, two
+scratch git repos. The mod registered `/probe-join`, `/probe-spawn`,
+`/probe-send` and a tool `mcp__fleet-probe__join`, and logged every event to
+a file. The real fleet plugin was not used.
+
+| Question | Result |
+| --- | --- |
+| 1. Does `/probe-join w1` as the `start_session` prompt run as a command? | **No. It arrives as plain text, and this is not a race.** The mod loaded in the new session 250 ms before the first prompt, and its tool was there on the first turn. But the app wraps the prompt: the first user message is `<system-reminder>`s (linked sessions, worktree), then `Background (from the session that started this one):`, the background text, `Task:`, the prompt, and a line about the shared notes folder. `prompt.submit` sees `origin: sdk` and no `command`. A slash command can never be first. The fallback works: the brief told the model to call `mcp__fleet-probe__join` with `w1`, and the model did. |
+| 1. Is the session in the sidebar under the chief? | **Yes.** `get_session` gives `parentSessionId` = the chief, `detached: false`. The app gave it its own worktree, `<repo>/.claude/worktrees/<name>` on branch `claude/<name>`, cut from `master`, because the chief itself runs in a worktree. Its `local_` id is not its CLI session id (`local_ceea9ccc…` against `1e069bd0…`), unlike imported sessions. |
+| 1. What does the user have to do? | **Trust each repo once.** The first start in an untrusted repo returns `Nothing was started. Before this can work, the user needs to trust the repository …`, and a Trust repository button shows in the chief. After the click, the same call starts the session. |
+| 2. Can the mod call `start_session`? | **Yes, both ways, from a command the user types, outside auto mode.** `$.mcp.call('ccd_session', 'start_session', args)` returns `{ content: [{ type: 'text', text: 'Started session "…" (session_id: local_…, name: …) …' }], isError: false }`. `$.tool.call({ tool: 'mcp__ccd_session__start_session', ...args })` returns `{ result: [...], text: 'Started session …' }`. No permission dialog showed for either. The new session is nested under the chief, gets a worktree, loads the mod and joins. It inherits the chief's permission mode. |
+| 2. And in auto mode? | **Refused, both ways.** `$.mcp.call` throws and `$.tool.call` returns `{ deny }`, each with: `The server-side auto mode classifier gave no verdict for mcp__ccd_session__start_session: the request that produced this action did not ask for one. …`. The call does not reach the app. |
+| 2. `initiation` from the mod | `user_asked` with `cwd`: **started** (after trust). `own_initiative` without `cwd`: **card** (`Proposed "…" (task_id: task_…). The user sees a card and nothing runs until they start it …`). When the user clicked it, the session started in the chief's project, not in a worker's repo. `offer` (title only): **the card asks the user, and the call waits**. "Do it here" returns `The user chose "Do it here" …`. "New session" returns `The user chose "New session" — the session is already opening … call start_session once more with exactly proposal_id …, prompt … and background …`. The mod has to make that second call, or the opened session fails without a brief. |
+| 3. A start on a turn that another session's message started | **Refused, and no card is possible for a worker's repo.** `user_asked` with `cwd`: `Start sessions only on the user's own words to you here; this turn runs an automated event, another session's message, or the task another session gave you. Propose the session instead (initiation "own_initiative"), or start it once the user asks you here.` `own_initiative` with `cwd`: `A proposal card cannot carry a host, folder, environment or preset yet: propose it for this project (drop those arguments), or start it there when the user asks you to (initiation "user_asked").` `offer`: `No card was shown: this turn's request did not come from someone at this app's composer, so there is nobody to ask.` So the chief has to tell the user to start the worker, for example "w3 is ready to start in `<repo>`: run `/fleet spawn w3`." |
+| 4. `$.session.send` from the chief's mod | **Only by the worker's CLI session id.** With `{ sessionId: 'local_…' }`: `{ isDelivered: false, reason: 'no live session on this machine has id local_… (a session that exited, or another machine's; …)' }`. With the CLI id: `{ isDelivered: true }`, and it starts a turn in the idle worker. The worker sees `Another Claude session sent a message:` and `<cross-session-message from="uds:…sock" from-session="local_<chief>" from-name="<chief title>" from-mode="prompting" from-plugin="fleet-probe">`, with `origin.kind: peer` and `origin.plugin: fleet-probe` in the transcript, then a note to treat it as a teammate's request. For comparison, the model's SendMessage to the `local_` id goes through "Claude Desktop's session messaging" and arrives as `<cross-session-message from="local_<chief>" name="<chief title>">`. |
+
+### Auto mode follow-up
+
+The user's chief always runs in auto mode, so a second probe looked for a way
+to start workers without leaving it. The chief session was in auto mode.
+
+| Variant | Result |
+| --- | --- |
+| B. A markdown prompt command in the mod (`commands/probe-ask.md`, typed as `/fleet-probe:probe-ask`). It tells the model to call `start_session` with `user_asked` and `cwd` = repo b. | **Works.** `prompt.submit` shows `origin: composer` and the command. The model's call goes through the classifier with no dialog. The worker starts nested under the chief, in its own worktree of b, loads the mod and joins six seconds later. |
+| C. A hooks command (`/probe-submit`) that calls `$.prompt.submit` with the same request. | **Refused by the host:** `prompt.submit: called from a command.run hook, it would wait on the turn this hook is holding; submit from a later event (turn.complete) (host check)`. A submit from a later event was not tried. Its origin would be `plugin`, not the user, and the app may then refuse the start. |
+| A. The mod calls `start_session` itself, and its own `tool.check` hook answers `allow`. | **Not built.** The auto mode classifier refused to write it, as an "Auto-Mode Bypass". That judgment is right: this design should not get past the classifier. |
+
+Not tested: a `prompt.submit`
+hook that runs the join from the wrapped brief; `$.session.send` to a worker
+that is not idle.
