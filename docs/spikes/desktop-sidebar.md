@@ -208,3 +208,38 @@ to start workers without leaving it. The chief session was in auto mode.
 Not tested: a `prompt.submit`
 hook that runs the join from the wrapped brief; `$.session.send` to a worker
 that is not idle.
+
+### Messages on a turn the user did not start
+
+2026-10-19, Claude Code 2.1.299, Claude desktop app (Code tab). The chief was
+a desktop session in auto mode. A throwaway mod, `fleet-probe3`, was in the
+chief's dev-mods folder. A copy was in `~/fleet-probe/{a,b}/.claude/skills/`.
+On a turn that the user started, the chief started two workers, w1 in repo a
+and w2 in repo b. Each one called the mod's `join` tool, reported its CLI
+session id and went idle. The workers' reports then started the chief's next
+turn. That turn was "another session's message", and all the tests below ran
+on it.
+
+| Test | Result |
+| --- | --- |
+| A. The mod's `$.session.send({ to: { sessionId: <w1 CLI id> } })`, from a mod tool that the model called | **Refused, twice:** `{ isDelivered: false, reason: 'The server-side auto mode classifier gave no verdict for SendMessage: the request that produced this action did not ask for one. …' }`. Nothing reached w1. |
+| C. The same send from a `$.clock.after` tick 90 s later, to w2 | **Refused** with the same reason. A clock tick belongs to no turn, so the refusal comes from auto mode, not from the kind of turn. The probe of 2026-10-19 that delivered by CLI id ran outside auto mode. |
+| B. The model's `SendMessage` to w2's `local_…` id | **Delivered:** `Forwarded to Claude Desktop's session messaging: Message delivered … its turn has started on it.` |
+| D. The model's `SendMessage` to w1's CLI session id | **Not reachable:** `No agent named '<CLI id>' is reachable.` The model reaches a desktop worker only by its `local_…` id. |
+
+So in auto mode, step 3 of the recommendation does not work as written. The
+chief's mod cannot send to a worker. Like `start_session`, the send goes
+through the classifier, and the classifier refuses an action that no request
+asked for. Two ways remain:
+
+- **The worker's own mailbox.** `fleet board go` and `fleet board msg` put the
+  message on the board. The worker's mod checks its inbox every three seconds
+  and submits what waits as a prompt in its own session. Background workers
+  get their messages this way today. No send crosses sessions, so the chief's
+  classifier is not involved. Not yet tested in a desktop worker.
+- **The chief's model.** `SendMessage` to the worker's `local_…` id works on
+  a worker's turn, as test B shows. The chief has to remember to do it.
+
+If the mailbox works, the board does not need the CLI id to send messages.
+It still needs the id to link the session to its agent row. The mod uses the
+id for every inbox check (`--session`), so `join` must record it.
