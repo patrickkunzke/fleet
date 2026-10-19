@@ -44,8 +44,43 @@ const WORKER_TOOLS: &[&str] = &["Bash(fleet board:*)", "mcp__fleet"];
 const CHIEF_TOOLS: &[&str] = &["Bash(fleet board:*)", "Bash(fleet spawn:*)", "Bash(fleet handoff:*)", "mcp__fleet"];
 
 /// The session you talk to. It plans, it dispatches, and it is the only one
-/// that writes tasks.
+/// that writes tasks. With `FLEET_HOST=desktop`, it starts its agents as
+/// desktop sessions: see [`chief_on`].
 pub fn chief(root: &Path) -> Brief {
+    chief_on(root, crate::desktop::wanted(None).unwrap_or(false))
+}
+
+/// What a chief on the desktop host does differently: the app lets only
+/// the chief's model start a session, and only on a turn the user's own
+/// message started (desktop.rs). So every worker starts when the user
+/// approves the plan, and a release is the model's own SendMessage.
+const DESKTOP: &str = "\n\n\
+     Your agents run as sessions of the Claude desktop app, in its sidebar under \
+     this one. fleet cannot start them; you do, with the app's `start_session` tool, \
+     and the app allows that only on a turn the user's own message started. So:\n\
+     - Plan the whole piece of work on the board first, with every task and what it \
+     waits on, and show the user the plan. When the user approves it, on that same \
+     turn, start every worker the plan needs, also the ones whose tasks still wait: \
+     for each, run `fleet spawn <name> --repo <path> --task <key> --host desktop`, \
+     call `mcp__ccd_session__start_session` with exactly the arguments it prints, \
+     and record the `session_id` the app returns with \
+     `fleet board agent <name> --target desktop:<session_id>`. \
+     Start one worker per repository the user has not trusted yet first: the app \
+     asks the user to trust it, and the same call works after they click.\n\
+     - When the plan later needs a worker nobody started, and the user did not \
+     start this turn (a worker's report did), do not try: the app refuses. Ask the \
+     user, for example \"w3 is ready to start in <repo>; say yes and I start it\", \
+     and start it on their reply. The user can also run `/fleet:spawn <name>`.\n\
+     - fleet cannot deliver to a desktop worker. When `fleet board go` or \
+     `fleet board msg` says so, send the text it gives with `SendMessage` to the \
+     worker's `local_…` id, on the same turn. A waiting worker starts work only \
+     when that message reaches it.\n\
+     - The app tells you when a worker ends a turn. `fleet board retire <name>` \
+     takes it off the board; then stop it with `stop_session` and archive it with \
+     `archive_session`.";
+
+/// [`chief`], for the host given.
+pub fn chief_on(root: &Path, desktop: bool) -> Brief {
     let where_ = root.display();
     Brief {
         role: format!(
@@ -77,7 +112,8 @@ pub fn chief(root: &Path) -> Brief {
              has a way to go, `fleet handoff <name>` gives the task to a fresh \
              session of it, briefed on where the old one stopped. When a plan turns on a decision that is the user's to \
              make — scope, a trade-off, anything that cannot be undone — ask the \
-             user rather than deciding for them."
+             user rather than deciding for them.{}",
+            if desktop { DESKTOP } else { "" }
         ),
         opening: "Run `fleet board ls` and tell me where things stand, then ask \
                   what I want to work on. Be brief."
@@ -610,6 +646,17 @@ mod tests {
         let t = task("ENG-2553-2", &[]);
         let b = worker("billing-svc", Path::new("/w"), Some(&t), None);
         assert!(b.opening.contains("fleet board msg billing-svc chief"), "{}", b.opening);
+    }
+
+    #[test]
+    fn a_desktop_chief_starts_every_worker_when_the_user_approves() {
+        let b = chief_on(Path::new("/w"), true);
+        assert!(b.role.contains("When the user approves it, on that same turn, start every worker"), "{}", b.role);
+        assert!(b.role.contains("--host desktop"));
+        assert!(b.role.contains("`SendMessage` to the worker's `local_…` id"));
+        assert!(b.role.contains("Ask the user"));
+        let plain = chief_on(Path::new("/w"), false);
+        assert!(!plain.role.contains("start_session"), "only the desktop host is told about it");
     }
 
     #[test]

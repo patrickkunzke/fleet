@@ -238,11 +238,18 @@ const BOARD_TOOLS: BoardTool[] = [
   },
   {
     name: 'spawn',
-    description: 'Start an agent in a repository, briefed on its task, and claim the task for it.',
-    properties: { name: str('What to call it, usually after the repository'), repo: str('The repository, as an absolute path'), task: TASK },
+    description:
+      'Start an agent in a repository, briefed on its task, and claim the task for it. ' +
+      'With host "desktop" it only registers the agent and says what to pass to start_session.',
+    properties: {
+      name: str('What to call it, usually after the repository'),
+      repo: str('The repository, as an absolute path'),
+      task: TASK,
+      host: { type: 'string', enum: ['herdr', 'background', 'desktop'], description: 'Where it runs; FLEET_HOST by default' },
+    },
     required: ['name', 'repo'],
     isChiefs: true,
-    argv: i => ['spawn', String(i.name), '--repo', String(i.repo), ...opt('--task', i.task)],
+    argv: i => ['spawn', String(i.name), '--repo', String(i.repo), ...opt('--task', i.task), ...opt('--host', i.host)],
   },
   {
     name: 'handoff',
@@ -335,6 +342,26 @@ async function versionOf($: EngineInterface, fleet: string): Promise<string | un
 
 /** What `fleet chief --adopt` prints. */
 type Adopted = { board: string; run: number; bin: string | null; brief: string }
+
+/** What `fleet join` prints: the same, for a worker. */
+type Joined = Adopted
+
+/** The tool a desktop worker joins the board with: see `join`. */
+const JOIN = {
+  name: 'join',
+  description:
+    "Join a fleet's board as the agent a fleet brief names. Call it only when a fleet brief tells you to, " +
+    'with the board, run and name the brief gives.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      board: str("The board's path, from the brief"),
+      run: { type: 'number', description: 'The run, from the brief' },
+      name: str("This agent's name, from the brief"),
+    },
+    required: ['board', 'run', 'name'],
+  },
+} as const
 
 /**
  * A plain `fleet board`, `fleet spawn` or `fleet handoff` command: what a
@@ -481,6 +508,38 @@ async function adopt($: EngineInterface, session: string): Promise<{ root: strin
 }
 
 /**
+ * Put `session` on the board as the desktop worker the chief started it
+ * as, as `/fleet start` does for the chief: the board and the run in its
+ * environment, fleet on its PATH, the board's tools. Its brief came as its
+ * first prompt, which compaction summarises: kept for that.
+ */
+async function join($: EngineInterface, session: string, input: Record<string, unknown>): Promise<Joined | { problem: string }> {
+  const name = typeof input.name === 'string' ? input.name : ''
+  const board = typeof input.board === 'string' ? input.board : ''
+  const run = typeof input.run === 'number' ? input.run : Number(input.run)
+  if (!name || !board || !Number.isInteger(run)) return { problem: 'fleet: join needs the board, the run and the name the brief gives' }
+  let joined: Joined
+  try {
+    const found = await findFleet($)
+    if ('problem' in found) return { problem: `fleet: ${found.problem}` }
+    const out = await $.process.run(
+      [found.path, 'join', name, '--session', session, '--run', String(run), '--db', board],
+      { timeoutMs: 20_000 },
+    )
+    if (out.exitCode !== 0) return { problem: `fleet: ${(out.stderr || out.stdout).trim()}` }
+    joined = JSON.parse(out.stdout) as Joined
+  } catch (err) {
+    return { problem: `fleet could not be run: ${String(err)}` }
+  }
+  await $.env.set('FLEET_DB', joined.board)
+  await $.env.set('FLEET_RUN', String(joined.run))
+  if (joined.bin) await $.env.set('PATH', `${joined.bin}:${(await $.env.get('PATH')) ?? ''}`)
+  await registerTools($)
+  await update($, brief, () => joined.brief)
+  return joined
+}
+
+/**
  * Whether the fleet pane is up, as the engine has it: the desktop app's
  * panel can be put away without the pane being closed, so `ui.close` alone
  * does not say. Kept in `paneOpen`, which redraws the band when it changes.
@@ -578,6 +637,10 @@ export const register: Register = on => {
   let seen: Set<string> | undefined
 
 
+  // A desktop worker, joined with `mcp__fleet__join`. Its messages come
+  // from the chief's model, through the app: its mod leaves them on the board.
+  let desktop = false
+
   // A turn is running. Messages wait on the board until it ends, rather than
   // queueing up as prompts behind it.
   let busy = false
@@ -606,6 +669,13 @@ export const register: Register = on => {
       } catch {
         // A command of that name already: the band and toasts still work.
       }
+      // How a desktop session the chief started joins its fleet: the app
+      // wraps the first prompt, so a slash command there never runs.
+      try {
+        await $.tool.register(JOIN)
+      } catch {
+        // A name already taken: the session cannot join, and says so.
+      }
 
       // A session fleet started has a board from the start. Any other waits
       // for /fleet start, and the timers below do nothing until then.
@@ -627,7 +697,7 @@ export const register: Register = on => {
           // A draft in the prompt box: the person is mid-sentence, and a
           // message submitted now would go out with what they typed so far.
           const drafting = (await $.prompt.read()).text.trim() !== ''
-          const take = !busy && !pending && !drafting
+          const take = !busy && !pending && !drafting && !desktop
           const argv = ['fleet', 'board', 'inbox', '--session', id]
           if (take) argv.push('--take')
           const tool = running.at(-1)
@@ -731,6 +801,15 @@ export const register: Register = on => {
     const main = session !== undefined && e.agentId === undefined
     if (main) running.push(e.tool)
     try {
+      if (e.tool === TOOL_PREFIX + JOIN.name) {
+        if (!session) return { isError: true as const, result: 'fleet: this session has not started yet; try again in a moment' }
+        if (active) return { isError: true as const, result: 'fleet: this session is part of a fleet already' }
+        const joined = await join($, session, e as unknown as Record<string, unknown>)
+        if ('problem' in joined) return { isError: true as const, result: joined.problem }
+        active = true
+        desktop = true
+        return { result: `Joined the fleet's board (run ${joined.run}). The board's tools, mcp__fleet__board_*, are yours now. Carry on with your brief.` }
+      }
       const boardTool = active && session && e.tool.startsWith(TOOL_PREFIX)
         ? BOARD_TOOLS.find(t => TOOL_PREFIX + t.name === e.tool)
         : undefined
@@ -800,7 +879,9 @@ export const register: Register = on => {
     }
     const reminder = {
       role: 'user' as const,
-      text: `[fleet] You are this workspace's chief of staff. Your brief, kept through compaction:\n\n${kept}`,
+      text: desktop
+        ? `[fleet] You are an agent of a fleet. Your brief, kept through compaction:\n\n${kept}`
+        : `[fleet] You are this workspace's chief of staff. Your brief, kept through compaction:\n\n${kept}`,
       toolUses: [],
     }
     return { ...compacted, messages: [reminder, ...compacted.messages] }

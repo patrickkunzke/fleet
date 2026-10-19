@@ -44,8 +44,9 @@ declare module 'claude-code' {
   interface PluginState {
     fleet: {
       snapshot: Snapshot | null
-      /** The brief a session made the chief with /fleet start received as a
-       *  turn, kept to put back after compaction. */
+      /** The brief a session made the chief with /fleet start, or a desktop
+       *  worker that joined, received as a turn, kept to put back after
+       *  compaction. */
       brief: string | null
       /** The workspace is listed in ~/.claude-fleet/auto-open and this
        *  session is not part of a fleet yet: the band offers to start one. */
