@@ -35,7 +35,7 @@ import type { EngineInterface, Register } from 'claude-code'
 
 import type { GraphSpan, Snapshot } from '../types'
 
-import { HIGH, Seen, TONE, askButton, asks, crewPane, doing, dot } from './crew'
+import { HIGH, Seen, crewPane, fleetBand } from './crew'
 
 /** How often the mailbox is checked. Well inside the board's fifteen. */
 const EVERY = 3_000
@@ -1117,45 +1117,7 @@ export const register: Register = on => {
     const isOpen = await paneShown($)
     // Nothing to count and the pane is up: the band has nothing to add.
     if (crew.length === 0 && isOpen) return next(e)
-    const want = asks(s)
-    const top = want[0]
-    const working = crew.filter(a => a.presence === 'working').length
-    const idle = crew.filter(a => a.presence === 'waiting' && doing(a).tone === 'idle').length
-    const open = s.tasks.length
     const act = { go: (task: string) => void give($, task), handoff: (agent: string) => void handoff($, agent) }
-    const opener = isOpen ? <Text dimColor>/fleet</Text> : <Button key="fleet-open" label="Open fleet" onPress={() => void openPane($)} />
-
-    // One quiet line while all is well: a dot per agent and the counts. Only
-    // the most urgent ask gets a second line, as a sentence with its button.
-    return (
-      <Box flexDirection="column" paddingX={1} width={e.props.bodyColumns}>
-        <Box flexDirection="row" columnGap={2} alignItems="center">
-          <Text bold>fleet</Text>
-          {crew.length === 0 ? (
-            <Box flexGrow={1}><Text dimColor>No agents yet. Tell the chief what you want done.</Text></Box>
-          ) : (
-            <Box flexDirection="row" columnGap={2} flexGrow={1} flexWrap="wrap">
-              <Text>{crew.map(a => <Text color={TONE[doing(a).tone]}>{dot(a)}</Text>)}</Text>
-              <Text>
-                {`${working} working`}
-                <Text dimColor> · </Text>
-                {`${idle} idle`}
-                <Text dimColor> · </Text>
-                {`${open} open`}
-              </Text>
-            </Box>
-          )}
-          {opener}
-        </Box>
-        {top && (
-          <Box flexDirection="row" columnGap={2} alignItems="center">
-            <Text color="yellow" bold>{`▲ ${top.agent}`}</Text>
-            <Box flexGrow={1} flexShrink={1}><Text>{top.text}</Text></Box>
-            {want.length > 1 && <Text dimColor>{`+${want.length - 1} more`}</Text>}
-            {askButton({ Button }, top, act, false)}
-          </Box>
-        )}
-      </Box>
-    )
+    return fleetBand({ Box, Button, Text }, s, act, { columns: e.props.bodyColumns, isOpen, open: () => void openPane($) })
   })
 }
