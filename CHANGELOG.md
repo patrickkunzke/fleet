@@ -4,6 +4,12 @@ Every release of fleet. Each section is written when a pull request with a
 `feat`, `fix` or `perf` commit is merged; see
 [Releases](README.md#releases).
 
+## [0.20.1](https://github.com/patrickkunzke/fleet/releases/tag/v0.20.1) — 2026-10-20
+
+### Fixes
+
+- **mod:** Line up the band's two rows and keep a long ask on one line
+
 ## [0.20.0](https://github.com/patrickkunzke/fleet/releases/tag/v0.20.0) — 2026-10-19
 
 ### Features
