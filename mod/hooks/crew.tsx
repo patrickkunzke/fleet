@@ -117,6 +117,72 @@ export function askButton(el: Pick<ElementTable<'mobile'>, 'Button'>, ask: Ask, 
   return null
 }
 
+/**
+ * The band above the chief's prompt: one quiet line while all is well, a dot
+ * per agent and the counts; only the most urgent ask gets a second line, as
+ * a sentence with its button. Both lines start their text in one column, the
+ * labels given one width, and the sentence keeps to its line: the pane has
+ * it whole.
+ */
+export function fleetBand(
+  el: Pick<ElementTable<'mobile'>, 'Box' | 'Text' | 'Button'>,
+  s: Snapshot,
+  act: CrewActions,
+  o: { columns: number; isOpen: boolean; open: () => void },
+) {
+  const { Box, Text, Button } = el
+  const crew = s.agents.filter(a => a.role === 'worker')
+  const want = asks(s)
+  const top = want[0]
+  const working = crew.filter(a => a.presence === 'working').length
+  const idle = crew.filter(a => a.presence === 'waiting' && doing(a).tone === 'idle').length
+  const ask = top ? `▲ ${clip(top.agent, 16)}` : ''
+  const label = Math.max('fleet'.length, ask.length)
+  return (
+    <Box flexDirection="column" rowGap={1} paddingX={1} width={o.columns}>
+      <Box flexDirection="row" columnGap={2} alignItems="center">
+        <Box minWidth={label} flexShrink={0}>
+          <Text bold>fleet</Text>
+        </Box>
+        <Box flexDirection="row" columnGap={2} flexGrow={1} flexShrink={1} minWidth={0}>
+          {crew.length === 0 ? (
+            <Text dimColor wrap="truncate-end">No agents yet. Tell the chief what you want done.</Text>
+          ) : (
+            <Text wrap="truncate-end">
+              {crew.map(a => <Text color={TONE[doing(a).tone]}>{dot(a)}</Text>)}
+              {'  '}
+              {`${working} working`}
+              <Text dimColor> · </Text>
+              {`${idle} idle`}
+              <Text dimColor> · </Text>
+              {`${s.tasks.length} open`}
+            </Text>
+          )}
+        </Box>
+        <Box flexShrink={0}>
+          {o.isOpen ? <Text dimColor>/fleet</Text> : <Button key="fleet-open" label="Open fleet" onPress={() => o.open()} />}
+        </Box>
+      </Box>
+      {top && (
+        <Box flexDirection="row" columnGap={2} alignItems="center">
+          <Box minWidth={label} flexShrink={0}>
+            <Text color="yellow" bold>{ask}</Text>
+          </Box>
+          <Box flexGrow={1} flexShrink={1} minWidth={0}>
+            <Text wrap="truncate-end">{top.text}</Text>
+          </Box>
+          {want.length > 1 && (
+            <Box flexShrink={0}>
+              <Text dimColor>{`+${want.length - 1} more`}</Text>
+            </Box>
+          )}
+          <Box flexShrink={0}>{askButton({ Button }, top, act, false)}</Box>
+        </Box>
+      )}
+    </Box>
+  )
+}
+
 /** How to reach a background agent from a terminal: there is no tab here. */
 function attach(a: SnapAgent): string | undefined {
   return a.target?.startsWith('bg:') ? `claude attach ${a.target.slice(3)}` : undefined
